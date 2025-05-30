@@ -1906,6 +1906,26 @@ class GlyphItemWidget(QFrame):
             self.clicked.emit(self.character)
         super().mousePressEvent(event)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # --- Glyph Grid Widget (Modified for incremental redisplay) ---
 class GlyphGridWidget(QWidget):
     glyph_selected_signal = Signal(str) 
@@ -1939,25 +1959,10 @@ class GlyphGridWidget(QWidget):
         self.grid_container = QWidget() 
         self.grid_layout = QGridLayout(self.grid_container)
         
-        # --- グリッドレイアウトのスペーシングとアライメント設定 ---
-        fixed_spacing = 5 # 固定したいスペーシング値
+        fixed_spacing = 5 
         self.grid_layout.setSpacing(fixed_spacing) 
-        # self.grid_layout.setHorizontalSpacing(fixed_spacing) # 個別設定も可能
-        # self.grid_layout.setVerticalSpacing(fixed_spacing)   # 個別設定も可能
-        
         self.grid_layout.setContentsMargins(fixed_spacing, fixed_spacing, fixed_spacing, fixed_spacing) 
         
-        # 列と行のストレッチファクターを設定して、余白が最後に集まるようにする
-        # ただし、アイテムが固定サイズなので、基本的にはアイテムとスペーシングでサイズが決まるはず
-        # for i in range(GRID_COLUMNS):
-        #     self.grid_layout.setColumnStretch(i, 0) # Default: no stretch
-        # self.grid_layout.setColumnStretch(GRID_COLUMNS, 1) # Allow last (non-existent) column to take space if needed
-
-        # グリッド全体を左上に寄せる (余白は右と下にできる)
-        # Qt.AlignLeft | Qt.AlignTop を指定する
-        # self.grid_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop) # これにより、アイテム間の間隔が固定されやすくなる
-        # -------------------------------------------------------------
-
         self.scroll_area.setWidget(self.grid_container)
         main_layout.addWidget(self.scroll_area, 1) 
 
@@ -1977,16 +1982,41 @@ class GlyphGridWidget(QWidget):
         self._has_vrt2_section_separator = False
         self._vrt2_separator_widget: Optional[QLabel] = None
 
+        # --- Batch processing and redisplay state ---
+        self._master_batch_queue: List[Tuple[List[Tuple[str, Optional[QPixmap]]], bool, bool]] = []
+        self._is_processing_master_batch: bool = False
+        
+        self._current_add_batch_data: List[Tuple[str, Optional[QPixmap]]] = []
+        self._current_add_batch_index: int = 0
+        self._current_add_batch_type_is_vrt2: bool = False
+        self._current_add_batch_is_final_for_type: bool = False
+        
         self._pending_standard_redisplay: List[Tuple[str, Optional[QPixmap]]] = []
         self._pending_vrt2_redisplay: List[Tuple[str, Optional[QPixmap]]] = []
         self._redisplay_active_char_cache: Optional[str] = None
         self._redisplay_active_vrt2_source_cache: bool = False
+        
         self._incremental_redisplay_timer: Optional[QTimer] = None
-        self._current_add_batch_type_is_vrt2 = False 
-        self._current_add_batch_data: List[Tuple[str, Optional[QPixmap]]] = []
-        self._current_add_batch_index = 0
-        self._current_add_batch_is_final_for_type = False
         self._single_widget_add_timer: Optional[QTimer] = None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     def set_search_enabled(self, enabled: bool):
@@ -2002,7 +2032,6 @@ class GlyphGridWidget(QWidget):
         if char_to_find == '.' and len(search_text) > 1: 
             if search_text.lower() == ".notdef": char_to_find = ".notdef"
         
-        # Check currently displayed widgets first
         if char_to_find in self.glyph_widgets:
             self.glyph_selected_signal.emit(char_to_find)
             self.search_input.clear() 
@@ -2012,10 +2041,8 @@ class GlyphGridWidget(QWidget):
             self.search_input.clear()
             return
         
-        # If not in displayed widgets (e.g. due to filtering), check full cache
-        # This will trigger a redisplay if filter is on and item is found
         if any(char_to_find == data[0] for data in self._all_glyph_data_for_filter): 
-            self.glyph_selected_signal.emit(char_to_find) # Will cause selection, if visible, or full load_glyph_for_editing
+            self.glyph_selected_signal.emit(char_to_find) 
             self.search_input.clear()
         elif any(char_to_find == data[0] for data in self._special_vrt2_data_for_filter): 
             self.vrt2_glyph_selected_signal.emit(char_to_find)
@@ -2031,10 +2058,10 @@ class GlyphGridWidget(QWidget):
     def set_non_rotated_vrt2_chars(self, chars: set[str]):
         if self.non_rotated_vrt2_chars != chars:
             self.non_rotated_vrt2_chars = chars
-            for char, widget in self.glyph_widgets.items(): # Update existing standard widgets
+            for char, widget in self.glyph_widgets.items(): 
                 widget.set_vrt2_highlight(char in self.non_rotated_vrt2_chars)
             
-            if (self.glyph_widgets or self.special_vrt2_glyph_widgets): # if grid is populated
+            if (self.glyph_widgets or self.special_vrt2_glyph_widgets): 
                 self.redisplay_from_cached_data()
 
 
@@ -2045,11 +2072,13 @@ class GlyphGridWidget(QWidget):
         if self._single_widget_add_timer and self._single_widget_add_timer.isActive():
             self._single_widget_add_timer.stop()
 
-        self._pending_standard_redisplay.clear()
-        self._pending_vrt2_redisplay.clear()
+        # Clear all queues and processing flags
+        self._master_batch_queue.clear()
+        self._is_processing_master_batch = False
         self._current_add_batch_data.clear()
         self._current_add_batch_index = 0
-
+        self._pending_standard_redisplay.clear()
+        self._pending_vrt2_redisplay.clear()
 
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
@@ -2064,11 +2093,11 @@ class GlyphGridWidget(QWidget):
         self._current_standard_glyph_count = 0
         self._current_vrt2_glyph_count = 0
         self._has_vrt2_section_separator = False
-        if self._vrt2_separator_widget: # Ensure separator widget is also cleaned up
+        if self._vrt2_separator_widget: 
             self._vrt2_separator_widget.deleteLater()
             self._vrt2_separator_widget = None 
 
-        self.grid_container.setMinimumHeight(0) # <<<< 最小高さをリセット
+        self.grid_container.setMinimumHeight(0) 
         self.grid_container.adjustSize() 
         self.scroll_area.updateGeometry()
 
@@ -2080,8 +2109,17 @@ class GlyphGridWidget(QWidget):
 
     def redisplay_from_cached_data(self):
         """Clears and re-populates the grid incrementally using the cached filter data."""
-        if self._incremental_redisplay_timer and self._incremental_redisplay_timer.isActive():
-            self._incremental_redisplay_timer.stop()
+        if self._is_processing_master_batch or self._master_batch_queue:
+             # If already processing, wait. Or, decide to cancel and restart.
+             # For simplicity, let's just queue this request by clearing and re-adding.
+             # Or better: stop current processing.
+            if self._single_widget_add_timer and self._single_widget_add_timer.isActive():
+                self._single_widget_add_timer.stop()
+            if self._incremental_redisplay_timer and self._incremental_redisplay_timer.isActive():
+                self._incremental_redisplay_timer.stop()
+            self._master_batch_queue.clear()
+            self._is_processing_master_batch = False
+
 
         self._redisplay_active_char_cache = None
         self._redisplay_active_vrt2_source_cache = False
@@ -2091,7 +2129,7 @@ class GlyphGridWidget(QWidget):
             self._redisplay_active_char_cache = self.active_special_vrt2_widget.character
             self._redisplay_active_vrt2_source_cache = True
 
-        self.clear_grid() 
+        self.clear_grid() # This also clears master_batch_queue
 
         self._pending_standard_redisplay = [gd for gd in self._all_glyph_data_for_filter 
                                if not self.show_written_only_checkbox.isChecked() or gd[1] is not None]
@@ -2106,121 +2144,111 @@ class GlyphGridWidget(QWidget):
 
 
     def _schedule_incremental_add(self):
+        # This is for redisplay_from_cached_data path
         if not self._incremental_redisplay_timer:
             self._incremental_redisplay_timer = QTimer(self)
             self._incremental_redisplay_timer.setSingleShot(True)
-            self._incremental_redisplay_timer.timeout.connect(self._process_incremental_add)
+            self._incremental_redisplay_timer.timeout.connect(self._process_incremental_add_chunk) # Renamed
         
-        if not self._incremental_redisplay_timer.isActive():
+        if not self._incremental_redisplay_timer.isActive() and not self._is_processing_master_batch:
              self._incremental_redisplay_timer.start(0) 
 
 
-
-
-    def _process_incremental_add(self):
+    def _process_incremental_add_chunk(self): # Renamed from _process_incremental_add
         # This method is for the redisplay_from_cached_data path
+        # It takes one chunk from _pending_ lists and adds it to _master_batch_queue
         if self._pending_standard_redisplay:
-            # Take a chunk for the add_glyph_batch call
             chunk_to_add = self._pending_standard_redisplay[:GLYPH_UI_UPDATE_BATCH_SIZE]
             self._pending_standard_redisplay = self._pending_standard_redisplay[GLYPH_UI_UPDATE_BATCH_SIZE:]
-            
-            is_final_standard_chunk_overall = not self._pending_standard_redisplay # Is this the last of standard glyphs?
-            is_final_type_for_this_chunk = is_final_standard_chunk_overall and not self._pending_vrt2_redisplay # Is this the last chunk of all types?
-            
-            # add_glyph_batch will now process 'chunk_to_add' widget by widget internally
-            self.add_glyph_batch(chunk_to_add, is_vrt2_batch=False, is_final_for_type=is_final_type_for_this_chunk)
-            
-            return # add_glyph_batch will continue via its timer.
+            is_final_overall = not self._pending_standard_redisplay and not self._pending_vrt2_redisplay
+            self.add_glyph_batch(chunk_to_add, is_vrt2_batch=False, is_final_for_type=is_final_overall)
+            return 
 
         if self._pending_vrt2_redisplay:
             chunk_to_add = self._pending_vrt2_redisplay[:GLYPH_UI_UPDATE_BATCH_SIZE]
             self._pending_vrt2_redisplay = self._pending_vrt2_redisplay[GLYPH_UI_UPDATE_BATCH_SIZE:]
-            
-            is_final_vrt2_chunk_overall = not self._pending_vrt2_redisplay
-            self.add_glyph_batch(chunk_to_add, is_vrt2_batch=True, is_final_for_type=is_final_vrt2_chunk_overall)
+            is_final_overall = not self._pending_vrt2_redisplay
+            self.add_glyph_batch(chunk_to_add, is_vrt2_batch=True, is_final_for_type=is_final_overall)
             return
-
-        # If both pending lists are empty, finalize.
-        # This path should ideally be reached only after the last widget from the last chunk
-        # has been processed by _process_single_widget_add.
-        if not self._single_widget_add_timer or not self._single_widget_add_timer.isActive():
-             self._finalize_incremental_add()
-
-
+        
+        # If both pending lists are empty, and no batches are being processed,
+        # this implies the redisplay operation should finalize.
+        # This is now handled by _start_processing_next_master_batch when _master_batch_queue is empty.
 
     def _finalize_incremental_add(self):
         # This is called when incremental redisplay (from filter change) is complete.
-        self.grid_container.adjustSize() # Let it calculate its natural size first
-        
-        # --- 縦揺れ対策: grid_container の最小高さをビューポートに合わせる ---
-        # これにより、コンテナがビューポートより小さく縮むことを防ぎ、
-        # 上方向への揺れを抑制する効果が期待できる。
-        # ただし、グリフが非常に少ない場合は大きな空白が生じる可能性がある。
+        self.grid_container.adjustSize() 
         current_content_height = self.grid_container.sizeHint().height()
         viewport_height = self.scroll_area.viewport().height()
-        
-        # スクロールエリアのビューポートよりグリッド内容が小さい場合、
-        # グリッドコンテナの最小高さをビューポートの高さに設定する。
-        # これにより、コンテナが不必要に縮んでガタつくのを防ぐ。
-        # 内容がビューポートより大きい場合は、自然な高さに任せる。
         if current_content_height < viewport_height:
             self.grid_container.setMinimumHeight(viewport_height)
         else:
-            # 内容がビューポートより大きい場合は、最小高さの制約を解除
-            # (または、現在の内容の高さに設定しても良いが、0でリセットが無難)
             self.grid_container.setMinimumHeight(0) 
-        # -------------------------------------------------------------
-
-        self.scroll_area.updateGeometry() # Ensure scrollbars update correctly
+        self.scroll_area.updateGeometry() 
         
         if self._redisplay_active_char_cache:
-            # Call set_active_glyph which will internally call ensureWidgetVisible
             self.set_active_glyph(self._redisplay_active_char_cache, self._redisplay_active_vrt2_source_cache)
         
-        # Clear redisplay-specific caches
         self._pending_standard_redisplay.clear()
         self._pending_vrt2_redisplay.clear()
         self._redisplay_active_char_cache = None
         self._redisplay_active_vrt2_source_cache = False
 
 
-
-
     def add_glyph_batch(self, glyph_data_batch: List[Tuple[str, Optional[QPixmap]]], 
                         is_vrt2_batch: bool, is_final_for_type: bool):
-        
-        if not glyph_data_batch and not is_final_for_type:
-            # If it's an empty batch but also the final one for this type,
-            # we might need to finalize (e.g., remove separator if VRT2 is empty)
+        if not glyph_data_batch:
+            # If it's an empty batch but also the final one for this type (e.g., all VRT2 glyphs were filtered out)
             if is_final_for_type and is_vrt2_batch:
                 if self._has_vrt2_section_separator and self._current_vrt2_glyph_count == 0:
                     if self._vrt2_separator_widget:
                         self.grid_layout.removeWidget(self._vrt2_separator_widget)
-                        self._vrt2_separator_widget.deleteLater()
-                        self._vrt2_separator_widget = None
+                        self._vrt2_separator_widget.deleteLater(); self._vrt2_separator_widget = None
                     self._has_vrt2_section_separator = False
-                if not (self._pending_standard_redisplay or self._pending_vrt2_redisplay or \
-                        (self._current_add_batch_data and self._current_add_batch_index < len(self._current_add_batch_data))):
-                     self.grid_container.adjustSize()
-                     self.scroll_area.updateGeometry()
+                # If this empty final batch completes all known processing (no pending redisplay chunks either)
+                if not self._is_processing_master_batch and not self._master_batch_queue and \
+                   not self._pending_standard_redisplay and not self._pending_vrt2_redisplay:
+                     self.grid_container.adjustSize(); self.scroll_area.updateGeometry()
             return
 
-
-        # Store batch data for incremental processing by _process_single_widget_add
-        self._current_add_batch_data = list(glyph_data_batch) # Make a copy
-        self._current_add_batch_index = 0
-        self._current_add_batch_type_is_vrt2 = is_vrt2_batch
-        self._current_add_batch_is_final_for_type = is_final_for_type
+        self._master_batch_queue.append(
+            (list(glyph_data_batch), is_vrt2_batch, is_final_for_type)
+        )
         
-        # Handle VRT2 separator logic immediately if this is the first VRT2 data
-        if is_vrt2_batch and self._current_add_batch_data and not self._has_vrt2_section_separator:
+        if not self._is_processing_master_batch:
+            self._start_processing_next_master_batch()
+
+    def _start_processing_next_master_batch(self):
+        if not self._master_batch_queue:
+            self._is_processing_master_batch = False
+            # Check if we were in a redisplay flow (initiated by _on_filter_changed)
+            if self._pending_standard_redisplay or self._pending_vrt2_redisplay:
+                # There are still chunks in the _pending_ lists for redisplay, schedule the next one
+                self._schedule_incremental_add()
+            elif self._redisplay_active_char_cache:
+                # All _pending_ lists are empty, and master queue is empty. Redisplay is complete.
+                self._finalize_incremental_add()
+            # Else: all batches from an initial load (not filter-redisplay) are done.
+            # MainWindow._check_and_finalize_loading_state handles the overall finalization.
+            return
+
+        self._is_processing_master_batch = True
+        
+        current_batch_info = self._master_batch_queue.pop(0)
+        self._current_add_batch_data, self._current_add_batch_type_is_vrt2, self._current_add_batch_is_final_for_type = current_batch_info
+        self._current_add_batch_index = 0
+        
+        is_vrt2_current_batch = self._current_add_batch_type_is_vrt2
+        
+        # Handle VRT2 separator logic (only if this batch actually contains VRT2 items)
+        if is_vrt2_current_batch and self._current_add_batch_data and not self._has_vrt2_section_separator:
             current_row_for_separator = (self._current_standard_glyph_count + GRID_COLUMNS -1) // GRID_COLUMNS
             if self._current_standard_glyph_count == 0 and self._vrt2_separator_widget is None:
                 current_row_for_separator = 0
 
             if self._vrt2_separator_widget: 
                 self.grid_layout.removeWidget(self._vrt2_separator_widget)
-                self._vrt2_separator_widget.deleteLater()
+                self._vrt2_separator_widget.deleteLater(); self._vrt2_separator_widget = None
             
             separator_label = QLabel("--- 非回転縦書きグリフ ---") 
             separator_label.setAlignment(Qt.AlignCenter)
@@ -2238,11 +2266,11 @@ class GlyphGridWidget(QWidget):
             self._single_widget_add_timer.timeout.connect(self._process_single_widget_add)
         
         if not self._single_widget_add_timer.isActive():
-            self._single_widget_add_timer.start(0) # Process next widget ASAP
+            self._single_widget_add_timer.start(0)
 
     def _process_single_widget_add(self):
         if not self._current_add_batch_data or self._current_add_batch_index >= len(self._current_add_batch_data):
-            # Current batch of widgets for add_glyph_batch is finished
+            # Current internal batch (_current_add_batch_data) is finished
             is_vrt2_batch_that_finished = self._current_add_batch_type_is_vrt2
             is_final_for_type_of_finished_batch = self._current_add_batch_is_final_for_type
             
@@ -2254,35 +2282,23 @@ class GlyphGridWidget(QWidget):
                 if is_vrt2_batch_that_finished and self._has_vrt2_section_separator and self._current_vrt2_glyph_count == 0:
                     if self._vrt2_separator_widget:
                         self.grid_layout.removeWidget(self._vrt2_separator_widget)
-                        self._vrt2_separator_widget.deleteLater()
-                        self._vrt2_separator_widget = None
+                        self._vrt2_separator_widget.deleteLater(); self._vrt2_separator_widget = None
                     self._has_vrt2_section_separator = False
                 
-                # If this isn't part of a larger _pending_ redisplay (i.e., it's from initial load),
-                # then we can adjust size here for this type completion.
-                is_part_of_pending_redisplay = bool(self._pending_standard_redisplay or self._pending_vrt2_redisplay)
-                if not is_part_of_pending_redisplay:
-                    self.grid_container.adjustSize() # Adjust for the completed type
+                is_part_of_pending_redisplay = bool(self._pending_standard_redisplay or self._pending_vrt2_redisplay or self._master_batch_queue)
+                if not is_part_of_pending_redisplay : # From initial load and this type is done
+                    self.grid_container.adjustSize() 
                     self.scroll_area.updateGeometry()
 
-            # Check if there are more *chunks* for the incremental redisplay
-            if self._pending_standard_redisplay or self._pending_vrt2_redisplay:
-                # Yield to _incremental_redisplay_timer to process the next chunk from pending lists
-                if self._incremental_redisplay_timer and not self._incremental_redisplay_timer.isActive():
-                     self._incremental_redisplay_timer.start(0)
-            elif self._redisplay_active_char_cache and (not self._single_widget_add_timer or not self._single_widget_add_timer.isActive()):
-                 # This means all pending chunks and all widgets within those chunks for redisplay are done.
-                 self._finalize_incremental_add() # Finalize the entire redisplay operation
-            # If not part of pending redisplay and no active char cache, it means a regular add_glyph_batch (from load) finished.
-            # Size adjustment for that type was handled above if is_final_for_type_of_finished_batch.
+            # Try to process the next master batch from the queue
+            self._start_processing_next_master_batch()
             return
 
-
-        # --- Process one widget ---
+        # --- Process one widget from _current_add_batch_data ---
         char, pixmap = self._current_add_batch_data[self._current_add_batch_index]
-        is_vrt2_batch = self._current_add_batch_type_is_vrt2
+        is_vrt2_batch_for_this_widget = self._current_add_batch_type_is_vrt2
         
-        if is_vrt2_batch:
+        if is_vrt2_batch_for_this_widget:
             base_row_offset = (self._current_standard_glyph_count + GRID_COLUMNS -1) // GRID_COLUMNS
             if self._current_standard_glyph_count == 0: base_row_offset = 0
             if self._has_vrt2_section_separator: base_row_offset +=1
@@ -2292,7 +2308,7 @@ class GlyphGridWidget(QWidget):
             current_item_index_in_type = self._current_standard_glyph_count
 
         item_widget = GlyphItemWidget(char, pixmap)
-        if is_vrt2_batch:
+        if is_vrt2_batch_for_this_widget:
             item_widget.clicked.connect(self._handle_special_vrt2_glyph_click)
             item_widget.set_vrt2_highlight(False) 
             self.special_vrt2_glyph_widgets[char] = item_widget
@@ -2304,103 +2320,18 @@ class GlyphGridWidget(QWidget):
         row, col = divmod(current_item_index_in_type, GRID_COLUMNS)
         self.grid_layout.addWidget(item_widget, base_row_offset + row, col, Qt.AlignTop)
 
-        if is_vrt2_batch:
+        if is_vrt2_batch_for_this_widget:
             self._current_vrt2_glyph_count += 1
         else:
             self._current_standard_glyph_count += 1
         
         self._current_add_batch_index += 1
         
-        self._schedule_single_widget_add() 
-
-
-    def _schedule_single_widget_add(self):
-        if not self._single_widget_add_timer:
-            self._single_widget_add_timer = QTimer(self)
-            self._single_widget_add_timer.setSingleShot(True)
-            self._single_widget_add_timer.timeout.connect(self._process_single_widget_add)
-        
-        if not self._single_widget_add_timer.isActive():
-            self._single_widget_add_timer.start(0) # Process next widget ASAP
-
-    def _process_single_widget_add(self):
-        if not self._current_add_batch_data or self._current_add_batch_index >= len(self._current_add_batch_data):
-            # Current batch finished, check if overall incremental redisplay or load is done
-            is_vrt2_batch = self._current_add_batch_type_is_vrt2
-            is_final_for_type = self._current_add_batch_is_final_for_type
-            
-            self._current_add_batch_data.clear()
-            self._current_add_batch_index = 0
-
-            if is_final_for_type:
-                if is_vrt2_batch and self._has_vrt2_section_separator and self._current_vrt2_glyph_count == 0:
-                    if self._vrt2_separator_widget:
-                        self.grid_layout.removeWidget(self._vrt2_separator_widget)
-                        self._vrt2_separator_widget.deleteLater()
-                        self._vrt2_separator_widget = None
-                    self._has_vrt2_section_separator = False
-                
-                # Check if this was the end of an incremental redisplay triggered by _on_filter_changed
-                # or if it's a batch from initial LoadProjectWorker
-                is_part_of_redisplay = bool(self._pending_standard_redisplay or self._pending_vrt2_redisplay)
-                
-                if not is_part_of_redisplay: # End of a LoadProjectWorker batch
-                    self.grid_container.adjustSize()
-                    self.scroll_area.updateGeometry()
-                # If it was part of redisplay, _finalize_incremental_add will handle final adjustments.
-
-            # If part of a larger incremental redisplay, continue that
-            if self._pending_standard_redisplay or self._pending_vrt2_redisplay:
-                self._schedule_incremental_add() # Process next chunk of redisplay
-            elif self._redisplay_active_char_cache and not self._single_widget_add_timer.isActive(): # Check if this was the very end of redisplay
-                 self._finalize_incremental_add()
-            return
-
-        char, pixmap = self._current_add_batch_data[self._current_add_batch_index]
-        is_vrt2_batch = self._current_add_batch_type_is_vrt2
-        
-        # Determine base row offset (same logic as before, but applied per widget)
-        if is_vrt2_batch:
-            base_row_offset = (self._current_standard_glyph_count + GRID_COLUMNS -1) // GRID_COLUMNS
-            if self._current_standard_glyph_count == 0: base_row_offset = 0
-            if self._has_vrt2_section_separator: base_row_offset +=1
-            # Index within the VRT2 type itself for layout
-            current_item_index_in_type = self._current_vrt2_glyph_count 
-        else:
-            base_row_offset = 0
-            # Index within the standard type itself for layout
-            current_item_index_in_type = self._current_standard_glyph_count
-
-        item_widget = GlyphItemWidget(char, pixmap)
-        if is_vrt2_batch:
-            item_widget.clicked.connect(self._handle_special_vrt2_glyph_click)
-            item_widget.set_vrt2_highlight(False) 
-            self.special_vrt2_glyph_widgets[char] = item_widget
-        else:
-            item_widget.clicked.connect(self.glyph_selected_signal)
-            item_widget.set_vrt2_highlight(char in self.non_rotated_vrt2_chars)
-            self.glyph_widgets[char] = item_widget
-        
-        row, col = divmod(current_item_index_in_type, GRID_COLUMNS)
-        self.grid_layout.addWidget(item_widget, base_row_offset + row, col, Qt.AlignTop)
-
-        # Increment counts *after* adding the widget
-        if is_vrt2_batch:
-            self._current_vrt2_glyph_count += 1
-        else:
-            self._current_standard_glyph_count += 1
-        
-        self._current_add_batch_index += 1
-        
-        # Process one widget, then yield via timer
-        self._schedule_single_widget_add()
+        self._schedule_single_widget_add() # Schedule next widget in current internal batch
 
 
     def _handle_special_vrt2_glyph_click(self, character: str):
         self.vrt2_glyph_selected_signal.emit(character)
-
-
-
 
 
     def set_active_glyph(self, character: Optional[str], is_vrt2_source: bool = False):
@@ -2431,19 +2362,34 @@ class GlyphGridWidget(QWidget):
 
             if widget_to_activate:
                 widget_to_activate.set_active(True)
-                # Ensure widget is visible only if not in the middle of an incremental add/redisplay
-                # Check if any timers related to adding widgets are active.
-                is_adding_incrementally = (self._incremental_redisplay_timer and self._incremental_redisplay_timer.isActive()) or \
-                                          (self._single_widget_add_timer and self._single_widget_add_timer.isActive()) or \
-                                          (self._current_add_batch_data and self._current_add_batch_index < len(self._current_add_batch_data)) or \
-                                          self._pending_standard_redisplay or self._pending_vrt2_redisplay
+                # Updated check for whether items are still being added
+                is_adding_incrementally = (self._is_processing_master_batch or \
+                                          bool(self._master_batch_queue) or \
+                                          bool(self._pending_standard_redisplay) or \
+                                          bool(self._pending_vrt2_redisplay))
 
                 if not is_adding_incrementally:
-                    # Delay slightly more to ensure layout is fully stable after all additions.
                     scroll_call = functools.partial(self.scroll_area.ensureWidgetVisible, widget_to_activate, 50, 50) 
                     QTimer.singleShot(100, scroll_call) 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
     def update_glyph_preview(self, character: str, pixmap: QPixmap):
         updated_in_filter_cache = False
         old_pixmap_in_cache = None
