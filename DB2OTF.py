@@ -1,51 +1,29 @@
 #!/usr/bin/env python3
 import argparse
-import sqlite3
+import io
 import os
-import shutil
-import glob
 import re
-import subprocess
 import sys
+import glob
+import shutil
+import sqlite3
+import subprocess
 from pathlib import Path
 import xml.etree.ElementTree as ET
-import io # Added for BytesIO
+from PIL import Image, ImageOps, ImageChops
+import numpy as np
+from skimage import measure
+from skimage.filters import threshold_otsu
+from scipy.signal import savgol_filter
+import svgwrite
+from fontTools.svgLib import SVGPath
+from fontTools.pens.pointPen import SegmentToPointPen
+from fontTools.pens.transformPen import TransformPointPen
+from fontTools.misc.transform import Transform
+import ufoLib2
 
-try:
-    from PIL import Image, ImageOps, ImageChops
-except ImportError:
-    print("Pillowライブラリが見つかりません。pip install Pillow でインストールしてください。")
-    sys.exit(1)
 
-try:
-    import numpy as np
-except ImportError:
-    print("NumPyライブラリが見つかりません。pip install numpy でインストールしてください。")
-    sys.exit(1)
 
-try:
-    from skimage import measure
-    from skimage.filters import threshold_otsu
-    from scipy.signal import savgol_filter
-except ImportError:
-    print("scikit-imageまたはSciPyが見つかりません。pip install scikit-image scipy でインストールしてください。")
-    sys.exit(1)
-
-try:
-    import svgwrite
-except ImportError:
-    print("svgwriteライブラリが見つかりません。pip install svgwrite でインストールしてください。")
-    sys.exit(1)
-
-try:
-    from fontTools.svgLib import SVGPath
-    from fontTools.pens.pointPen import SegmentToPointPen
-    from fontTools.pens.transformPen import TransformPointPen
-    from fontTools.misc.transform import Transform
-    import ufoLib2
-except ImportError:
-    print("fontToolsまたはufoLib2が見つかりません。pip install fonttools ufolib2 fontmake でインストールしてください。")
-    sys.exit(1)
 
 # --- 定数 (main.pyから一部持ってくるが、DBクエリで直接キーを使うので多くは不要) ---
 TMP_DIR_BASE_NAME = "tmp"
@@ -604,7 +582,6 @@ def main():
     parser.add_argument("--db_path", required=True, help="入力となる.fontprojデータベースファイルのパス")
     args = parser.parse_args()
 
-    print(f"処理開始: {args.db_path}")
 
     base_dir = Path(".").resolve() 
     tmp_dir = base_dir / TMP_DIR_BASE_NAME
@@ -617,7 +594,6 @@ def main():
 
     for p in [img_tmp, svg_tmp, ufo_tmp]:
         if p.exists():
-            print(f"既存の一時ディレクトリをクリーンアップ: {p}")
             shutil.rmtree(p)
         p.mkdir(parents=True, exist_ok=True) 
     
@@ -630,12 +606,10 @@ def main():
         step2_convert_images_to_svg(img_tmp, svg_tmp)
         step3_build_otf_from_svgs(svg_tmp, db_helper, ufo_tmp, otf_output_dir)
 
-        print("\nフォントビルド処理が完了しました。")
+
 
     except Exception as e:
-        import traceback
-        print(f"\n致命的なエラーが発生しました: {e}")
-        print(traceback.format_exc())
+
         sys.exit(1) 
 
 if __name__ == "__main__":
