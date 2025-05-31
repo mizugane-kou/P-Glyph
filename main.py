@@ -2049,6 +2049,7 @@ class GlyphTableDelegate(QStyledItemDelegate):
 
 # --- GlyphGridWidget の修正箇所 ---
 # --- GlyphGridWidget の修正箇所 ---
+
 class GlyphGridWidget(QWidget):
     glyph_selected_signal = Signal(str)
     vrt2_glyph_selected_signal = Signal(str)
@@ -2094,13 +2095,14 @@ class GlyphGridWidget(QWidget):
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self.current_active_view = self.std_glyph_view
-        # self.current_active_view.setFocus() # 初期フォーカスは MainWindow で制御することがあるため、ここからは削除検討
-
+        
         grid_width = DELEGATE_GRID_COLUMNS * DELEGATE_CELL_BASE_WIDTH + \
                      (DELEGATE_GRID_COLUMNS * DELEGATE_ITEM_MARGIN * 2) + \
-                     2
-        self.setFixedWidth(grid_width)
-        self.setFocusPolicy(Qt.StrongFocus) # GlyphGridWidget 自体もフォーカスを受け取れるように
+                     2 # Account for borders/padding
+        self.setFixedWidth(grid_width) 
+
+
+        self.setFocusPolicy(Qt.StrongFocus) 
 
     def _setup_table_view(self, view: QTableView, model: GlyphTableModel, delegate: GlyphTableDelegate):
         view.setModel(model)
@@ -2108,7 +2110,7 @@ class GlyphGridWidget(QWidget):
         view.horizontalHeader().hide()
         view.verticalHeader().hide()
         view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems) # Important
         view.setShowGrid(False)
         view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -2119,25 +2121,23 @@ class GlyphGridWidget(QWidget):
 
         initial_cell_size_normal = delegate.sizeHint(temp_option, QModelIndex())
         initial_cell_size_selected = delegate.sizeHint(temp_option_selected, QModelIndex())
-
+        
         actual_cell_width = max(initial_cell_size_normal.width(), initial_cell_size_selected.width())
         actual_cell_height = max(initial_cell_size_normal.height(), initial_cell_size_selected.height())
 
         for i in range(model.columnCount()):
             view.setColumnWidth(i, actual_cell_width)
         view.verticalHeader().setDefaultSectionSize(actual_cell_height)
-
+        
         view.clicked.connect(self._on_item_clicked)
         view.selectionModel().currentChanged.connect(self._on_current_item_changed_in_view)
 
         view.setStyleSheet("""
             QTableView { background-color: palette(window); border: 1px solid palette(mid); gridline-color: transparent; }
             QTableView::item { border: none; padding: 0px; margin: 0px; background-color: transparent; }
-            QTableView::item:selected { background-color: transparent; }
+            QTableView::item:selected { background-color: transparent; } 
         """)
-        view.setFocusPolicy(Qt.StrongFocus) # 各TableViewもフォーカスを受け取れるように
-
-        # イベントフィルターをインストール
+        view.setFocusPolicy(Qt.StrongFocus)
         view.installEventFilter(self)
 
 
@@ -2151,12 +2151,11 @@ class GlyphGridWidget(QWidget):
                         if key_event.isAccepted():
                             return True 
                         else:
-                            # If custom logic didn't accept, but we still want to consume to prevent default QTableView nav
-                            return True # Or False if you want QTableView's default to run if yours doesn't accept
+                            return True 
                     else:
-                        return False # Allow QTableView default for modified arrow keys
+                        return False 
                 else:
-                     return False # Allow QTableView default for non-arrow keys
+                     return False 
         return super().eventFilter(watched, event)
 
     def set_search_and_filter_enabled(self, enabled: bool):
@@ -2178,8 +2177,8 @@ class GlyphGridWidget(QWidget):
         
         flat_idx = target_model.get_flat_index_of_char_key(char_to_find)
         if flat_idx is not None:
-            self._select_char_in_view(char_to_find, target_view, target_model) # <<< 変更
-            self.search_input.clear()
+            self._select_char_in_view(char_to_find, target_view, target_model)
+            self.search_input.clear() # Clearing search input should not steal focus from canvas (which will be set by load_glyph_for_editing)
             return
         
         QMessageBox.information(self, "検索結果", f"文字 '{search_text}' は現在表示中のリストに見つかりません。")
@@ -2198,19 +2197,22 @@ class GlyphGridWidget(QWidget):
         else:
             self.current_active_view = self.vrt2_glyph_view
         
-        self.current_active_view.setFocus() 
+        # self.current_active_view.setFocus() # Let MainWindow handle final focus
         self.search_input.clear()
         self._try_to_restore_selection_or_select_first(self.current_active_view)
 
+
     def _on_item_clicked(self, index: QModelIndex):
-        if self._is_selecting_programmatically or not index.isValid(): 
+        if self._is_selecting_programmatically or not index.isValid():
             return
         
         view = self.sender()
         if not isinstance(view, QTableView):
             return
         
-        view.setFocus()
+        # view.setFocus() # Removed: Let MainWindow handle final focus to canvas
+        # The click itself will trigger selectionModel().currentChanged if selection changes,
+        # which leads to _on_current_item_changed_in_view -> signal -> MainWindow.load_glyph_for_editing -> canvas focus.
 
 
     def _on_current_item_changed_in_view(self, current: QModelIndex, previous: QModelIndex):
@@ -2218,18 +2220,17 @@ class GlyphGridWidget(QWidget):
             return
 
         active_view = self.current_active_view 
-        model = active_view.model() # current_active_view のモデルを使用
+        model = active_view.model()
         if not isinstance(model, GlyphTableModel):
             return
 
-        if not current.isValid(): # 新しいカレントインデックスが無効な場合
+        if not current.isValid():
             is_vrt2_source_for_clear = (active_view == self.vrt2_glyph_view)
             self._emit_selection_signal("", is_vrt2_source_for_clear)
             return
         
-        # current QModelIndex から char_key を取得
         char_key_from_current_idx = model.data(current, Qt.UserRole)
-        if char_key_from_current_idx: # 新しいカレントインデックスから文字キーが取れた場合
+        if char_key_from_current_idx:
             is_vrt2_source = (active_view == self.vrt2_glyph_view)
             self._emit_selection_signal(char_key_from_current_idx, is_vrt2_source)
 
@@ -2255,47 +2256,33 @@ class GlyphGridWidget(QWidget):
     def populate_models(self, 
                         std_char_data: List[Tuple[str, bool]], 
                         vrt2_char_data: List[Tuple[str, bool]]):
-        self._is_selecting_programmatically = True # モデル変更中はシグナル発行を抑制
+        self._is_selecting_programmatically = True
         try:
             self.std_glyph_model.set_character_data(std_char_data)
             self.vrt2_glyph_model.set_character_data(vrt2_char_data)
         finally:
             self._is_selecting_programmatically = False
 
-        # populate直後の選択は MainWindow の _select_initial_glyph_after_full_load で行う
-        # ここでは何もしないか、あるいは _try_to_restore_selection_or_select_first を呼ぶ
-        # ただし、_try_to_restore はシグナルを発行する可能性があるため、
-        # 初期ロード時は MainWindow 側で制御するのが望ましい。
-        # self._try_to_restore_selection_or_select_first(self.current_active_view)
 
     def set_active_glyph(self, character: Optional[str], is_vrt2_source: bool = False):
-        """
-        指定されたグリフをアクティブにし、表示を更新する。
-        このメソッドは主にMainWindowから呼び出され、グリッドの表示を同期させる。
-        シグナルは発行しない（循環呼び出しを避けるため）。
-        """
         if self._is_selecting_programmatically: 
             return
 
-        self._is_selecting_programmatically = True
+        self._is_selecting_programmatically = True # Prevent signals during programmatic update
         try:
             target_view = self.vrt2_glyph_view if is_vrt2_source else self.std_glyph_view
             target_model = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
 
             target_tab_index = 1 if is_vrt2_source else 0
             if self.tab_widget.currentIndex() != target_tab_index:
-                # _on_tab_changed が呼ばれ、そこで current_active_view とフォーカスが設定される
                 self.tab_widget.setCurrentIndex(target_tab_index) 
+                # _on_tab_changed will set self.current_active_view
             else:
-                # タブが変わらない場合でも、current_active_view を更新し、フォーカスを当てる
-                self.current_active_view = target_view
-                # target_view.setFocus() # ★★★ フォーカスを設定 ★★★
-                # → _on_tab_changed が呼ばれない場合、ここでフォーカスが必要
+                self.current_active_view = target_view # Ensure current_active_view is correct
 
             if character is None or not character:
                 target_view.selectionModel().clear()
-                # target_view.setFocus() # フォーカスはタブ変更時かアイテムクリック時に
-                self._is_selecting_programmatically = False # 早期リターンの前にフラグを解除
+                self._is_selecting_programmatically = False # Early exit, reset flag
                 return
 
             flat_idx = target_model.get_flat_index_of_char_key(character)
@@ -2303,44 +2290,30 @@ class GlyphGridWidget(QWidget):
                 row, col = divmod(flat_idx, target_model.columnCount())
                 q_model_idx = target_model.index(row, col)
                 if q_model_idx.isValid():
+                    # Only change selection if it's actually different
                     if target_view.currentIndex() != q_model_idx:
                          target_view.selectionModel().setCurrentIndex(q_model_idx, QItemSelectionModel.ClearAndSelect)
                     target_view.scrollTo(q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-                else:
+                else: # Should not happen if flat_idx is valid
                     target_view.selectionModel().clear()
-            else:
+            else: # Character not found in this model's filtered list
                 target_view.selectionModel().clear()
             
-            # 最終的にフォーカスを当てるのは、実際に操作対象となるビュー
-            # self.current_active_view.setFocus() # current_active_view はタブ変更で更新される
-            # タブ変更がない場合は target_view が current_active_view と同じはず
-            if self.tab_widget.currentIndex() == target_tab_index: # タブ変更がなかった場合
-                 target_view.setFocus()
-            # タブ変更があった場合は、_on_tab_changed でフォーカスが設定される
-
+            # Removed target_view.setFocus() here. MainWindow will handle final focus.
         finally:
             self._is_selecting_programmatically = False
 
 
-
     def _select_char_in_view(self, character: Optional[str], view: QTableView, model: GlyphTableModel):
-        # if self._is_selecting_programmatically: # このメソッドはユーザー操作の起点なので、このチェックは不要
-        #     return
-
-        # self._is_selecting_programmatically = True # <<< この行を削除。このメソッドはユーザー操作の結果なのでFalseのまま。
-        # try: # try-finally も不要になる
         current_selection_model = view.selectionModel()
         if not current_selection_model:
             return
-
-        old_model_idx = current_selection_model.currentIndex()
-        # old_char_key = model.data(old_model_idx, Qt.UserRole) if old_model_idx.isValid() else None # old_char_key比較は不要に
         
         new_q_model_idx = QModelIndex()
 
         if character is None or not character:
-            if old_model_idx.isValid():
-                current_selection_model.clear() # これが _on_current_item_changed_in_view をトリガー
+            # Clearing selection will trigger _on_current_item_changed_in_view
+            current_selection_model.clear()
         else:
             flat_idx = model.get_flat_index_of_char_key(character)
             if flat_idx is not None:
@@ -2348,21 +2321,19 @@ class GlyphGridWidget(QWidget):
                 q_model_idx_candidate = model.index(row, col)
                 if q_model_idx_candidate.isValid():
                     new_q_model_idx = q_model_idx_candidate
-                    if old_model_idx != new_q_model_idx: # 実際に選択が変わる場合のみsetCurrentIndex
-                        current_selection_model.setCurrentIndex(new_q_model_idx, QItemSelectionModel.ClearAndSelect)
+                    # This setCurrentIndex call is the key to triggering _on_current_item_changed_in_view
+                    # if the selection actually changes.
+                    current_selection_model.setCurrentIndex(new_q_model_idx, QItemSelectionModel.ClearAndSelect)
                     view.scrollTo(new_q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-                else: # モデルインデックスが無効
-                    if old_model_idx.isValid(): current_selection_model.clear()
-            else: # 文字が見つからない
-                if old_model_idx.isValid(): current_selection_model.clear()
+                else: 
+                    current_selection_model.clear()
+            else: 
+                current_selection_model.clear()
         
-        view.setFocus()
+        # Removed view.setFocus(). Let selection change signals propagate.
 
 
     def _try_to_restore_selection_or_select_first(self, view_to_update: QTableView):
-        # if self._is_selecting_programmatically: # このメソッド自体は外部要因で呼ばれるので、このチェックは不要
-        #     return
-
         model_to_update = view_to_update.model()
         if not isinstance(model_to_update, GlyphTableModel): return
 
@@ -2373,23 +2344,21 @@ class GlyphGridWidget(QWidget):
             current_char_key = model_to_update.data(current_selection_model_idx, Qt.UserRole)
         
         if current_char_key and model_to_update.get_flat_index_of_char_key(current_char_key) is not None:
-            self._select_char_in_view(current_char_key, view_to_update, model_to_update) # <<< 変更
+            self._select_char_in_view(current_char_key, view_to_update, model_to_update)
         elif model_to_update.get_metadata_count() > 0:
             first_item_char_key = model_to_update.get_char_key_at_flat_index(0)
             if first_item_char_key:
-                 self._select_char_in_view(first_item_char_key, view_to_update, model_to_update) # <<< 変更
+                 self._select_char_in_view(first_item_char_key, view_to_update, model_to_update)
         else: 
             self._select_char_in_view(None, view_to_update, model_to_update)
 
 
-    # ... (update_glyph_preview, get_first_navigable_glyph_info, get_navigable_glyphs_info_for_active_tab は変更なし) ...
     def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool):
         model_to_update = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
         model_to_update.update_glyph_pixmap(character, pixmap)
 
     def get_first_navigable_glyph_info(self) -> Optional[Tuple[str, bool]]:
-        # このメソッドは外部から呼ばれるので、現在のUI状態に基づいて情報を返す
-        active_view_for_info = self.current_active_view # タブ変更直後でも正しいビューを参照
+        active_view_for_info = self.current_active_view
         active_model = active_view_for_info.model()
         is_active_vrt2 = (active_view_for_info == self.vrt2_glyph_view)
         
@@ -2420,10 +2389,6 @@ class GlyphGridWidget(QWidget):
 
 
     def keyPressEvent(self, event: QKeyEvent):
-        # if self._is_selecting_programmatically: # このメソッドはユーザー操作の起点なので、このチェックは不要
-        #     event.ignore()
-        #     return
-
         view = self.current_active_view
         model = view.model()
         if not isinstance(model, GlyphTableModel):
@@ -2435,8 +2400,7 @@ class GlyphGridWidget(QWidget):
         if event.modifiers() != Qt.NoModifier and event.modifiers() != Qt.KeypadModifier:
             if key in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
                 super().keyPressEvent(event)
-                if event.isAccepted():
-                    return
+                if event.isAccepted(): return
                 return
             else: 
                 super().keyPressEvent(event)
@@ -2447,7 +2411,6 @@ class GlyphGridWidget(QWidget):
             return
 
         current_model_idx = view.currentIndex()
-        
         num_cols = model.columnCount()
         total_visible_items = model.get_metadata_count()
 
@@ -2460,7 +2423,6 @@ class GlyphGridWidget(QWidget):
             current_row_from_idx = current_model_idx.row()
             current_col_from_idx = current_model_idx.column()
             current_flat_idx = current_row_from_idx * num_cols + current_col_from_idx
-            
             if not (0 <= current_flat_idx < total_visible_items):
                 current_flat_idx = -1 
         
@@ -2468,7 +2430,7 @@ class GlyphGridWidget(QWidget):
             if total_visible_items > 0:
                 first_item_char_key = model.get_char_key_at_flat_index(0)
                 if first_item_char_key:
-                    self._select_char_in_view(first_item_char_key, view, model) # <<< 変更
+                    self._select_char_in_view(first_item_char_key, view, model) # Triggers selection chain
                 event.accept()
             else:
                 super().keyPressEvent(event)
@@ -2479,16 +2441,13 @@ class GlyphGridWidget(QWidget):
         if key == Qt.Key_Left:
             if current_flat_idx > 0:
                 target_flat_idx = current_flat_idx - 1
-        
         elif key == Qt.Key_Right:
             if current_flat_idx < total_visible_items - 1:
                 target_flat_idx = current_flat_idx + 1
-        
         elif key == Qt.Key_Up:
             potential_target_idx = current_flat_idx - num_cols
             if potential_target_idx >= 0:
                 target_flat_idx = potential_target_idx
-        
         elif key == Qt.Key_Down:
             potential_target_idx = current_flat_idx + num_cols
             if potential_target_idx < total_visible_items:
@@ -2498,9 +2457,12 @@ class GlyphGridWidget(QWidget):
             if 0 <= target_flat_idx < total_visible_items:
                 char_to_select = model.get_char_key_at_flat_index(target_flat_idx)
                 if char_to_select: 
-                    self._select_char_in_view(char_to_select, view, model) # <<< 変更
+                    self._select_char_in_view(char_to_select, view, model) # Triggers selection chain
         
         event.accept()
+
+
+
 
 
 # --- Properties Widget (変更なし) ---
@@ -3431,22 +3393,19 @@ class MainWindow(QMainWindow):
 
     @Slot(str) 
     @Slot(str, bool) 
-    def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False): # (SETTING_LAST_ACTIVE_GLYPH_IS_VRT2 save added)
-        if self._project_loading_in_progress: return # プロジェクト読み込み中は処理しない
+    def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False):
+        if self._project_loading_in_progress: return 
 
-        # 現在のキャンバス情報を取得（必要なら保存するため）
         current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
         current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value() 
         
-        # 新しいグリフをロードする前に、現在のグリフの情報を保存 (バッチ処理中でなければ)
         if current_canvas_char and not self._batch_operation_in_progress: 
-            # 読み込むグリフが現在のグリフと異なるか、VRT2モードが異なる場合のみ保存を試みる
             if current_canvas_char != character or \
                (current_canvas_char == character and is_vrt2_edit_mode != self.drawing_editor_widget.canvas.editing_vrt2_glyph):
-                 if not self.drawing_editor_widget.canvas.editing_vrt2_glyph: # 標準グリフの送り幅のみ保存
+                 if not self.drawing_editor_widget.canvas.editing_vrt2_glyph:
                      self._save_current_advance_width_sync(current_canvas_char, current_canvas_adv_width)
         
-        # ... (KVビューア更新ロジックは変更なし) ...
+        # Kanji Viewer update logic (unchanged)
         if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
             with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = character 
             self._kv_deferred_update_timer.start(self._kv_update_delay_ms) 
@@ -3460,10 +3419,12 @@ class MainWindow(QMainWindow):
             adv_width = DEFAULT_ADVANCE_WIDTH
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
             self.drawing_editor_widget.set_enabled_controls(False)
-            self.glyph_grid_widget.set_active_glyph(None)
+            self.glyph_grid_widget.set_active_glyph(None) # Visually clear grid selection
             self.drawing_editor_widget.update_unicode_display(None)
             self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
-            self.drawing_editor_widget.update_vrt2_controls(False, False); return
+            self.drawing_editor_widget.update_vrt2_controls(False, False)
+            self.drawing_editor_widget.canvas.setFocus() # <<< ADDED: Focus canvas even if no glyph
+            return
         
         adv_width = self.db_manager.load_glyph_advance_width(character)
         pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode)
@@ -3473,7 +3434,10 @@ class MainWindow(QMainWindow):
         
         self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode)
         self.drawing_editor_widget.set_enabled_controls(True)
-        self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode)
+        
+        # Tell grid to update its selection visually, but it won't emit signals back due to _is_selecting_programmatically
+        self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode) 
+        
         self.drawing_editor_widget.update_unicode_display(character)
         self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
         
@@ -3488,10 +3452,14 @@ class MainWindow(QMainWindow):
             current_glyph_has_content_on_canvas = self.drawing_editor_widget.canvas.image and not self.drawing_editor_widget.canvas.image.isNull() 
             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(editor_is_generally_enabled and current_glyph_has_content_on_canvas)
         
-        # <<< 修正箇所: バッチ処理中でなければ、最後にアクティブだったグリフとして保存 >>>
         if character and not self._project_loading_in_progress and not self._batch_operation_in_progress:
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_edit_mode))
+
+        self.drawing_editor_widget.canvas.setFocus() # <<< ADDED: Crucial for focus behavior
+
+
+
 
 
     @Slot(str, QPixmap, bool)
@@ -3820,12 +3788,12 @@ class MainWindow(QMainWindow):
 
 
 
+
     def keyPressEvent(self, event: QKeyEvent):
         if self._project_loading_in_progress:
             event.ignore()
             return
 
-        # Standard Undo/Redo shortcuts
         if event.matches(QKeySequence.StandardKey.Undo):
             if self.drawing_editor_widget.undo_button.isEnabled():
                 self.drawing_editor_widget.canvas.undo()
@@ -3837,55 +3805,46 @@ class MainWindow(QMainWindow):
 
         focus_widget = QApplication.focusWidget()
 
-        # If focus is on text input fields, let them handle the event
         if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox)):
-            super().keyPressEvent(event); return # Let input fields handle their keys
+            super().keyPressEvent(event); return
 
-        # Tool shortcuts if drawing editor's canvas has focus and a glyph is loaded
-        # This check is specific to canvas focus for tool shortcuts.
         is_drawing_canvas_focused_for_tools = (focus_widget == self.drawing_editor_widget.canvas)
         
         if is_drawing_canvas_focused_for_tools and \
            self.drawing_editor_widget.pen_button.isEnabled() and \
            self.drawing_editor_widget.canvas.current_glyph_character:
             if not event.isAutoRepeat():
-                key_tool = event.key() # Use a distinct variable name for tool keys
+                key_tool = event.key()
                 if key_tool == Qt.Key_E: self.drawing_editor_widget.eraser_button.click(); event.accept(); return
                 if key_tool == Qt.Key_B: self.drawing_editor_widget.pen_button.click(); event.accept(); return
                 if key_tool == Qt.Key_V: self.drawing_editor_widget.move_button.click(); event.accept(); return
 
-        # Navigation keys handling
-        key_nav = event.key() # Use a distinct variable name for navigation keys
+        key_nav = event.key()
         
         if key_nav in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
-            # --- START OF MODIFICATION FOR ARROW KEY NAVIGATION FROM DRAWING EDITOR CANVAS ---
-            # Check if the drawing editor's canvas specifically has focus
             is_canvas_focused_for_nav = (focus_widget == self.drawing_editor_widget.canvas)
             
             if is_canvas_focused_for_nav and \
                (event.modifiers() == Qt.NoModifier or event.modifiers() == Qt.KeypadModifier):
-                # If canvas has focus and an arrow key is pressed without modifiers,
-                # delegate this event to the GlyphGridWidget for navigation.
-                # GlyphGridWidget.keyPressEvent will handle selection change and focus update.
+                # If canvas has focus, delegate arrow keys to the grid.
+                # The grid's selection change will trigger load_glyph_for_editing,
+                # which in turn will set focus back to the canvas.
                 self.glyph_grid_widget.keyPressEvent(event)
                 if event.isAccepted():
-                    # GlyphGridWidget handled the event (selection changed, focus moved to grid).
                     return 
-                # If GlyphGridWidget did not accept (e.g., at boundary, no items),
-                # the event might be ignored or fall through. Since canvas itself
-                # usually doesn't use arrow keys for its own navigation, this is often fine.
-
             elif focus_widget == self.glyph_grid_widget.current_active_view or \
                  focus_widget == self.glyph_grid_widget:
-                # If focus is already on the grid or its views, let the grid handle it directly.
-                # This ensures that the grid's own navigation logic is prioritized when it has focus.
+                # If grid (or its view) has focus, let it handle its own navigation.
+                # This will also trigger load_glyph_for_editing, setting canvas focus.
                 self.glyph_grid_widget.keyPressEvent(event)
                 if event.isAccepted():
                     return
-            # --- END OF MODIFICATION FOR ARROW KEY NAVIGATION FROM DRAWING EDITOR CANVAS ---
         
-        # Fallback to default QMainWindow keyPressEvent handling if not specifically processed above
         super().keyPressEvent(event)
+
+
+
+
 
     def open_batch_advance_width_dialog(self): # (変更なし)
         if not self.current_project_path or self._project_loading_in_progress:
@@ -3954,7 +3913,8 @@ class MainWindow(QMainWindow):
     def batch_import_reference_images(self): self._process_batch_image_import(import_type="reference") # (grid update changed)
 
 
-    def _process_batch_image_import(self, import_type: str): # (Grid update changed)
+    def _process_batch_image_import(self, import_type: str):
+
         if not self.current_project_path or self._project_loading_in_progress:
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         
@@ -3963,14 +3923,12 @@ class MainWindow(QMainWindow):
         dialog_title_prefix = "グリフ画像" if import_type == "glyph" else "下書き画像"
         folder_dialog_title = f"{dialog_title_prefix}が含まれるフォルダを選択"
         
-        # <<< 修正点: ファイル選択ダイアログからフォルダ選択ダイアログへ変更 >>>
         selected_folder_path = QFileDialog.getExistingDirectory(self, folder_dialog_title)
 
         if not selected_folder_path:
             self._batch_operation_in_progress = False 
             return
 
-        # <<< 修正点: 選択されたフォルダから画像ファイルリストを作成 >>>
         image_extensions = {".png", ".jpg", ".jpeg", ".bmp"}
         file_paths: List[str] = []
         try:
@@ -3988,9 +3946,6 @@ class MainWindow(QMainWindow):
             self._batch_operation_in_progress = False
             return
         
-        # --- ここから下のロジックは基本的に変更なし ---
-        # ただし、statusBarのメッセージを修正
-
         target_image_size = QSize(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT)
         if not self.project_glyph_chars_cache: 
             all_glyphs_data_raw = self.db_manager.get_all_glyphs_with_preview_data()
@@ -4002,7 +3957,6 @@ class MainWindow(QMainWindow):
         skipped_char_not_in_project = 0; skipped_image_load_error = 0; db_update_errors = 0
         total_files = len(file_paths)
         
-        # StatusBarのメッセージ修正
         status_bar_message_prefix = "グリフ一括読み込み" if import_type == "glyph" else "下書き一括読み込み"
         self.statusBar().showMessage(f"{status_bar_message_prefix} を開始します ({total_files} ファイル from '{os.path.basename(selected_folder_path)}')...", 0); QApplication.processEvents()
         
@@ -4031,12 +3985,12 @@ class MainWindow(QMainWindow):
                 if import_type == "reference" and is_vrt2_ref_candidate:
                     if character not in self.non_rotated_vrt2_chars: skipped_char_not_in_project +=1; continue
                     target_is_nrvg_for_ref = True
-                elif character not in self.project_glyph_chars_cache: skipped_char_not_in_project += 1; continue
+                elif character not in self.project_glyph_chars_cache and character != '.notdef': # Allow .notdef
+                     skipped_char_not_in_project += 1; continue
                 
-                try: # <<< QImage読み込みのtry-exceptを追加
+                try: 
                     qimage = QImage(file_path_str)
-                except Exception as img_load_exc: # QImageが内部で例外を出す場合もキャッチ
-
+                except Exception:
                     skipped_image_load_error += 1; continue
 
                 if qimage.isNull(): skipped_image_load_error += 1; continue
@@ -4063,7 +4017,7 @@ class MainWindow(QMainWindow):
                     is_editor_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
                     if character == current_editor_char:
                         if import_type == "glyph" and not is_editor_vrt2_editing: 
-                            self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) 
+                            self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) # This will set canvas focus
                         elif import_type == "reference":
                             if target_is_nrvg_for_ref and is_editor_vrt2_editing: 
                                 self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
@@ -4075,8 +4029,11 @@ class MainWindow(QMainWindow):
         finally:
             self._batch_operation_in_progress = False 
             self._save_current_editor_state_settings() 
+            # After batch operations, ensure the editor canvas has focus if a glyph is loaded
+            if self.drawing_editor_widget.canvas.current_glyph_character:
+                self.drawing_editor_widget.canvas.setFocus()
         
-        self.statusBar().showMessage(f"{status_bar_message_prefix} 完了", 5000) # StatusBarメッセージ修正
+        self.statusBar().showMessage(f"{status_bar_message_prefix} 完了", 5000)
         summary_parts = [f"{processed_count} 件の画像を処理・保存しました。"]
         if skipped_filename_format > 0: summary_parts.append(f"{skipped_filename_format} 件: ファイル名形式エラー")
         if skipped_unicode_conversion > 0: summary_parts.append(f"{skipped_unicode_conversion} 件: Unicode変換エラー")
@@ -4084,6 +4041,7 @@ class MainWindow(QMainWindow):
         if skipped_image_load_error > 0: summary_parts.append(f"{skipped_image_load_error} 件: 画像読み込みエラー")
         if db_update_errors > 0: summary_parts.append(f"{db_update_errors} 件: DB更新エラー")
         QMessageBox.information(self, "一括読み込み結果", "\n".join(summary_parts))
+
 
 
 
