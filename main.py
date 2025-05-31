@@ -2178,7 +2178,7 @@ class GlyphGridWidget(QWidget):
         
         flat_idx = target_model.get_flat_index_of_char_key(char_to_find)
         if flat_idx is not None:
-            self._select_char_in_view_and_emit(char_to_find, target_view, target_model) # 変更: emitを伴う選択
+            self._select_char_in_view(char_to_find, target_view, target_model) # <<< 変更
             self.search_input.clear()
             return
         
@@ -2203,23 +2203,14 @@ class GlyphGridWidget(QWidget):
         self._try_to_restore_selection_or_select_first(self.current_active_view)
 
     def _on_item_clicked(self, index: QModelIndex):
-        if self._is_selecting_programmatically or not index.isValid():
+        if self._is_selecting_programmatically or not index.isValid(): 
             return
         
         view = self.sender()
         if not isinstance(view, QTableView):
             return
         
-        view.setFocus() # ★★★ クリックされたビューにフォーカスをセット ★★★
-        
-        model = view.model()
-        if not isinstance(model, GlyphTableModel):
-            return
-            
-        char_key = model.data(index, Qt.UserRole)
-        if char_key:
-            is_vrt2_source = (view == self.vrt2_glyph_view)
-            self._emit_selection_signal(char_key, is_vrt2_source)
+        view.setFocus()
 
 
     def _on_current_item_changed_in_view(self, current: QModelIndex, previous: QModelIndex):
@@ -2331,54 +2322,46 @@ class GlyphGridWidget(QWidget):
             self._is_selecting_programmatically = False
 
 
-    def _select_char_in_view_and_emit(self, character: Optional[str], view: QTableView, model: GlyphTableModel):
-        """
-        指定された文字を選択し、必要であれば選択シグナルを発行する。
-        主にユーザー操作（キー入力、検索）から呼び出される。
-        """
-        if self._is_selecting_programmatically:
+
+    def _select_char_in_view(self, character: Optional[str], view: QTableView, model: GlyphTableModel):
+        # if self._is_selecting_programmatically: # このメソッドはユーザー操作の起点なので、このチェックは不要
+        #     return
+
+        # self._is_selecting_programmatically = True # <<< この行を削除。このメソッドはユーザー操作の結果なのでFalseのまま。
+        # try: # try-finally も不要になる
+        current_selection_model = view.selectionModel()
+        if not current_selection_model:
             return
 
-        self._is_selecting_programmatically = True
-        try:
-            current_selection_model = view.selectionModel()
-            if not current_selection_model:
-                return
+        old_model_idx = current_selection_model.currentIndex()
+        # old_char_key = model.data(old_model_idx, Qt.UserRole) if old_model_idx.isValid() else None # old_char_key比較は不要に
+        
+        new_q_model_idx = QModelIndex()
 
-            old_idx = current_selection_model.currentIndex()
-            old_char_key = model.data(old_idx, Qt.UserRole) if old_idx.isValid() else None
-
-            new_q_model_idx = QModelIndex() # デフォルトは無効なインデックス
-
-            if character is None or not character:
-                if old_idx.isValid(): # 実際に選択がクリアされる場合のみ
-                    current_selection_model.clear()
-                    # _on_current_item_changed_in_view が処理する
-            else:
-                flat_idx = model.get_flat_index_of_char_key(character)
-                if flat_idx is not None:
-                    row, col = divmod(flat_idx, model.columnCount())
-                    q_model_idx = model.index(row, col)
-                    if q_model_idx.isValid():
-                        new_q_model_idx = q_model_idx
-                        if old_idx != new_q_model_idx:
-                             current_selection_model.setCurrentIndex(new_q_model_idx, QItemSelectionModel.ClearAndSelect)
-                        view.scrollTo(new_q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-                    else: # モデルインデックスが無効
-                        if old_idx.isValid(): current_selection_model.clear()
-                else: # 文字が見つからない
-                    if old_idx.isValid(): current_selection_model.clear()
-            
-            view.setFocus()
-            # setCurrentIndex または clear を呼ぶと _on_current_item_changed_in_view がトリガーされ、
-            # そこで _emit_selection_signal が呼ばれるので、ここでは直接呼ばない。
-        finally:
-            self._is_selecting_programmatically = False
+        if character is None or not character:
+            if old_model_idx.isValid():
+                current_selection_model.clear() # これが _on_current_item_changed_in_view をトリガー
+        else:
+            flat_idx = model.get_flat_index_of_char_key(character)
+            if flat_idx is not None:
+                row, col = divmod(flat_idx, model.columnCount())
+                q_model_idx_candidate = model.index(row, col)
+                if q_model_idx_candidate.isValid():
+                    new_q_model_idx = q_model_idx_candidate
+                    if old_model_idx != new_q_model_idx: # 実際に選択が変わる場合のみsetCurrentIndex
+                        current_selection_model.setCurrentIndex(new_q_model_idx, QItemSelectionModel.ClearAndSelect)
+                    view.scrollTo(new_q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
+                else: # モデルインデックスが無効
+                    if old_model_idx.isValid(): current_selection_model.clear()
+            else: # 文字が見つからない
+                if old_model_idx.isValid(): current_selection_model.clear()
+        
+        view.setFocus()
 
 
     def _try_to_restore_selection_or_select_first(self, view_to_update: QTableView):
-        if self._is_selecting_programmatically:
-            return
+        # if self._is_selecting_programmatically: # このメソッド自体は外部要因で呼ばれるので、このチェックは不要
+        #     return
 
         model_to_update = view_to_update.model()
         if not isinstance(model_to_update, GlyphTableModel): return
@@ -2390,13 +2373,13 @@ class GlyphGridWidget(QWidget):
             current_char_key = model_to_update.data(current_selection_model_idx, Qt.UserRole)
         
         if current_char_key and model_to_update.get_flat_index_of_char_key(current_char_key) is not None:
-            self._select_char_in_view_and_emit(current_char_key, view_to_update, model_to_update)
+            self._select_char_in_view(current_char_key, view_to_update, model_to_update) # <<< 変更
         elif model_to_update.get_metadata_count() > 0:
             first_item_char_key = model_to_update.get_char_key_at_flat_index(0)
             if first_item_char_key:
-                 self._select_char_in_view_and_emit(first_item_char_key, view_to_update, model_to_update)
+                 self._select_char_in_view(first_item_char_key, view_to_update, model_to_update) # <<< 変更
         else: 
-            self._select_char_in_view_and_emit(None, view_to_update, model_to_update)
+            self._select_char_in_view(None, view_to_update, model_to_update)
 
 
     # ... (update_glyph_preview, get_first_navigable_glyph_info, get_navigable_glyphs_info_for_active_tab は変更なし) ...
@@ -2437,9 +2420,9 @@ class GlyphGridWidget(QWidget):
 
 
     def keyPressEvent(self, event: QKeyEvent):
-        if self._is_selecting_programmatically:
-            event.ignore()
-            return
+        # if self._is_selecting_programmatically: # このメソッドはユーザー操作の起点なので、このチェックは不要
+        #     event.ignore()
+        #     return
 
         view = self.current_active_view
         model = view.model()
@@ -2485,7 +2468,7 @@ class GlyphGridWidget(QWidget):
             if total_visible_items > 0:
                 first_item_char_key = model.get_char_key_at_flat_index(0)
                 if first_item_char_key:
-                    self._select_char_in_view_and_emit(first_item_char_key, view, model)
+                    self._select_char_in_view(first_item_char_key, view, model) # <<< 変更
                 event.accept()
             else:
                 super().keyPressEvent(event)
@@ -2515,9 +2498,11 @@ class GlyphGridWidget(QWidget):
             if 0 <= target_flat_idx < total_visible_items:
                 char_to_select = model.get_char_key_at_flat_index(target_flat_idx)
                 if char_to_select: 
-                    self._select_char_in_view_and_emit(char_to_select, view, model)
+                    self._select_char_in_view(char_to_select, view, model) # <<< 変更
         
         event.accept()
+
+
 # --- Properties Widget (変更なし) ---
 class PropertiesWidget(QWidget):
     character_set_changed_signal = Signal(str)
