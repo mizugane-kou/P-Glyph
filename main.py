@@ -1266,6 +1266,7 @@ class Canvas(QWidget):
         else: event.ignore()
 
 # --- Drawing Editor Widget (変更なし) ---
+
 class DrawingEditorWidget(QWidget):
     gui_setting_changed_signal = Signal(str, str) # key, value
     vrt2_edit_mode_toggled = Signal(bool) # is_editing_vrt2_glyph
@@ -1320,7 +1321,9 @@ class DrawingEditorWidget(QWidget):
         cols = 5
         for i, size_val in enumerate(pen_sizes):
             button = QPushButton(str(size_val)); button.setToolTip(f"{size_val}px")
-            button.clicked.connect(lambda checked=False, s=size_val: self._handle_pen_width_changed(s))
+            # VV IMPLICIT MODIFICATION VV
+            button.clicked.connect(lambda checked=False, s=size_val: self._handle_pen_size_button_click(s))
+            # ^^ IMPLICIT MODIFICATION ^^
             row, col = divmod(i, cols)
             pen_size_grid_layout.addWidget(button, row, col)
         controls_outer_layout.addWidget(self.pen_size_buttons_group)
@@ -1494,6 +1497,14 @@ class DrawingEditorWidget(QWidget):
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, self.canvas.current_tool)
 
     def _handle_pen_width_changed(self, width: int): self.canvas.set_pen_width(width); self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width))
+    
+    # VV EXPLCIT MODIFICATION VV
+    def _handle_pen_size_button_click(self, size: int):
+        """Handles click from preset pen size buttons, then resets focus to canvas."""
+        self._handle_pen_width_changed(size) # Call the existing handler for slider/etc.
+        self.canvas.setFocus() # Ensure canvas regains focus for keyboard navigation
+    # ^^ EXPLCIT MODIFICATION ^^
+    
     def _handle_pen_shape_changed(self, shape_name: str): self.canvas.set_pen_shape(shape_name); self.gui_setting_changed_signal.emit(SETTING_PEN_SHAPE, shape_name)
     def _handle_mirror_mode_changed(self, checked: bool): self.canvas.set_mirror_mode(checked); self.gui_setting_changed_signal.emit(SETTING_MIRROR_MODE, str(checked))
     def _handle_glyph_margin_slider_change(self, value: int): self.canvas.set_glyph_margin_width(value); self.gui_setting_changed_signal.emit(SETTING_GLYPH_MARGIN_WIDTH, str(value))
@@ -1601,6 +1612,8 @@ class DrawingEditorWidget(QWidget):
         else: 
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
+
+
 
 class ImageLoaderSignals(QObject):
     image_loaded = Signal(str, QPixmap) # character_key, pixmap
