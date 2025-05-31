@@ -2634,6 +2634,7 @@ class MainWindow(QMainWindow):
         self.original_export_button_state: bool = False 
         
         self._project_loading_in_progress: bool = False
+        self._batch_operation_in_progress: bool = False # <<< 新しいフラグ
         self._last_active_glyph_char_from_load: Optional[str] = None
         self._last_active_glyph_is_vrt2_from_load: bool = False
 
@@ -3441,17 +3442,26 @@ class MainWindow(QMainWindow):
             self.db_manager.save_glyph_advance_width(character, advance_width)
         except Exception as e: pass
 
+
+
     @Slot(str) 
     @Slot(str, bool) 
     def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False): # (SETTING_LAST_ACTIVE_GLYPH_IS_VRT2 save added)
-        if self._project_loading_in_progress: return
+        if self._project_loading_in_progress: return # プロジェクト読み込み中は処理しない
+
+        # 現在のキャンバス情報を取得（必要なら保存するため）
         current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
         current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value() 
-        if current_canvas_char: 
+        
+        # 新しいグリフをロードする前に、現在のグリフの情報を保存 (バッチ処理中でなければ)
+        if current_canvas_char and not self._batch_operation_in_progress: 
+            # 読み込むグリフが現在のグリフと異なるか、VRT2モードが異なる場合のみ保存を試みる
             if current_canvas_char != character or \
                (current_canvas_char == character and is_vrt2_edit_mode != self.drawing_editor_widget.canvas.editing_vrt2_glyph):
-                 if not self.drawing_editor_widget.canvas.editing_vrt2_glyph:
+                 if not self.drawing_editor_widget.canvas.editing_vrt2_glyph: # 標準グリフの送り幅のみ保存
                      self._save_current_advance_width_sync(current_canvas_char, current_canvas_adv_width)
+        
+        # ... (KVビューア更新ロジックは変更なし) ...
         if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
             with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = character 
             self._kv_deferred_update_timer.start(self._kv_update_delay_ms) 
@@ -3460,6 +3470,7 @@ class MainWindow(QMainWindow):
             if self.kanji_viewer_related_tabs: self.kanji_viewer_related_tabs.clear()
             if self._kv_deferred_update_timer.isActive(): self._kv_deferred_update_timer.stop()
             with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = None
+        
         if not self.current_project_path or not character: 
             adv_width = DEFAULT_ADVANCE_WIDTH
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
@@ -3468,16 +3479,19 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.update_unicode_display(None)
             self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
             self.drawing_editor_widget.update_vrt2_controls(False, False); return
+        
         adv_width = self.db_manager.load_glyph_advance_width(character)
         pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode)
         reference_pixmap = None
         if is_vrt2_edit_mode: reference_pixmap = self.db_manager.load_vrt2_glyph_reference_image(character)
         else: reference_pixmap = self.db_manager.load_reference_image(character)
+        
         self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode)
         self.drawing_editor_widget.set_enabled_controls(True)
         self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode)
         self.drawing_editor_widget.update_unicode_display(character)
         self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
+        
         is_char_in_nr_vrt2_set = character in self.non_rotated_vrt2_chars
         self.drawing_editor_widget.update_vrt2_controls(is_char_in_nr_vrt2_set, is_editing_vrt2=is_vrt2_edit_mode)
         editor_is_generally_enabled = self.drawing_editor_widget.pen_button.isEnabled()
@@ -3488,10 +3502,12 @@ class MainWindow(QMainWindow):
         if hasattr(self.drawing_editor_widget, 'glyph_to_ref_reset_button'):
             current_glyph_has_content_on_canvas = self.drawing_editor_widget.canvas.image and not self.drawing_editor_widget.canvas.image.isNull() 
             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(editor_is_generally_enabled and current_glyph_has_content_on_canvas)
-        if character and not self._project_loading_in_progress:
+        
+        # <<< 修正箇所: バッチ処理中でなければ、最後にアクティブだったグリフとして保存 >>>
+        if character and not self._project_loading_in_progress and not self._batch_operation_in_progress:
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
-            self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_edit_mode))# Save VRT2 state
-        # self.drawing_editor_widget.canvas.setFocus() 
+            self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_edit_mode))
+
 
     @Slot(str, QPixmap, bool)
     def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool): # (変更なし)
@@ -3924,81 +3940,130 @@ class MainWindow(QMainWindow):
     def batch_import_glyphs(self): self._process_batch_image_import(import_type="glyph") # (grid update changed)
     def batch_import_reference_images(self): self._process_batch_image_import(import_type="reference") # (grid update changed)
 
+
     def _process_batch_image_import(self, import_type: str): # (Grid update changed)
         if not self.current_project_path or self._project_loading_in_progress:
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
-        file_dialog_title = "グリフ画像の一括読み込み" if import_type == "glyph" else "下書き画像の一括読み込み"
-        file_paths, _ = QFileDialog.getOpenFileNames(self, file_dialog_title, "", "画像ファイル (*.png *.jpg *.jpeg *.bmp)")
-        if not file_paths: return
+        
+        self._batch_operation_in_progress = True 
+        
+        dialog_title_prefix = "グリフ画像" if import_type == "glyph" else "下書き画像"
+        folder_dialog_title = f"{dialog_title_prefix}が含まれるフォルダを選択"
+        
+        # <<< 修正点: ファイル選択ダイアログからフォルダ選択ダイアログへ変更 >>>
+        selected_folder_path = QFileDialog.getExistingDirectory(self, folder_dialog_title)
+
+        if not selected_folder_path:
+            self._batch_operation_in_progress = False 
+            return
+
+        # <<< 修正点: 選択されたフォルダから画像ファイルリストを作成 >>>
+        image_extensions = {".png", ".jpg", ".jpeg", ".bmp"}
+        file_paths: List[str] = []
+        try:
+            for root, _, files in os.walk(selected_folder_path):
+                for file_name in files:
+                    if Path(file_name).suffix.lower() in image_extensions:
+                        file_paths.append(os.path.join(root, file_name))
+        except Exception as e:
+            QMessageBox.critical(self, "フォルダ読み込みエラー", f"フォルダ内のファイルリスト作成中にエラーが発生しました:\n{e}")
+            self._batch_operation_in_progress = False
+            return
+
+        if not file_paths:
+            QMessageBox.information(self, "情報", f"選択されたフォルダ '{os.path.basename(selected_folder_path)}' 内に処理対象の画像ファイルが見つかりませんでした。")
+            self._batch_operation_in_progress = False
+            return
+        
+        # --- ここから下のロジックは基本的に変更なし ---
+        # ただし、statusBarのメッセージを修正
+
         target_image_size = QSize(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT)
         if not self.project_glyph_chars_cache: 
             all_glyphs_data_raw = self.db_manager.get_all_glyphs_with_preview_data()
             self.project_glyph_chars_cache = {char_data[0] for char_data in all_glyphs_data_raw}
         if import_type == "reference" and not self.non_rotated_vrt2_chars: 
             self.non_rotated_vrt2_chars = set(self.db_manager.get_non_rotated_vrt2_character_set())
+        
         processed_count = 0; skipped_filename_format = 0; skipped_unicode_conversion = 0
         skipped_char_not_in_project = 0; skipped_image_load_error = 0; db_update_errors = 0
         total_files = len(file_paths)
-        self.statusBar().showMessage(f"{file_dialog_title} を開始します ({total_files} ファイル)...", 0); QApplication.processEvents()
-        for idx, file_path_str in enumerate(file_paths):
-            file_path = Path(file_path_str)
-            self.statusBar().showMessage(f"処理中 ({idx+1}/{total_files}): {file_path.name}", 0); QApplication.processEvents()
-            stem = file_path.stem; is_vrt2_ref_candidate = False; hex_code = "" 
-            if import_type == "reference":
-                match_vert = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
-                if not match_vert:
-                     match_vert_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
-                     if match_vert_uplus: hex_code = match_vert_uplus.group(1); is_vrt2_ref_candidate = True
-                else: hex_code = match_vert.group(1); is_vrt2_ref_candidate = True
-            if not is_vrt2_ref_candidate: 
-                match = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
-                if not match: 
-                    match_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
-                    if not match_uplus: skipped_filename_format += 1; continue
-                    hex_code = match_uplus.group(1)
-                else: hex_code = match.group(1)
-            if not hex_code: skipped_filename_format += 1; continue
-            try: unicode_val = int(hex_code, 16); character = chr(unicode_val)
-            except (ValueError, OverflowError): skipped_unicode_conversion += 1; continue
-            target_is_nrvg_for_ref = False 
-            if import_type == "reference" and is_vrt2_ref_candidate:
-                if character not in self.non_rotated_vrt2_chars: skipped_char_not_in_project +=1; continue
-                target_is_nrvg_for_ref = True
-            elif character not in self.project_glyph_chars_cache: skipped_char_not_in_project += 1; continue
-            qimage = QImage(file_path_str)
-            if qimage.isNull(): skipped_image_load_error += 1; continue
-            scaled_image = qimage.scaled(target_image_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            final_qimage = QImage(target_image_size, QImage.Format_ARGB32_Premultiplied); final_qimage.fill(QColor(Qt.white)) 
-            painter = QPainter(final_qimage)
-            x_offset = (target_image_size.width() - scaled_image.width()) // 2
-            y_offset = (target_image_size.height() - scaled_image.height()) // 2
-            painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
-            processed_pixmap = QPixmap.fromImage(final_qimage) 
-            byte_array = QByteArray(); buffer = QBuffer(byte_array)
-            buffer.open(QIODevice.WriteOnly); final_qimage.save(buffer, "PNG"); image_data_bytes = byte_array.data()
-            success = False
-            if import_type == "glyph": success = self.db_manager.update_glyph_image_data_bytes(character, image_data_bytes)
-            elif import_type == "reference":
-                if target_is_nrvg_for_ref: success = self.db_manager.update_vrt2_glyph_reference_image_data_bytes(character, image_data_bytes)
-                else: success = self.db_manager.update_glyph_reference_image_data_bytes(character, image_data_bytes)
-            if success:
-                processed_count += 1
-                if import_type == "glyph": # Standard glyph image updated
-                    self.glyph_grid_widget.update_glyph_preview(character, processed_pixmap, is_vrt2_source=False)
-                current_editor_char = self.drawing_editor_widget.canvas.current_glyph_character
-                is_editor_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
-                if character == current_editor_char:
-                    if import_type == "glyph" and not is_editor_vrt2_editing: 
-                        self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) 
-                    elif import_type == "reference":
-                        if target_is_nrvg_for_ref and is_editor_vrt2_editing: 
-                            self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
-                            self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
-                        elif not target_is_nrvg_for_ref and not is_editor_vrt2_editing: 
-                            self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
-                            self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
-            else: db_update_errors +=1
-        self.statusBar().showMessage(f"{file_dialog_title} 完了", 5000)
+        
+        # StatusBarのメッセージ修正
+        status_bar_message_prefix = "グリフ一括読み込み" if import_type == "glyph" else "下書き一括読み込み"
+        self.statusBar().showMessage(f"{status_bar_message_prefix} を開始します ({total_files} ファイル from '{os.path.basename(selected_folder_path)}')...", 0); QApplication.processEvents()
+        
+        try: 
+            for idx, file_path_str in enumerate(file_paths):
+                file_path = Path(file_path_str)
+                self.statusBar().showMessage(f"処理中 ({idx+1}/{total_files}): {file_path.name}", 0); QApplication.processEvents()
+                stem = file_path.stem; is_vrt2_ref_candidate = False; hex_code = "" 
+                if import_type == "reference":
+                    match_vert = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
+                    if not match_vert:
+                         match_vert_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
+                         if match_vert_uplus: hex_code = match_vert_uplus.group(1); is_vrt2_ref_candidate = True
+                    else: hex_code = match_vert.group(1); is_vrt2_ref_candidate = True
+                if not is_vrt2_ref_candidate: 
+                    match = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
+                    if not match: 
+                        match_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
+                        if not match_uplus: skipped_filename_format += 1; continue
+                        hex_code = match_uplus.group(1)
+                    else: hex_code = match.group(1)
+                if not hex_code: skipped_filename_format += 1; continue
+                try: unicode_val = int(hex_code, 16); character = chr(unicode_val)
+                except (ValueError, OverflowError): skipped_unicode_conversion += 1; continue
+                target_is_nrvg_for_ref = False 
+                if import_type == "reference" and is_vrt2_ref_candidate:
+                    if character not in self.non_rotated_vrt2_chars: skipped_char_not_in_project +=1; continue
+                    target_is_nrvg_for_ref = True
+                elif character not in self.project_glyph_chars_cache: skipped_char_not_in_project += 1; continue
+                
+                try: # <<< QImage読み込みのtry-exceptを追加
+                    qimage = QImage(file_path_str)
+                except Exception as img_load_exc: # QImageが内部で例外を出す場合もキャッチ
+
+                    skipped_image_load_error += 1; continue
+
+                if qimage.isNull(): skipped_image_load_error += 1; continue
+                
+                scaled_image = qimage.scaled(target_image_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                final_qimage = QImage(target_image_size, QImage.Format_ARGB32_Premultiplied); final_qimage.fill(QColor(Qt.white)) 
+                painter = QPainter(final_qimage)
+                x_offset = (target_image_size.width() - scaled_image.width()) // 2
+                y_offset = (target_image_size.height() - scaled_image.height()) // 2
+                painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
+                processed_pixmap = QPixmap.fromImage(final_qimage) 
+                byte_array = QByteArray(); buffer = QBuffer(byte_array)
+                buffer.open(QIODevice.WriteOnly); final_qimage.save(buffer, "PNG"); image_data_bytes = byte_array.data()
+                success = False
+                if import_type == "glyph": success = self.db_manager.update_glyph_image_data_bytes(character, image_data_bytes)
+                elif import_type == "reference":
+                    if target_is_nrvg_for_ref: success = self.db_manager.update_vrt2_glyph_reference_image_data_bytes(character, image_data_bytes)
+                    else: success = self.db_manager.update_glyph_reference_image_data_bytes(character, image_data_bytes)
+                if success:
+                    processed_count += 1
+                    if import_type == "glyph": 
+                        self.glyph_grid_widget.update_glyph_preview(character, processed_pixmap, is_vrt2_source=False)
+                    current_editor_char = self.drawing_editor_widget.canvas.current_glyph_character
+                    is_editor_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
+                    if character == current_editor_char:
+                        if import_type == "glyph" and not is_editor_vrt2_editing: 
+                            self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) 
+                        elif import_type == "reference":
+                            if target_is_nrvg_for_ref and is_editor_vrt2_editing: 
+                                self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
+                                self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
+                            elif not target_is_nrvg_for_ref and not is_editor_vrt2_editing: 
+                                self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
+                                self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
+                else: db_update_errors +=1
+        finally:
+            self._batch_operation_in_progress = False 
+            self._save_current_editor_state_settings() 
+        
+        self.statusBar().showMessage(f"{status_bar_message_prefix} 完了", 5000) # StatusBarメッセージ修正
         summary_parts = [f"{processed_count} 件の画像を処理・保存しました。"]
         if skipped_filename_format > 0: summary_parts.append(f"{skipped_filename_format} 件: ファイル名形式エラー")
         if skipped_unicode_conversion > 0: summary_parts.append(f"{skipped_unicode_conversion} 件: Unicode変換エラー")
@@ -4006,6 +4071,21 @@ class MainWindow(QMainWindow):
         if skipped_image_load_error > 0: summary_parts.append(f"{skipped_image_load_error} 件: 画像読み込みエラー")
         if db_update_errors > 0: summary_parts.append(f"{db_update_errors} 件: DB更新エラー")
         QMessageBox.information(self, "一括読み込み結果", "\n".join(summary_parts))
+
+
+
+
+    def _save_current_editor_state_settings(self):
+        """Saves the current state of the editor (active glyph and VRT2 mode) to settings."""
+        if not self.current_project_path or self._project_loading_in_progress or self._batch_operation_in_progress:
+            return
+
+        character = self.drawing_editor_widget.canvas.current_glyph_character
+        is_vrt2_mode = self.drawing_editor_widget.canvas.editing_vrt2_glyph
+
+        if character: # グリフが実際に選択されている場合のみ保存
+            self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
+            self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_mode))
 
     def closeEvent(self, event: QEvent): # (変更なし)
         if self._project_loading_in_progress:
