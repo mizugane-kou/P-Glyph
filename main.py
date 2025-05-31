@@ -456,6 +456,9 @@ class LoadProjectWorkerSignals(QObject):
     error = Signal(str)
     finished = Signal()
 
+# --- Worker for loading project data (Modified for batch loading) ---
+# ... (LoadProjectWorkerSignals class definition remains the same) ...
+
 class LoadProjectWorker(QRunnable):
     def __init__(self, db_path: str):
         super().__init__()
@@ -466,7 +469,10 @@ class LoadProjectWorker(QRunnable):
         """For a list of characters, checks DB if image_data exists."""
         results = []
         if not char_list: return results
-        conn = db_manager._get_connection() # Use local connection for thread safety
+        # Use a local connection per call for thread safety if db_manager methods aren't inherently thread-safe for reads
+        # However, db_manager._get_connection() should provide a new connection or handle thread safety.
+        # For simplicity, assuming db_manager methods used here are safe or _get_connection handles it.
+        conn = db_manager._get_connection() 
         cursor = conn.cursor()
         table = "vrt2_glyphs" if is_vrt2 else "glyphs"
         for char_val in char_list:
@@ -483,13 +489,32 @@ class LoadProjectWorker(QRunnable):
             db_manager = DatabaseManager(self.db_path) 
 
             self.signals.load_progress.emit(0, "基本設定を読み込み中...")
-            char_set_list_raw = db_manager.get_project_character_set()
+            char_set_list_raw = db_manager.get_project_character_set() # User-defined char set (no .notdef)
             r_vrt2_list_raw = db_manager.get_rotated_vrt2_character_set()
             nr_vrt2_list_raw = db_manager.get_non_rotated_vrt2_character_set()
             
             # Get image existence info for initial model population
+            self.signals.load_progress.emit(10, "グリフメタデータを確認中(.notdef)...")
+            
+            # Explicitly fetch .notdef information
+            notdef_info_list: List[Tuple[str, bool]] = []
+            try:
+                # db_manager already has db_path, so we can use its methods
+                notdef_image_bytes = db_manager.load_glyph_image_bytes('.notdef', is_vrt2=False)
+                has_notdef_image = (notdef_image_bytes is not None)
+                notdef_info_list.append(('.notdef', has_notdef_image))
+            except Exception: 
+                # Fallback if .notdef somehow failed to load, though it should exist
+                notdef_info_list.append(('.notdef', False))
+
+
             self.signals.load_progress.emit(20, "グリフメタデータを確認中(標準)...")
-            char_set_list_with_img_info = self._get_char_list_with_image_info(db_manager, char_set_list_raw, is_vrt2=False)
+            # Get info for user-defined character set (ensure .notdef isn't accidentally in char_set_list_raw)
+            user_chars_for_info = [c for c in char_set_list_raw if c != '.notdef']
+            char_set_list_with_img_info_user = self._get_char_list_with_image_info(db_manager, user_chars_for_info, is_vrt2=False)
+            
+            # Combine .notdef with user characters, ensuring .notdef is first
+            char_set_list_with_img_info = notdef_info_list + char_set_list_with_img_info_user
             
             self.signals.load_progress.emit(40, "グリフメタデータを確認中(縦書き)...")
             nr_vrt2_list_with_img_info = self._get_char_list_with_image_info(db_manager, nr_vrt2_list_raw, is_vrt2=True)
@@ -526,10 +551,10 @@ class LoadProjectWorker(QRunnable):
 
 
             basic_loaded_data = {
-                'char_set_list': char_set_list_raw, # Raw list for properties widget
+                'char_set_list': char_set_list_raw, # Raw list for properties widget (does not include .notdef)
                 'r_vrt2_list': r_vrt2_list_raw,
                 'nr_vrt2_list': nr_vrt2_list_raw,
-                'char_set_list_with_img_info': char_set_list_with_img_info, # For std model
+                'char_set_list_with_img_info': char_set_list_with_img_info, # For std model (includes .notdef)
                 'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info, # For vrt2 model
                 'font_name': font_name,
                 'font_weight': font_weight,
@@ -547,7 +572,6 @@ class LoadProjectWorker(QRunnable):
             self.signals.error.emit(f"プロジェクトデータの読み込み中にエラーが発生しました: {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
-
 
 # --- Worker for creating project DB (変更なし) ---
 class CreateProjectWorkerSignals(QObject):
