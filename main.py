@@ -3819,6 +3819,7 @@ class MainWindow(QMainWindow):
             self.export_process.deleteLater(); self.export_process = None
 
 
+
     def keyPressEvent(self, event: QKeyEvent):
         if self._project_loading_in_progress:
             event.ignore()
@@ -3836,27 +3837,54 @@ class MainWindow(QMainWindow):
 
         focus_widget = QApplication.focusWidget()
 
+        # If focus is on text input fields, let them handle the event
         if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox)):
-            super().keyPressEvent(event); return
+            super().keyPressEvent(event); return # Let input fields handle their keys
 
-        if self.drawing_editor_widget.pen_button.isEnabled() and \
+        # Tool shortcuts if drawing editor's canvas has focus and a glyph is loaded
+        # This check is specific to canvas focus for tool shortcuts.
+        is_drawing_canvas_focused_for_tools = (focus_widget == self.drawing_editor_widget.canvas)
+        
+        if is_drawing_canvas_focused_for_tools and \
+           self.drawing_editor_widget.pen_button.isEnabled() and \
            self.drawing_editor_widget.canvas.current_glyph_character:
             if not event.isAutoRepeat():
-                key = event.key()
-                if key == Qt.Key_E: self.drawing_editor_widget.eraser_button.click(); event.accept(); return
-                if key == Qt.Key_B: self.drawing_editor_widget.pen_button.click(); event.accept(); return
-                if key == Qt.Key_V: self.drawing_editor_widget.move_button.click(); event.accept(); return
+                key_tool = event.key() # Use a distinct variable name for tool keys
+                if key_tool == Qt.Key_E: self.drawing_editor_widget.eraser_button.click(); event.accept(); return
+                if key_tool == Qt.Key_B: self.drawing_editor_widget.pen_button.click(); event.accept(); return
+                if key_tool == Qt.Key_V: self.drawing_editor_widget.move_button.click(); event.accept(); return
 
-        key = event.key()
-        if key in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
-            # Check if focus is on one of the QTableViews or their parent GlyphGridWidget
-            if focus_widget == self.glyph_grid_widget.current_active_view or \
-               focus_widget == self.glyph_grid_widget:
-                # Pass the event to GlyphGridWidget's custom handler
+        # Navigation keys handling
+        key_nav = event.key() # Use a distinct variable name for navigation keys
+        
+        if key_nav in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
+            # --- START OF MODIFICATION FOR ARROW KEY NAVIGATION FROM DRAWING EDITOR CANVAS ---
+            # Check if the drawing editor's canvas specifically has focus
+            is_canvas_focused_for_nav = (focus_widget == self.drawing_editor_widget.canvas)
+            
+            if is_canvas_focused_for_nav and \
+               (event.modifiers() == Qt.NoModifier or event.modifiers() == Qt.KeypadModifier):
+                # If canvas has focus and an arrow key is pressed without modifiers,
+                # delegate this event to the GlyphGridWidget for navigation.
+                # GlyphGridWidget.keyPressEvent will handle selection change and focus update.
+                self.glyph_grid_widget.keyPressEvent(event)
+                if event.isAccepted():
+                    # GlyphGridWidget handled the event (selection changed, focus moved to grid).
+                    return 
+                # If GlyphGridWidget did not accept (e.g., at boundary, no items),
+                # the event might be ignored or fall through. Since canvas itself
+                # usually doesn't use arrow keys for its own navigation, this is often fine.
+
+            elif focus_widget == self.glyph_grid_widget.current_active_view or \
+                 focus_widget == self.glyph_grid_widget:
+                # If focus is already on the grid or its views, let the grid handle it directly.
+                # This ensures that the grid's own navigation logic is prioritized when it has focus.
                 self.glyph_grid_widget.keyPressEvent(event)
                 if event.isAccepted():
                     return
+            # --- END OF MODIFICATION FOR ARROW KEY NAVIGATION FROM DRAWING EDITOR CANVAS ---
         
+        # Fallback to default QMainWindow keyPressEvent handling if not specifically processed above
         super().keyPressEvent(event)
 
     def open_batch_advance_width_dialog(self): # (変更なし)
