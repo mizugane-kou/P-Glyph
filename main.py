@@ -305,7 +305,7 @@ class SaveGlyphWorker(QRunnable):
             qimage.save(buffer, "PNG")
             image_data = byte_array.data()
 
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
             cursor = conn.cursor()
 
             if self.is_vrt2_glyph:
@@ -351,7 +351,7 @@ class SaveGuiStateWorker(QRunnable):
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save GUI setting '{self.key}': DB path not set.")
                 return
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
             cursor = conn.cursor()
             cursor.execute("INSERT OR REPLACE INTO project_settings (key, value) VALUES (?, ?)", (self.key, self.value))
             conn.commit()
@@ -376,7 +376,7 @@ class SaveAdvanceWidthWorker(QRunnable):
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save advance width for '{self.character}': DB path not set.")
                 return
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
             cursor = conn.cursor()
             cursor.execute("UPDATE glyphs SET advance_width = ? WHERE character = ?", (self.advance_width, self.character))
             conn.commit()
@@ -411,7 +411,7 @@ class SaveReferenceImageWorker(QRunnable):
                 qimage.save(buffer, "PNG")
                 image_data = byte_array.data()
             
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
             cursor = conn.cursor()
 
             if self.is_vrt2_glyph:
@@ -900,7 +900,7 @@ class Canvas(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setFocusPolicy(Qt.ClickFocus); self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True) # Changed to ClickFocus
         self.ascender_height_for_baseline = DEFAULT_ASCENDER_HEIGHT 
         self.glyph_margin_width: int = DEFAULT_GLYPH_MARGIN_WIDTH
         self.current_glyph_character: Optional[str] = None
@@ -1265,7 +1265,8 @@ class Canvas(QWidget):
                 event.ignore()
         else: event.ignore()
 
-# --- Drawing Editor Widget (変更なし) ---
+
+
 
 class DrawingEditorWidget(QWidget):
     gui_setting_changed_signal = Signal(str, str) # key, value
@@ -1279,15 +1280,15 @@ class DrawingEditorWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.canvas = Canvas()
-        self.rotated_vrt2_chars: Set[str] = set() 
+        self.rotated_vrt2_chars: Set[str] = set()
         main_layout = QVBoxLayout(self)
-        self.unicode_label = QLineEdit("Unicode: N/A") 
+        self.unicode_label = QLineEdit("Unicode: N/A")
         self.unicode_label.setReadOnly(True); self.unicode_label.setAlignment(Qt.AlignCenter)
         font = self.unicode_label.font(); font.setPointSize(10); self.unicode_label.setFont(font)
-        self.unicode_label.setStyleSheet("QLineEdit { border: none; background: transparent; }") 
+        self.unicode_label.setStyleSheet("QLineEdit { border: none; background: transparent; }")
         main_layout.addWidget(self.unicode_label)
-        main_layout.addWidget(self.canvas, 0, Qt.AlignCenter) 
-        controls_outer_layout = QVBoxLayout(); controls_outer_layout.setSpacing(5) 
+        main_layout.addWidget(self.canvas, 0, Qt.AlignCenter)
+        controls_outer_layout = QVBoxLayout(); controls_outer_layout.setSpacing(5)
         top_controls_layout = QHBoxLayout()
         self.pen_button = QPushButton("ペン (B)"); self.pen_button.setCheckable(True)
         self.eraser_button = QPushButton("消しゴム (E)"); self.eraser_button.setCheckable(True)
@@ -1299,7 +1300,7 @@ class DrawingEditorWidget(QWidget):
         self.eraser_button.clicked.connect(self._handle_eraser_button_clicked)
         self.move_button.clicked.connect(self._handle_move_button_clicked)
         top_controls_layout.addWidget(self.pen_button); top_controls_layout.addWidget(self.eraser_button)
-        top_controls_layout.addWidget(self.move_button); top_controls_layout.addSpacing(10) 
+        top_controls_layout.addWidget(self.move_button); top_controls_layout.addSpacing(10)
         self.undo_button = QPushButton("Undo (Ctrl+Z)"); self.undo_button.clicked.connect(self.canvas.undo)
         top_controls_layout.addWidget(self.undo_button)
         self.redo_button = QPushButton("Redo (Ctrl+Y)"); self.redo_button.clicked.connect(self.canvas.redo)
@@ -1313,45 +1314,43 @@ class DrawingEditorWidget(QWidget):
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(1, 100); self.slider.setValue(self.canvas.pen_width)
         self.slider.valueChanged.connect(self._handle_pen_width_changed)
-        slider_layout.addWidget(self.slider, 1) 
+        slider_layout.addWidget(self.slider, 1)
         controls_outer_layout.addLayout(slider_layout)
-        self.pen_size_buttons_group = QWidget() 
+        self.pen_size_buttons_group = QWidget()
         pen_size_grid_layout = QGridLayout(self.pen_size_buttons_group); pen_size_grid_layout.setSpacing(5)
-        pen_sizes = [2, 5, 8, 10, 15, 20, 25, 30, 40, 50] 
+        pen_sizes = [2, 5, 8, 10, 15, 20, 25, 30, 40, 50]
         cols = 5
         for i, size_val in enumerate(pen_sizes):
             button = QPushButton(str(size_val)); button.setToolTip(f"{size_val}px")
-            # VV IMPLICIT MODIFICATION VV
-            button.clicked.connect(lambda checked=False, s=size_val: self._handle_pen_size_button_click(s))
-            # ^^ IMPLICIT MODIFICATION ^^
+            button.clicked.connect(lambda checked=False, s=size_val: self._handle_pen_width_changed(s))
             row, col = divmod(i, cols)
             pen_size_grid_layout.addWidget(button, row, col)
         controls_outer_layout.addWidget(self.pen_size_buttons_group)
         self.mirror_checkbox = QCheckBox("左右反転表示")
         self.mirror_checkbox.toggled.connect(self._handle_mirror_mode_changed)
-        display_options_layout = QHBoxLayout(); display_options_layout.addStretch(1) 
+        display_options_layout = QHBoxLayout(); display_options_layout.addStretch(1)
         display_options_layout.addWidget(self.mirror_checkbox)
         controls_outer_layout.addLayout(display_options_layout)
         margin_layout = QHBoxLayout(); margin_layout.addWidget(QLabel("グリフマージン:"))
         self.margin_slider = QSlider(Qt.Horizontal)
-        max_margin_val = min(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT) // 4 
-        self.margin_slider.setRange(0, max_margin_val if max_margin_val > 0 else 1) 
+        max_margin_val = min(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT) // 4
+        self.margin_slider.setRange(0, max_margin_val if max_margin_val > 0 else 1)
         self.margin_slider.setValue(self.canvas.glyph_margin_width)
         self.margin_slider.valueChanged.connect(self._handle_glyph_margin_slider_change)
-        self.margin_value_label = QLabel(str(self.canvas.glyph_margin_width)) 
+        self.margin_value_label = QLabel(str(self.canvas.glyph_margin_width))
         margin_layout.addWidget(self.margin_slider, 1); margin_layout.addWidget(self.margin_value_label)
         controls_outer_layout.addLayout(margin_layout)
         ref_opacity_layout = QHBoxLayout(); ref_opacity_layout.addWidget(QLabel("下書き透明度:"))
-        self.ref_opacity_slider = QSlider(Qt.Horizontal); self.ref_opacity_slider.setRange(0, 100) 
+        self.ref_opacity_slider = QSlider(Qt.Horizontal); self.ref_opacity_slider.setRange(0, 100)
         self.ref_opacity_slider.setValue(int(DEFAULT_REFERENCE_IMAGE_OPACITY * 100))
         self.ref_opacity_slider.valueChanged.connect(self._handle_ref_opacity_changed)
         self.ref_opacity_label = QLabel(str(int(DEFAULT_REFERENCE_IMAGE_OPACITY * 100)))
         ref_opacity_layout.addWidget(self.ref_opacity_slider, 1); ref_opacity_layout.addWidget(self.ref_opacity_label)
         controls_outer_layout.addLayout(ref_opacity_layout)
         adv_width_layout = QHBoxLayout()
-        self.adv_width_label = QLabel("文字送り幅:") 
+        self.adv_width_label = QLabel("文字送り幅:")
         adv_width_layout.addWidget(self.adv_width_label)
-        self.adv_width_slider = QSlider(Qt.Horizontal); self.adv_width_slider.setRange(0, 1000) 
+        self.adv_width_slider = QSlider(Qt.Horizontal); self.adv_width_slider.setRange(0, 1000)
         self.adv_width_slider.setValue(DEFAULT_ADVANCE_WIDTH)
         self.adv_width_slider.valueChanged.connect(self._on_adv_width_slider_changed)
         self.adv_width_spinbox = QSpinBox(); self.adv_width_spinbox.setRange(0, 1000)
@@ -1360,17 +1359,17 @@ class DrawingEditorWidget(QWidget):
         adv_width_layout.addWidget(self.adv_width_slider, 1); adv_width_layout.addWidget(self.adv_width_spinbox)
         controls_outer_layout.addLayout(adv_width_layout)
         self.vrt2_and_ref_controls_layout = QHBoxLayout()
-        self.vrt2_and_ref_controls_layout.setContentsMargins(0, 5, 0, 0) 
+        self.vrt2_and_ref_controls_layout.setContentsMargins(0, 5, 0, 0)
         self.vrt2_controls_widget = QWidget()
-        vrt2_layout = QHBoxLayout(self.vrt2_controls_widget); vrt2_layout.setContentsMargins(0,0,0,0) 
-        self.vrt2_toggle_button = QPushButton("標準グリフ編集中") 
+        vrt2_layout = QHBoxLayout(self.vrt2_controls_widget); vrt2_layout.setContentsMargins(0,0,0,0)
+        self.vrt2_toggle_button = QPushButton("標準グリフ編集中")
         self.vrt2_toggle_button.setCheckable(True); self.vrt2_toggle_button.toggled.connect(self._on_vrt2_toggle)
         vrt2_layout.addWidget(self.vrt2_toggle_button)
         self.transfer_to_vrt2_button = QPushButton("標準を縦書きへ転送")
         self.transfer_to_vrt2_button.clicked.connect(self.transfer_to_vrt2_requested)
         vrt2_layout.addWidget(self.transfer_to_vrt2_button)
         self.vrt2_and_ref_controls_layout.addWidget(self.vrt2_controls_widget)
-        self.vrt2_and_ref_controls_layout.addStretch(1) 
+        self.vrt2_and_ref_controls_layout.addStretch(1)
         self.ref_image_buttons_widget = QWidget()
         ref_image_buttons_layout = QHBoxLayout(self.ref_image_buttons_widget)
         ref_image_buttons_layout.setContentsMargins(0,0,0,0); ref_image_buttons_layout.setSpacing(5)
@@ -1386,7 +1385,7 @@ class DrawingEditorWidget(QWidget):
         ref_image_buttons_layout.addWidget(self.glyph_to_ref_reset_button)
         self.vrt2_and_ref_controls_layout.addWidget(self.ref_image_buttons_widget)
         controls_outer_layout.addLayout(self.vrt2_and_ref_controls_layout)
-        self.vrt2_controls_widget.setVisible(False) 
+        self.vrt2_controls_widget.setVisible(False)
         main_layout.addLayout(controls_outer_layout)
         self.canvas.pen_width_changed.connect(self._update_slider_value_no_signal)
         self.canvas.tool_changed.connect(self._update_tool_buttons_state_no_signal)
@@ -1399,56 +1398,62 @@ class DrawingEditorWidget(QWidget):
         self.mirror_checkbox.setChecked(self.canvas.mirror_mode)
         self._update_glyph_margin_slider_and_label_no_signal(self.canvas.glyph_margin_width)
         self._update_adv_width_ui_no_signal(self.canvas.current_glyph_advance_width)
-        self._update_undo_redo_buttons_state(False, False) 
+        self._update_undo_redo_buttons_state(False, False)
         self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
         self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
-        self.set_enabled_controls(False) 
+        self.set_enabled_controls(False)
 
     def set_rotated_vrt2_chars(self, chars: Set[str]):
         self.rotated_vrt2_chars = chars
-        self.update_unicode_display(self.canvas.current_glyph_character) 
+        self.update_unicode_display(self.canvas.current_glyph_character)
 
     def _handle_glyph_to_ref_reset_button_clicked(self):
         self.glyph_to_reference_and_reset_requested.emit(self.canvas.editing_vrt2_glyph)
+        self.canvas.setFocus()
 
     def _handle_load_reference_image_button_clicked(self):
         if not self.canvas.current_glyph_character:
             QMessageBox.warning(self, "グリフ未選択", "下書きを読み込むグリフが選択されていません。"); return
         file_path, _ = QFileDialog.getOpenFileName(self, "下書き画像を選択", "", "画像ファイル (*.png *.jpg *.jpeg *.bmp)")
-        if not file_path: return
+        if not file_path:
+            self.canvas.setFocus() 
+            return
         try:
             loaded_qimage = QImage(file_path)
             if loaded_qimage.isNull():
                 QMessageBox.warning(self, "画像読み込みエラー", f"画像 '{Path(file_path).name}' を読み込めませんでした。"); return
             target_size = self.canvas.image_size
             scaled_image = loaded_qimage.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied); final_image.fill(QColor(Qt.white)) 
+            final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied); final_image.fill(QColor(Qt.white))
             painter = QPainter(final_image)
             x_offset = (target_size.width() - scaled_image.width()) // 2
             y_offset = (target_size.height() - scaled_image.height()) // 2
             painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
             new_reference_pixmap = QPixmap.fromImage(final_image)
-            self.canvas.reference_image = new_reference_pixmap; self.canvas.update() 
-            self.delete_ref_button.setEnabled(self.pen_button.isEnabled()) 
+            self.canvas.reference_image = new_reference_pixmap; self.canvas.update()
+            self.delete_ref_button.setEnabled(self.pen_button.isEnabled())
             self.reference_image_selected_signal.emit(self.canvas.current_glyph_character, new_reference_pixmap.copy(), self.canvas.editing_vrt2_glyph)
         except Exception as e: QMessageBox.critical(self, "下書き処理エラー", f"下書き画像の処理中にエラーが発生しました: {e}")
+        self.canvas.setFocus()
 
     def _handle_delete_reference_image_button_clicked(self):
-        if not self.canvas.current_glyph_character: return 
-        if self.canvas.reference_image is None: return 
+        if not self.canvas.current_glyph_character: return
+        if self.canvas.reference_image is None: return
         reply = QMessageBox.question(self, "下書き削除の確認",
                                      f"文字 '{self.canvas.current_glyph_character}' の下書き画像を削除しますか？",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.canvas.reference_image = None; self.canvas.update()
-            self.delete_ref_button.setEnabled(False) 
+            self.delete_ref_button.setEnabled(False)
             self.reference_image_deleted_signal.emit(self.canvas.current_glyph_character, self.canvas.editing_vrt2_glyph)
+        self.canvas.setFocus()
 
-    def _handle_ref_opacity_changed(self, value: int): 
+    def _handle_ref_opacity_changed(self, value: int):
         opacity_float = value / 100.0
         self.ref_opacity_label.setText(str(value))
         self.canvas.set_reference_image_opacity(opacity_float)
         self.gui_setting_changed_signal.emit(SETTING_REFERENCE_IMAGE_OPACITY, str(opacity_float))
+        self.canvas.setFocus()
 
     def _update_ref_opacity_slider_no_signal(self, opacity_float: float):
         slider_value = int(round(opacity_float * 100))
@@ -1457,22 +1462,24 @@ class DrawingEditorWidget(QWidget):
 
     def _on_adv_width_slider_changed(self, value: int):
         self.adv_width_spinbox.blockSignals(True); self.adv_width_spinbox.setValue(value)
-        self.adv_width_spinbox.blockSignals(False); self.canvas.set_current_glyph_advance_width(value) 
-        if self.canvas.current_glyph_character: 
+        self.adv_width_spinbox.blockSignals(False); self.canvas.set_current_glyph_advance_width(value)
+        if self.canvas.current_glyph_character:
             self.advance_width_changed_signal.emit(self.canvas.current_glyph_character, value)
+        self.canvas.setFocus()
 
     def _on_adv_width_spinbox_changed(self, value: int):
         self.adv_width_slider.blockSignals(True); self.adv_width_slider.setValue(value)
         self.adv_width_slider.blockSignals(False); self.canvas.set_current_glyph_advance_width(value)
-        if self.canvas.current_glyph_character: 
+        if self.canvas.current_glyph_character:
             self.advance_width_changed_signal.emit(self.canvas.current_glyph_character, value)
+        self.canvas.setFocus()
 
     def _update_adv_width_ui_no_signal(self, width: int):
         is_vrt2 = self.canvas.editing_vrt2_glyph if self.canvas else False
         self.adv_width_slider.blockSignals(True); self.adv_width_slider.setValue(width); self.adv_width_slider.blockSignals(False)
         self.adv_width_spinbox.blockSignals(True); self.adv_width_spinbox.setValue(width); self.adv_width_spinbox.blockSignals(False)
         self.adv_width_label.setText("文字送り高さ:" if is_vrt2 else "文字送り幅:")
-        adv_controls_enabled = self.pen_button.isEnabled() 
+        adv_controls_enabled = self.pen_button.isEnabled()
         self.adv_width_slider.setEnabled(adv_controls_enabled)
         self.adv_width_spinbox.setEnabled(adv_controls_enabled)
 
@@ -1480,42 +1487,62 @@ class DrawingEditorWidget(QWidget):
         if checked: self.vrt2_toggle_button.setText("縦書きグリフ編集中")
         else: self.vrt2_toggle_button.setText("標準グリフ編集中")
         self.vrt2_edit_mode_toggled.emit(checked)
+        # Focus is handled by load_glyph_for_editing (triggered by signal) which sets canvas focus.
 
     def update_vrt2_controls(self, show: bool, is_editing_vrt2: bool):
         self.vrt2_controls_widget.setVisible(show)
-        if show: 
+        if show:
             self.vrt2_toggle_button.blockSignals(True)
             self.vrt2_toggle_button.setChecked(is_editing_vrt2)
             self.vrt2_toggle_button.setText("縦書きグリフ編集中" if is_editing_vrt2 else "標準グリフ編集中")
             self.vrt2_toggle_button.blockSignals(False)
 
-    def _handle_pen_button_clicked(self): self.canvas.set_brush_mode(); self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "brush")
-    def _handle_eraser_button_clicked(self): self.canvas.set_eraser_mode(); self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "eraser")
+    def _handle_pen_button_clicked(self):
+        self.canvas.set_brush_mode()
+        self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "brush")
+        self.canvas.setFocus()
+
+    def _handle_eraser_button_clicked(self):
+        self.canvas.set_eraser_mode()
+        self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "eraser")
+        self.canvas.setFocus()
+
     def _handle_move_button_clicked(self):
-        is_move_tool_selected = self.move_button.isChecked() 
+        is_move_tool_selected = self.move_button.isChecked()
         self.canvas.set_move_mode(is_move_tool_selected)
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, self.canvas.current_tool)
+        self.canvas.setFocus()
 
-    def _handle_pen_width_changed(self, width: int): self.canvas.set_pen_width(width); self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width))
-    
-    # VV EXPLCIT MODIFICATION VV
-    def _handle_pen_size_button_click(self, size: int):
-        """Handles click from preset pen size buttons, then resets focus to canvas."""
-        self._handle_pen_width_changed(size) # Call the existing handler for slider/etc.
-        self.canvas.setFocus() # Ensure canvas regains focus for keyboard navigation
-    # ^^ EXPLCIT MODIFICATION ^^
-    
-    def _handle_pen_shape_changed(self, shape_name: str): self.canvas.set_pen_shape(shape_name); self.gui_setting_changed_signal.emit(SETTING_PEN_SHAPE, shape_name)
-    def _handle_mirror_mode_changed(self, checked: bool): self.canvas.set_mirror_mode(checked); self.gui_setting_changed_signal.emit(SETTING_MIRROR_MODE, str(checked))
-    def _handle_glyph_margin_slider_change(self, value: int): self.canvas.set_glyph_margin_width(value); self.gui_setting_changed_signal.emit(SETTING_GLYPH_MARGIN_WIDTH, str(value))
+    def _handle_pen_width_changed(self, width: int):
+        self.canvas.set_pen_width(width)
+        self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width))
+        self.canvas.setFocus()
 
-    def _update_slider_value_no_signal(self, width: int): self.slider.blockSignals(True); self.slider.setValue(width); self.slider.blockSignals(False)
+    def _handle_pen_shape_changed(self, shape_name: str):
+        self.canvas.set_pen_shape(shape_name)
+        self.gui_setting_changed_signal.emit(SETTING_PEN_SHAPE, shape_name)
+        self.canvas.setFocus()
+
+    def _handle_mirror_mode_changed(self, checked: bool):
+        self.canvas.set_mirror_mode(checked)
+        self.gui_setting_changed_signal.emit(SETTING_MIRROR_MODE, str(checked))
+        self.canvas.setFocus()
+
+    def _handle_glyph_margin_slider_change(self, value: int):
+        self.canvas.set_glyph_margin_width(value)
+        self.gui_setting_changed_signal.emit(SETTING_GLYPH_MARGIN_WIDTH, str(value))
+        self.canvas.setFocus()
+
+    def _update_slider_value_no_signal(self, width: int):
+        self.slider.blockSignals(True); self.slider.setValue(width); self.slider.blockSignals(False)
+
     def _update_tool_buttons_state_no_signal(self, tool_name: str):
         self.pen_button.blockSignals(True); self.eraser_button.blockSignals(True); self.move_button.blockSignals(True)
         self.pen_button.setChecked(tool_name == "brush")
         self.eraser_button.setChecked(tool_name == "eraser")
         self.move_button.setChecked(tool_name == "move")
         self.pen_button.blockSignals(False); self.eraser_button.blockSignals(False); self.move_button.blockSignals(False)
+
     def _update_glyph_margin_slider_and_label_no_signal(self, value: int):
         self.margin_slider.blockSignals(True); self.margin_slider.setValue(value); self.margin_slider.blockSignals(False)
         self.margin_value_label.setText(str(value))
@@ -1531,50 +1558,50 @@ class DrawingEditorWidget(QWidget):
                 else: base_text = f"Char: {character}"
         else: base_text = "Unicode: N/A"
         final_text = base_text
-        if self.canvas and character: 
-            if self.canvas.editing_vrt2_glyph: final_text += " vert" 
-            elif character != '.notdef' and character in self.rotated_vrt2_chars: final_text += " vert-r" 
+        if self.canvas and character:
+            if self.canvas.editing_vrt2_glyph: final_text += " vert"
+            elif character != '.notdef' and character in self.rotated_vrt2_chars: final_text += " vert-r"
         self.unicode_label.setText(final_text)
 
     def set_enabled_controls(self, enabled: bool):
         self.pen_button.setEnabled(enabled); self.eraser_button.setEnabled(enabled)
         self.move_button.setEnabled(enabled); self.slider.setEnabled(enabled)
-        if hasattr(self, 'pen_size_buttons_group'): 
+        if hasattr(self, 'pen_size_buttons_group'):
             for button in self.pen_size_buttons_group.findChildren(QPushButton): button.setEnabled(enabled)
         self.shape_box.setEnabled(enabled); self.mirror_checkbox.setEnabled(enabled)
         self.margin_slider.setEnabled(enabled); self.margin_value_label.setEnabled(enabled)
         self.ref_opacity_slider.setEnabled(enabled); self.ref_opacity_label.setEnabled(enabled)
-        self.unicode_label.setEnabled(enabled) 
+        self.unicode_label.setEnabled(enabled)
         is_vrt2_currently = self.canvas.editing_vrt2_glyph if self.canvas else False
-        adv_controls_enabled = enabled 
+        adv_controls_enabled = enabled
         self.adv_width_slider.setEnabled(adv_controls_enabled); self.adv_width_spinbox.setEnabled(adv_controls_enabled)
         self.adv_width_label.setText("文字送り高さ:" if (enabled and is_vrt2_currently) else "文字送り幅:")
-        self.load_ref_button.setEnabled(enabled) 
+        self.load_ref_button.setEnabled(enabled)
         self.delete_ref_button.setEnabled(enabled and self.canvas.reference_image is not None)
         if hasattr(self, 'glyph_to_ref_reset_button'):
              current_glyph_image = self.canvas.image
              current_glyph_has_content = (current_glyph_image and not current_glyph_image.isNull() and
-                                          not (current_glyph_image.width() == 1 and current_glyph_image.height() == 1 and 
-                                               current_glyph_image.pixelColor(0,0) == QColor(Qt.white).rgba())) 
+                                          not (current_glyph_image.width() == 1 and current_glyph_image.height() == 1 and
+                                               current_glyph_image.pixelColor(0,0) == QColor(Qt.white).rgba()))
              self.glyph_to_ref_reset_button.setEnabled(enabled and current_glyph_has_content)
-        is_vrt2_widget_visible_and_char_eligible = self.vrt2_controls_widget.isVisible() 
+        is_vrt2_widget_visible_and_char_eligible = self.vrt2_controls_widget.isVisible()
         self.vrt2_toggle_button.setEnabled(enabled and is_vrt2_widget_visible_and_char_eligible)
         self.transfer_to_vrt2_button.setEnabled(enabled and is_vrt2_widget_visible_and_char_eligible)
         if enabled: self._update_undo_redo_buttons_state(len(self.canvas.undo_stack) > 1, bool(self.canvas.redo_stack))
-        else: 
+        else:
             self._update_undo_redo_buttons_state(False, False)
-            self._update_adv_width_ui_no_signal(DEFAULT_ADVANCE_WIDTH) 
-            self.canvas.reference_image = None 
+            self._update_adv_width_ui_no_signal(DEFAULT_ADVANCE_WIDTH)
+            self.canvas.reference_image = None
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
-        if not enabled: 
-            self.canvas.current_glyph_character = None 
-            inactive_canvas_fill_color = QColor(220, 220, 220) 
+        if not enabled:
+            self.canvas.current_glyph_character = None
+            inactive_canvas_fill_color = QColor(220, 220, 220)
             self.canvas.image.fill(inactive_canvas_fill_color)
             self.canvas.update(); self.update_unicode_display(None)
 
     def _update_undo_redo_buttons_state(self, can_undo: bool, can_redo: bool):
-        controls_are_generally_enabled = self.pen_button.isEnabled() 
+        controls_are_generally_enabled = self.pen_button.isEnabled()
         self.undo_button.setEnabled(can_undo and controls_are_generally_enabled)
         self.redo_button.setEnabled(can_redo and controls_are_generally_enabled)
 
@@ -1582,15 +1609,15 @@ class DrawingEditorWidget(QWidget):
         pen_width_str = settings.get(SETTING_PEN_WIDTH)
         if pen_width_str is not None:
             try: self.canvas.set_pen_width(int(pen_width_str))
-            except ValueError: pass 
+            except ValueError: pass
         pen_shape = settings.get(SETTING_PEN_SHAPE)
         if pen_shape is not None:
             self.shape_box.blockSignals(True); self.shape_box.setCurrentText(pen_shape); self.shape_box.blockSignals(False)
             self.canvas.set_pen_shape(pen_shape)
         current_tool = settings.get(SETTING_CURRENT_TOOL)
         if current_tool == "eraser": self.canvas.set_eraser_mode()
-        elif current_tool == "move": self.canvas.set_move_mode(True) 
-        else: self.canvas.set_brush_mode() 
+        elif current_tool == "move": self.canvas.set_move_mode(True)
+        else: self.canvas.set_brush_mode()
         mirror_mode_str = settings.get(SETTING_MIRROR_MODE)
         if mirror_mode_str is not None:
             checked = mirror_mode_str.lower() == 'true'
@@ -1609,10 +1636,9 @@ class DrawingEditorWidget(QWidget):
             except ValueError:
                 self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
                 self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
-        else: 
+        else:
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
-
 
 
 class ImageLoaderSignals(QObject):
@@ -2061,7 +2087,6 @@ class GlyphTableDelegate(QStyledItemDelegate):
 
 
 # --- GlyphGridWidget の修正箇所 ---
-# --- GlyphGridWidget の修正箇所 ---
 
 class GlyphGridWidget(QWidget):
     glyph_selected_signal = Signal(str)
@@ -2114,8 +2139,7 @@ class GlyphGridWidget(QWidget):
                      2 # Account for borders/padding
         self.setFixedWidth(grid_width) 
 
-
-        self.setFocusPolicy(Qt.StrongFocus) 
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
 
     def _setup_table_view(self, view: QTableView, model: GlyphTableModel, delegate: GlyphTableDelegate):
         view.setModel(model)
@@ -2150,7 +2174,7 @@ class GlyphGridWidget(QWidget):
             QTableView::item { border: none; padding: 0px; margin: 0px; background-color: transparent; }
             QTableView::item:selected { background-color: transparent; } 
         """)
-        view.setFocusPolicy(Qt.StrongFocus)
+        view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         view.installEventFilter(self)
 
 
@@ -2163,11 +2187,11 @@ class GlyphGridWidget(QWidget):
                         self.keyPressEvent(key_event) 
                         if key_event.isAccepted():
                             return True 
-                        else:
+                        else: # If keyPressEvent did not accept, still return True to prevent default TableView nav
                             return True 
-                    else:
+                    else: # Modifiers are pressed, let default handling occur (e.g. Ctrl+Arrow)
                         return False 
-                else:
+                else: # Other keys, let default handling occur
                      return False 
         return super().eventFilter(watched, event)
 
@@ -2191,15 +2215,26 @@ class GlyphGridWidget(QWidget):
         flat_idx = target_model.get_flat_index_of_char_key(char_to_find)
         if flat_idx is not None:
             self._select_char_in_view(char_to_find, target_view, target_model)
-            self.search_input.clear() # Clearing search input should not steal focus from canvas (which will be set by load_glyph_for_editing)
+            # MainWindow.load_glyph_for_editing will set focus to canvas
+            self.search_input.clear() 
             return
         
         QMessageBox.information(self, "検索結果", f"文字 '{search_text}' は現在表示中のリストに見つかりません。")
+        # After QMessageBox, focus might shift. Ensure canvas focus if a glyph is active.
+        main_window = self.window()
+        if isinstance(main_window, MainWindow) and main_window.drawing_editor_widget.canvas.current_glyph_character:
+            main_window.drawing_editor_widget.canvas.setFocus()
+
 
     def _on_filter_changed(self, checked: bool):
         self.std_glyph_model.set_filter_written_only(checked)
         self.vrt2_glyph_model.set_filter_written_only(checked)
+        
+        # After filter change, a new selection (or no selection) will occur.
+        # This will call _try_to_restore_selection_or_select_first,
+        # which in turn ensures the signal is emitted to MainWindow.
         self._try_to_restore_selection_or_select_first(self.current_active_view)
+
 
     def _on_tab_changed(self, index: int):
         if self._is_selecting_programmatically:
@@ -2210,29 +2245,65 @@ class GlyphGridWidget(QWidget):
         else:
             self.current_active_view = self.vrt2_glyph_view
         
-        # self.current_active_view.setFocus() # Let MainWindow handle final focus
         self.search_input.clear()
+        
+        # Attempt to restore selection or select the first item in the new tab.
+        # This will call _select_char_in_view, which will handle emitting signals.
         self._try_to_restore_selection_or_select_first(self.current_active_view)
+
+        # The _select_char_in_view (via _try_to_restore...) should ensure the correct
+        # signal is emitted, leading to load_glyph_for_editing and canvas focus.
+        # If, after _try_to_restore..., no item is selected, _select_char_in_view(None...)
+        # will trigger a signal with an empty char_key.
+
+        # Explicitly emit signal for the current state of the new active tab
+        final_selected_idx = self.current_active_view.currentIndex()
+        model = self.current_active_view.model()
+        char_key_to_load: Optional[str] = None
+        if final_selected_idx.isValid() and isinstance(model, GlyphTableModel):
+            char_key_to_load = model.data(final_selected_idx, Qt.UserRole)
+        
+        is_vrt2 = (self.current_active_view == self.vrt2_glyph_view)
+        if char_key_to_load:
+            self._emit_selection_signal(char_key_to_load, is_vrt2)
+        else:
+            self._emit_selection_signal("", is_vrt2)
 
 
     def _on_item_clicked(self, index: QModelIndex):
-        if self._is_selecting_programmatically or not index.isValid():
+        if self._is_selecting_programmatically:
             return
         
         view = self.sender()
         if not isinstance(view, QTableView):
             return
+
+        if not index.isValid(): # Clicked on empty area of the view
+            main_window = self.window() # Try to get MainWindow instance
+            if isinstance(main_window, MainWindow):
+                if main_window.drawing_editor_widget.canvas.current_glyph_character:
+                     main_window.drawing_editor_widget.canvas.setFocus()
+            return
         
-        # view.setFocus() # Removed: Let MainWindow handle final focus to canvas
-        # The click itself will trigger selectionModel().currentChanged if selection changes,
-        # which leads to _on_current_item_changed_in_view -> signal -> MainWindow.load_glyph_for_editing -> canvas focus.
+        # An actual item was clicked.
+        model = view.model()
+        if not isinstance(model, GlyphTableModel): return
+
+        char_key_from_click = model.data(index, Qt.UserRole)
+        if char_key_from_click:
+            is_vrt2_source = (view == self.vrt2_glyph_view)
+            # This will trigger load_glyph_for_editing (via MainWindow), which focuses the canvas.
+            self._emit_selection_signal(char_key_from_click, is_vrt2_source)
 
 
     def _on_current_item_changed_in_view(self, current: QModelIndex, previous: QModelIndex):
         if self._is_selecting_programmatically:
             return
 
-        active_view = self.current_active_view 
+        active_view = self.current_active_view # Should be the sender's view context
+        # It's possible sender() might be more robust if this slot is connected to multiple views' selection models
+        # For now, current_active_view is updated by _on_tab_changed.
+        
         model = active_view.model()
         if not isinstance(model, GlyphTableModel):
             return
@@ -2249,6 +2320,7 @@ class GlyphGridWidget(QWidget):
 
 
     def _emit_selection_signal(self, char_key: str, is_vrt2_source: bool):
+        # This is the single point for emitting selection to MainWindow
         if is_vrt2_source:
             self.vrt2_glyph_selected_signal.emit(char_key)
         else:
@@ -2281,7 +2353,7 @@ class GlyphGridWidget(QWidget):
         if self._is_selecting_programmatically: 
             return
 
-        self._is_selecting_programmatically = True # Prevent signals during programmatic update
+        self._is_selecting_programmatically = True 
         try:
             target_view = self.vrt2_glyph_view if is_vrt2_source else self.std_glyph_view
             target_model = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
@@ -2289,30 +2361,24 @@ class GlyphGridWidget(QWidget):
             target_tab_index = 1 if is_vrt2_source else 0
             if self.tab_widget.currentIndex() != target_tab_index:
                 self.tab_widget.setCurrentIndex(target_tab_index) 
-                # _on_tab_changed will set self.current_active_view
-            else:
-                self.current_active_view = target_view # Ensure current_active_view is correct
+            self.current_active_view = target_view
 
             if character is None or not character:
-                target_view.selectionModel().clear()
-                self._is_selecting_programmatically = False # Early exit, reset flag
-                return
-
-            flat_idx = target_model.get_flat_index_of_char_key(character)
-            if flat_idx is not None:
-                row, col = divmod(flat_idx, target_model.columnCount())
-                q_model_idx = target_model.index(row, col)
-                if q_model_idx.isValid():
-                    # Only change selection if it's actually different
-                    if target_view.currentIndex() != q_model_idx:
-                         target_view.selectionModel().setCurrentIndex(q_model_idx, QItemSelectionModel.ClearAndSelect)
-                    target_view.scrollTo(q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-                else: # Should not happen if flat_idx is valid
-                    target_view.selectionModel().clear()
-            else: # Character not found in this model's filtered list
-                target_view.selectionModel().clear()
-            
-            # Removed target_view.setFocus() here. MainWindow will handle final focus.
+                target_view.selectionModel().clearSelection() # Use clearSelection for full clear
+                # _on_current_item_changed_in_view will handle emitting empty signal
+            else:
+                flat_idx = target_model.get_flat_index_of_char_key(character)
+                if flat_idx is not None:
+                    row, col = divmod(flat_idx, target_model.columnCount())
+                    q_model_idx = target_model.index(row, col)
+                    if q_model_idx.isValid():
+                        if target_view.currentIndex() != q_model_idx: # Only if selection changes
+                             target_view.selectionModel().setCurrentIndex(q_model_idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Current)
+                        target_view.scrollTo(q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
+                    else: 
+                        target_view.selectionModel().clearSelection()
+                else: 
+                    target_view.selectionModel().clearSelection()
         finally:
             self._is_selecting_programmatically = False
 
@@ -2322,28 +2388,40 @@ class GlyphGridWidget(QWidget):
         if not current_selection_model:
             return
         
-        new_q_model_idx = QModelIndex()
+        target_q_model_idx: Optional[QModelIndex] = None
+        must_emit_manually = False # To track if selection didn't change but signal needed
 
-        if character is None or not character:
-            # Clearing selection will trigger _on_current_item_changed_in_view
-            current_selection_model.clear()
-        else:
+        if character:
             flat_idx = model.get_flat_index_of_char_key(character)
             if flat_idx is not None:
                 row, col = divmod(flat_idx, model.columnCount())
-                q_model_idx_candidate = model.index(row, col)
-                if q_model_idx_candidate.isValid():
-                    new_q_model_idx = q_model_idx_candidate
-                    # This setCurrentIndex call is the key to triggering _on_current_item_changed_in_view
-                    # if the selection actually changes.
-                    current_selection_model.setCurrentIndex(new_q_model_idx, QItemSelectionModel.ClearAndSelect)
-                    view.scrollTo(new_q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-                else: 
-                    current_selection_model.clear()
-            else: 
-                current_selection_model.clear()
+                idx_candidate = model.index(row, col)
+                if idx_candidate.isValid():
+                    target_q_model_idx = idx_candidate
         
-        # Removed view.setFocus(). Let selection change signals propagate.
+        current_view_idx = view.currentIndex()
+
+        if target_q_model_idx:
+            if current_view_idx != target_q_model_idx:
+                # Selection will change, _on_current_item_changed_in_view handles signal
+                current_selection_model.setCurrentIndex(target_q_model_idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Current)
+            else:
+                # Selection is the same, currentChanged won't fire. We need to ensure editor knows.
+                must_emit_manually = True
+            view.scrollTo(target_q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
+        else: # No valid target character or character not found
+            if current_view_idx.isValid():
+                current_selection_model.clearSelection() # Will trigger currentChanged if valid -> invalid
+            # else: already clear, no signal needed from here by currentChanged
+
+        if must_emit_manually and character: # Character is valid and already selected
+            is_vrt2 = (view == self.vrt2_glyph_view)
+            self._emit_selection_signal(character, is_vrt2)
+        elif not target_q_model_idx and not current_view_idx.isValid() and character is None:
+            # This case: asked to select None, and view is already clear.
+            # No currentChanged, but editor needs to know.
+            is_vrt2 = (view == self.vrt2_glyph_view)
+            self._emit_selection_signal("", is_vrt2)
 
 
     def _try_to_restore_selection_or_select_first(self, view_to_update: QTableView):
@@ -2356,14 +2434,13 @@ class GlyphGridWidget(QWidget):
         if current_selection_model_idx.isValid():
             current_char_key = model_to_update.data(current_selection_model_idx, Qt.UserRole)
         
+        char_to_set: Optional[str] = None
         if current_char_key and model_to_update.get_flat_index_of_char_key(current_char_key) is not None:
-            self._select_char_in_view(current_char_key, view_to_update, model_to_update)
+            char_to_set = current_char_key # Try to keep current selection if valid
         elif model_to_update.get_metadata_count() > 0:
-            first_item_char_key = model_to_update.get_char_key_at_flat_index(0)
-            if first_item_char_key:
-                 self._select_char_in_view(first_item_char_key, view_to_update, model_to_update)
-        else: 
-            self._select_char_in_view(None, view_to_update, model_to_update)
+            char_to_set = model_to_update.get_char_key_at_flat_index(0) # Fallback to first
+        
+        self._select_char_in_view(char_to_set, view_to_update, model_to_update)
 
 
     def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool):
@@ -2410,25 +2487,36 @@ class GlyphGridWidget(QWidget):
 
         key = event.key()
         
+        # Check for modifiers. If any modifier (except KeypadModifier for numpad arrows) is pressed,
+        # let the default QTableView behavior or parent handle it.
+        # This allows Ctrl+A, Shift+Arrow for range selection (if enabled), etc.
         if event.modifiers() != Qt.NoModifier and event.modifiers() != Qt.KeypadModifier:
-            if key in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
-                super().keyPressEvent(event)
-                if event.isAccepted(): return
-                return
-            else: 
+            if key in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]: # Common navigation keys
+                # If the event is not accepted by super, it means QTableView might not handle it.
+                # We don't want to interfere with potential text input if a cell editor were active.
+                # However, our cells are not directly editable.
+                super().keyPressEvent(event) 
+                if event.isAccepted(): # If QTableView handled it (e.g. scroll)
+                    return
+                # If not accepted by super, and it was an arrow key with modifier,
+                # we probably don't want to do custom navigation either.
+                return 
+            else: # Non-arrow key with modifier
                 super().keyPressEvent(event)
                 return
         
+        # If no modifiers (or only KeypadModifier), and it's not an arrow key, let super handle.
         if key not in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
             super().keyPressEvent(event)
             return
 
+        # At this point, it's an arrow key with no modifiers (or KeypadModifier)
         current_model_idx = view.currentIndex()
         num_cols = model.columnCount()
         total_visible_items = model.get_metadata_count()
 
         if num_cols == 0 or total_visible_items == 0:
-            super().keyPressEvent(event) 
+            super().keyPressEvent(event) # Should not happen if items exist, but good guard
             return
 
         current_flat_idx = -1
@@ -2436,20 +2524,22 @@ class GlyphGridWidget(QWidget):
             current_row_from_idx = current_model_idx.row()
             current_col_from_idx = current_model_idx.column()
             current_flat_idx = current_row_from_idx * num_cols + current_col_from_idx
+            # Validate flat_idx as it might be out of bounds if columns changed or data is sparse
             if not (0 <= current_flat_idx < total_visible_items):
-                current_flat_idx = -1 
+                current_flat_idx = -1 # Treat as no selection if invalid
         
-        if current_flat_idx == -1: 
-            if total_visible_items > 0:
+        if current_flat_idx == -1: # No valid current selection
+            if total_visible_items > 0: # If there are items, select the first one
                 first_item_char_key = model.get_char_key_at_flat_index(0)
                 if first_item_char_key:
-                    self._select_char_in_view(first_item_char_key, view, model) # Triggers selection chain
+                    # _select_char_in_view will handle emitting signals
+                    self._select_char_in_view(first_item_char_key, view, model)
                 event.accept()
-            else:
+            else: # No items to select
                 super().keyPressEvent(event)
             return
         
-        target_flat_idx = current_flat_idx 
+        target_flat_idx = current_flat_idx # Default to current if no move happens
 
         if key == Qt.Key_Left:
             if current_flat_idx > 0:
@@ -2459,26 +2549,25 @@ class GlyphGridWidget(QWidget):
                 target_flat_idx = current_flat_idx + 1
         elif key == Qt.Key_Up:
             potential_target_idx = current_flat_idx - num_cols
-            if potential_target_idx >= 0:
+            if potential_target_idx >= 0: # Check if it's a valid index
                 target_flat_idx = potential_target_idx
         elif key == Qt.Key_Down:
             potential_target_idx = current_flat_idx + num_cols
-            if potential_target_idx < total_visible_items:
+            if potential_target_idx < total_visible_items: # Check if it's a valid index
                 target_flat_idx = potential_target_idx
 
-        if target_flat_idx != current_flat_idx:
+        if target_flat_idx != current_flat_idx: # If a move is determined
+            # Ensure target_flat_idx is within bounds (already done by checks above, but belt-and-suspenders)
             if 0 <= target_flat_idx < total_visible_items:
                 char_to_select = model.get_char_key_at_flat_index(target_flat_idx)
                 if char_to_select: 
-                    self._select_char_in_view(char_to_select, view, model) # Triggers selection chain
+                    # _select_char_in_view will handle emitting signals
+                    self._select_char_in_view(char_to_select, view, model)
         
-        event.accept()
+        event.accept() # We've handled the arrow key navigation
 
 
 
-
-
-# --- Properties Widget (変更なし) ---
 class PropertiesWidget(QWidget):
     character_set_changed_signal = Signal(str)
     rotated_vrt2_set_changed_signal = Signal(str)
@@ -2492,13 +2581,13 @@ class PropertiesWidget(QWidget):
         layout = QVBoxLayout(self)
         font_name_layout = QHBoxLayout(); font_name_layout.addWidget(QLabel("フォント名:"))
         self.font_name_input = QLineEdit(); self.font_name_input.setPlaceholderText("例: MyCustomFont")
-        self.font_name_input.editingFinished.connect(self._emit_font_name_change) 
+        self.font_name_input.editingFinished.connect(self._emit_font_name_change)
         font_name_layout.addWidget(self.font_name_input); layout.addLayout(font_name_layout)
         font_weight_layout = QHBoxLayout(); font_weight_layout.addWidget(QLabel("ウェイト:"))
         self.font_weight_combobox = QComboBox(); self.font_weight_combobox.addItems(FONT_WEIGHT_OPTIONS)
-        self.font_weight_combobox.setCurrentText(DEFAULT_FONT_WEIGHT) 
+        self.font_weight_combobox.setCurrentText(DEFAULT_FONT_WEIGHT)
         self.font_weight_combobox.currentTextChanged.connect(self._emit_font_weight_change)
-        font_weight_layout.addWidget(self.font_weight_combobox); font_weight_layout.addStretch(1) 
+        font_weight_layout.addWidget(self.font_weight_combobox); font_weight_layout.addStretch(1)
         layout.addLayout(font_weight_layout); layout.addSpacing(10)
         layout.addWidget(QLabel("プロジェクトの文字セット:"))
         self.char_set_text_edit = QTextEdit(); self.char_set_text_edit.setPlaceholderText("例: あいうえお漢字...")
@@ -2515,10 +2604,10 @@ class PropertiesWidget(QWidget):
         self.nr_vrt2_text_edit.setFixedHeight(60); layout.addWidget(self.nr_vrt2_text_edit)
         apply_nr_vrt2_button = QPushButton("非回転縦書き文字セットを適用")
         apply_nr_vrt2_button.clicked.connect(self._apply_nr_vrt2_changes); layout.addWidget(apply_nr_vrt2_button)
-        layout.addSpacing(20) 
+        layout.addSpacing(20)
         self.export_font_button = QPushButton("フォントを書き出す")
         self.export_font_button.clicked.connect(self.export_font_signal); layout.addWidget(self.export_font_button)
-        layout.addStretch(1) 
+        layout.addStretch(1)
 
     def _emit_font_name_change(self): self.font_name_changed_signal.emit(self.font_name_input.text())
     def _emit_font_weight_change(self, weight_text: str): self.font_weight_changed_signal.emit(weight_text)
@@ -2531,7 +2620,7 @@ class PropertiesWidget(QWidget):
     def load_font_weight(self, weight: str):
         self.font_weight_combobox.blockSignals(True)
         if weight in FONT_WEIGHT_OPTIONS: self.font_weight_combobox.setCurrentText(weight)
-        else: self.font_weight_combobox.setCurrentText(DEFAULT_FONT_WEIGHT) 
+        else: self.font_weight_combobox.setCurrentText(DEFAULT_FONT_WEIGHT)
         self.font_weight_combobox.blockSignals(False)
     def load_character_set(self, char_string: str): self.char_set_text_edit.setText(char_string)
     def load_r_vrt2_set(self, char_string: str): self.r_vrt2_text_edit.setText(char_string)
@@ -2543,6 +2632,30 @@ class PropertiesWidget(QWidget):
         apply_buttons = [btn for btn in self.findChildren(QPushButton) if btn != self.export_font_button]
         for btn in apply_buttons: btn.setEnabled(enabled)
         self.export_font_button.setEnabled(enabled)
+
+
+    def mousePressEvent(self, event: QMouseEvent):
+        # このウィジェットの背景(余白)がクリックされたかを確認
+        # childAt() は、指定された位置に子ウィジェットがあればそれを返す。なければ None。
+        # もしクリック位置に具体的な操作可能な子ウィジェット (ボタン、テキスト入力など) がなく、
+        # PropertiesWidget 自身がクリックされたと見なせる場合、フォーカスを移す。
+        clicked_child = self.childAt(event.position().toPoint())
+        
+        # もしクリックされたのが PropertiesWidget 自身 (背景) であり、
+        # かつ MainWindow のインスタンスを取得でき、そのキャンバスにグリフがロードされていればフォーカスを移す
+        if clicked_child is None or clicked_child is self: # clicked_child is None means background
+            main_window = self.window() # PropertiesWidget のトップレベルウィンドウ (MainWindow のはず)
+            if isinstance(main_window, MainWindow): # MainWindow の型を確認
+                if main_window.drawing_editor_widget.canvas.current_glyph_character:
+                    main_window.drawing_editor_widget.canvas.setFocus()
+                    event.accept() # イベントを消費
+                    return
+        
+        super().mousePressEvent(event) # それ以外は通常の処理
+
+
+
+
 
 # --- Batch Advance Width Dialog (変更なし) ---
 class BatchAdvanceWidthDialog(QDialog):
@@ -2568,6 +2681,44 @@ class BatchAdvanceWidthDialog(QDialog):
         adv_width = self.advance_width_spinbox.value()
         return char_spec if char_spec else None, adv_width
 
+
+
+
+
+
+
+
+
+
+class ClickableKanjiLabel(QLabel):
+    clicked_with_info = Signal(str, bool) # char_key, is_vrt2_glyph
+
+    def __init__(self, char_key: str, is_vrt2_glyph: bool, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.char_key = char_key
+        self.is_vrt2_glyph = is_vrt2_glyph
+        self.setCursor(Qt.PointingHandCursor)
+        
+        tooltip_text = f"グリフ「{self.char_key}」を編集"
+        if self.is_vrt2_glyph:
+            tooltip_text += " (縦書きグリフ)"
+        self.setToolTip(tooltip_text)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            self.clicked_with_info.emit(self.char_key, self.is_vrt2_glyph)
+        super().mousePressEvent(event)
+
+
+
+
+
+
+
+
+
+
+
 # --- MainWindow (Modified for new GlyphGridWidget and data flow) ---
 class MainWindow(QMainWindow):
     KV_MODE_FONT_DISPLAY = 0
@@ -2578,7 +2729,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("P-Glyph")
         self.setGeometry(50, 50, 1550, 800)
-        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) # For MainWindow to receive key events initially
 
         self.db_manager = DatabaseManager() 
         self.current_project_path: Optional[str] = None
@@ -2587,21 +2738,18 @@ class MainWindow(QMainWindow):
 
         self.non_rotated_vrt2_chars: set[str] = set()
         self.project_glyph_chars_cache: Set[str] = set() 
-        # self._all_standard_glyphs_pixmap_cache: List[Tuple[str, Optional[QPixmap]]] = [] # No longer primary source for KV
-        # self._all_nrvg_pixmap_cache: List[Tuple[str, Optional[QPixmap]]] = [] # No longer primary source for KV
-
+        
         self.export_process: Optional[QProcess] = None
         self.original_export_button_state: bool = False 
         
         self._project_loading_in_progress: bool = False
-        self._batch_operation_in_progress: bool = False # <<< 新しいフラグ
+        self._batch_operation_in_progress: bool = False 
         self._last_active_glyph_char_from_load: Optional[str] = None
         self._last_active_glyph_is_vrt2_from_load: bool = False
 
 
         self.drawing_editor_widget = DrawingEditorWidget()
-        self.glyph_grid_widget = GlyphGridWidget(self.db_manager) # Pass db_manager
-        # self.glyph_grid_widget.setFixedWidth(GLYPH_GRID_WIDTH) # Width is now dynamic
+        self.glyph_grid_widget = GlyphGridWidget(self.db_manager) 
         self.properties_widget = PropertiesWidget()
         self.properties_widget.setFixedWidth(PROPERTIES_WIDTH)
 
@@ -2631,9 +2779,7 @@ class MainWindow(QMainWindow):
         self.font_bookmarks: List[str] = []
         self._load_font_bookmarks()
         
-        # This dictionary will store char_key -> QPixmap for written glyphs found for the current KV update.
-        # Used for rendering in KV_MODE_WRITTEN_GLYPHS.
-        self.temp_written_kv_pixmaps: Dict[str, QPixmap] = {}
+        self.temp_written_kv_pixmaps: Dict[str, Tuple[QPixmap, bool]] = {} 
 
 
         central_widget = QWidget(); self.setCentralWidget(central_widget)
@@ -2641,7 +2787,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(5, 5, 5, 5); main_layout.setSpacing(5)
         self._init_ui_for_kanji_viewer_panel()
         if self.kanji_viewer_panel_widget: main_layout.addWidget(self.kanji_viewer_panel_widget, 0)
-        main_layout.addWidget(self.glyph_grid_widget, 0) # No fixed width for grid
+        main_layout.addWidget(self.glyph_grid_widget, 0) 
         main_layout.addWidget(self.drawing_editor_widget, 1)
         main_layout.addWidget(self.properties_widget, 0)
 
@@ -2650,7 +2796,8 @@ class MainWindow(QMainWindow):
         self.edit_menu: Optional[QMenu] = None; self.batch_adv_width_action: Optional[QAction] = None
         self.batch_import_glyphs_action: Optional[QAction] = None
         self.batch_import_reference_images_action: Optional[QAction] = None
-        self._create_menus(); self.setStatusBar(QStatusBar(self))
+        self._create_menus()
+        self.setStatusBar(QStatusBar(self))
         self._kv_deferred_update_timer = QTimer(self)
         self._kv_deferred_update_timer.setSingleShot(True)
         self._kv_deferred_update_timer.timeout.connect(self._process_deferred_kv_update)
@@ -2705,6 +2852,10 @@ class MainWindow(QMainWindow):
             self.save_gui_setting_async(SETTING_KV_CURRENT_FONT, actual_font_name)
         char_to_update_kv_with = self.drawing_editor_widget.canvas.current_glyph_character or self._kv_initial_char_to_display
         self._trigger_kanji_viewer_update_for_current_glyph(char_to_update_kv_with)
+        # Ensure canvas focus after combo interaction if a glyph is active
+        if self.drawing_editor_widget.canvas.current_glyph_character:
+            self.drawing_editor_widget.canvas.setFocus()
+
 
     def _init_ui_for_kanji_viewer_panel(self):
         self.kanji_viewer_panel_widget = QWidget()
@@ -2813,7 +2964,7 @@ class MainWindow(QMainWindow):
         if is_bookmarked: self.bookmark_font_button.setStyleSheet("QPushButton { background-color: palette(highlight); color: palette(highlighted-text); border: 1px solid palette(dark);} QPushButton:hover {background-color: palette(highlight); }")
         else: self.bookmark_font_button.setStyleSheet("QPushButton { } QPushButton:hover { background-color: palette(button); }")
 
-    def _toggle_font_bookmark(self): # (変更なし)
+    def _toggle_font_bookmark(self): # (変更なし) + Added canvas focus
         if not self.kanji_viewer_font_combo: return
         current_display_name = self.kanji_viewer_font_combo.currentText();
         if not current_display_name: return
@@ -2826,6 +2977,9 @@ class MainWindow(QMainWindow):
             self.font_bookmarks.append(actual_font_name); self.font_bookmarks.sort() 
             self.statusBar().showMessage(f"フォント「{actual_font_name}」をブックマークに追加しました。", 3000)
         self._save_font_bookmarks(); self._populate_kv_fonts() 
+        if self.drawing_editor_widget.canvas.current_glyph_character: # Ensure focus returns to canvas
+            self.drawing_editor_widget.canvas.setFocus()
+
 
     def _kv_initial_display_setup(self): # (変更なし)
         if self.kanji_viewer_font_combo and self.kanji_viewer_font_combo.count() > 0:
@@ -2869,7 +3023,7 @@ class MainWindow(QMainWindow):
         if char_to_process: self._trigger_kanji_viewer_update_for_current_glyph(char_to_process)
 
     @Slot(QAbstractButton, bool)
-    def _on_kv_display_mode_button_toggled(self, button: QAbstractButton, checked: bool): # (変更なし)
+    def _on_kv_display_mode_button_toggled(self, button: QAbstractButton, checked: bool): # (変更なし) + Added canvas focus
         if not checked: return 
         new_mode = self.kv_mode_button_group.id(button)
         if new_mode == self.kv_display_mode and self.current_project_path and not self._project_loading_in_progress : return 
@@ -2878,6 +3032,9 @@ class MainWindow(QMainWindow):
             self.save_gui_setting_async(SETTING_KV_DISPLAY_MODE, str(new_mode))
         current_char_for_kv = self.drawing_editor_widget.canvas.current_glyph_character or self._kv_initial_char_to_display
         self._trigger_kanji_viewer_update_for_current_glyph(current_char_for_kv)
+        if self.drawing_editor_widget.canvas.current_glyph_character: # Ensure focus returns to canvas
+            self.drawing_editor_widget.canvas.setFocus()
+
 
     def _trigger_kanji_viewer_update_for_current_glyph(self, current_char: str): # (変更なし)
         if self._project_loading_in_progress: return 
@@ -2931,6 +3088,7 @@ class MainWindow(QMainWindow):
             self.related_kanji_worker = new_worker; self.related_kanji_worker.start()
 
 
+
     @Slot(int, dict, str, int)
     def _handle_kv_related_kanji_result(self, process_id: int, results_dict: dict, font_family_from_worker: str, font_px_size: int):
         with QMutexLocker(self._worker_management_mutex):
@@ -2967,12 +3125,13 @@ class MainWindow(QMainWindow):
             for radical, kanji_list in results_dict.items():
                 written_kanji_in_list = []
                 for k_char in kanji_list:
-                    is_written = False
+                    is_written_as_std = False
+                    is_written_as_vrt2 = False
                     pixmap_to_store: Optional[QPixmap] = None
 
                     # Check standard glyphs
                     if self.glyph_grid_widget.std_glyph_model.is_glyph_written(k_char):
-                        is_written = True
+                        is_written_as_std = True
                         if k_char in self.glyph_grid_widget.std_glyph_model._pixmap_cache:
                             pixmap_to_store = self.glyph_grid_widget.std_glyph_model._pixmap_cache[k_char]
                         else: # Not in model's RAM cache, try direct DB load for KV
@@ -2981,16 +3140,16 @@ class MainWindow(QMainWindow):
                     # Check VRT2 glyphs (non-rotated) if not found as written standard glyph
                     elif k_char in self.non_rotated_vrt2_chars and \
                          self.glyph_grid_widget.vrt2_glyph_model.is_glyph_written(k_char):
-                        is_written = True
+                        is_written_as_vrt2 = True
                         if k_char in self.glyph_grid_widget.vrt2_glyph_model._pixmap_cache:
                             pixmap_to_store = self.glyph_grid_widget.vrt2_glyph_model._pixmap_cache[k_char]
                         else: # Not in model's RAM cache, try direct DB load for KV
                             pixmap_to_store = self.db_manager.load_glyph_image(k_char, is_vrt2=True)
                     
-                    if is_written:
+                    if is_written_as_std or is_written_as_vrt2:
                         written_kanji_in_list.append(k_char)
                         if pixmap_to_store and k_char not in self.temp_written_kv_pixmaps:
-                             self.temp_written_kv_pixmaps[k_char] = pixmap_to_store.copy() # Store a copy
+                             self.temp_written_kv_pixmaps[k_char] = (pixmap_to_store.copy(), is_written_as_vrt2)
                 
                 if written_kanji_in_list:
                     filtered_dict[radical] = sorted(list(set(written_kanji_in_list))) 
@@ -3007,7 +3166,7 @@ class MainWindow(QMainWindow):
 
         if not effective_results_dict:
             msg_text = f"「{char_for_msg_display}」の構成部首データがないか、\n関連する漢字が見つかりませんでした。"
-            if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS: 
+            if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS: # This case should be caught above now
                  msg_text = f"「{char_for_msg_display}」に関連する書き込み済みグリフは\n見つかりませんでした。"
             elif self.kanji_radicals_data and char_for_msg_display in self.kanji_radicals_data and \
                  not self.kanji_radicals_data.get(char_for_msg_display): 
@@ -3049,14 +3208,23 @@ class MainWindow(QMainWindow):
             tab_layout.setSpacing(5); tab_layout.setContentsMargins(5, 5, 5, 5)
             row, col = 0, 0
             for kanji_char_to_display in kanji_list:
-                kanji_label = QLabel()
-                kanji_label.setFixedSize(item_side_length, item_side_length)
-                kanji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                kanji_label: QLabel # Type hint
 
                 if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
-                    glyph_pixmap = self.temp_written_kv_pixmaps.get(kanji_char_to_display)
-                    if glyph_pixmap and not glyph_pixmap.isNull():
-                        scaled_pixmap = glyph_pixmap.scaled(preview_display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    glyph_pixmap_tuple = self.temp_written_kv_pixmaps.get(kanji_char_to_display)
+                    
+                    is_vrt2_source_for_label = False # Default
+                    glyph_pixmap_for_label: Optional[QPixmap] = None
+
+                    if glyph_pixmap_tuple:
+                        glyph_pixmap_for_label, is_vrt2_source_for_label = glyph_pixmap_tuple
+                    
+                    current_label = ClickableKanjiLabel(kanji_char_to_display, is_vrt2_source_for_label)
+                    current_label.clicked_with_info.connect(self._on_kv_related_glyph_clicked)
+                    kanji_label = current_label 
+
+                    if glyph_pixmap_for_label and not glyph_pixmap_for_label.isNull():
+                        scaled_pixmap = glyph_pixmap_for_label.scaled(preview_display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         kanji_label.setPixmap(scaled_pixmap)
                     else: 
                         kanji_label.setText(kanji_char_to_display) 
@@ -3064,8 +3232,12 @@ class MainWindow(QMainWindow):
                         font_for_fallback.setPixelSize(max(10, int(item_side_length * 0.6)))
                         kanji_label.setFont(font_for_fallback)
                 else: # KV_MODE_FONT_DISPLAY
+                    kanji_label = QLabel() # Regular QLabel
                     kanji_label.setFont(related_kanji_font)
                     kanji_label.setText(kanji_char_to_display)
+                
+                kanji_label.setFixedSize(item_side_length, item_side_length)
+                kanji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 
                 tab_layout.addWidget(kanji_label, row, col)
                 col += 1
@@ -3093,6 +3265,29 @@ class MainWindow(QMainWindow):
         elif self.kanji_viewer_related_tabs.count() > 0: self.kanji_viewer_related_tabs.setCurrentIndex(0)
         
         self.temp_written_kv_pixmaps.clear()
+
+
+
+    @Slot(str, bool)
+    def _on_kv_related_glyph_clicked(self, char_key: str, is_vrt2_glyph: bool):
+        if self._project_loading_in_progress or not self.current_project_path:
+            return
+        
+        target_model = self.glyph_grid_widget.vrt2_glyph_model if is_vrt2_glyph else self.glyph_grid_widget.std_glyph_model
+        
+        if target_model.get_flat_index_of_char_key(char_key) is None:
+            QMessageBox.information(self, "情報", 
+                                    f"グリフ「{char_key}」は現在グリッドリストに表示されていません。\n"
+                                    "「書き込み済みグリフのみ表示」フィルタなどが影響している可能性があります。")
+            if self.drawing_editor_widget.canvas.current_glyph_character: # Ensure focus returns to canvas
+                self.drawing_editor_widget.canvas.setFocus()
+            return
+
+        self.load_glyph_for_editing(char_key, is_vrt2_edit_mode=is_vrt2_glyph)
+        # load_glyph_for_editing will set focus to canvas.
+
+
+
 
 
     @Slot(int, str)
@@ -3126,11 +3321,11 @@ class MainWindow(QMainWindow):
         self.batch_import_reference_images_action = QAction("下書きの一括読み込み...", self); self.batch_import_reference_images_action.triggered.connect(self.batch_import_reference_images)
         self.edit_menu.addAction(self.batch_import_reference_images_action)
 
-    def _set_project_loading_state(self, loading: bool): # (glyph_grid_widget.setEnabled -> .set_search_and_filter_enabled)
+    def _set_project_loading_state(self, loading: bool): 
         self._project_loading_in_progress = loading
         self.drawing_editor_widget.setEnabled(not loading and self.current_project_path is not None)
         self.properties_widget.setEnabled(not loading and self.current_project_path is not None)
-        self.glyph_grid_widget.set_search_and_filter_enabled(not loading and self.current_project_path is not None) # Changed
+        self.glyph_grid_widget.set_search_and_filter_enabled(not loading and self.current_project_path is not None)
         if self.batch_adv_width_action: self.batch_adv_width_action.setEnabled(not loading and self.current_project_path is not None)
         if self.batch_import_glyphs_action: self.batch_import_glyphs_action.setEnabled(not loading and self.current_project_path is not None)
         if self.batch_import_reference_images_action: self.batch_import_reference_images_action.setEnabled(not loading and self.current_project_path is not None)
@@ -3142,11 +3337,14 @@ class MainWindow(QMainWindow):
             else: self.statusBar().clearMessage()
         self._update_ui_for_project_state() 
 
-    def _update_ui_for_project_state(self): # (glyph_grid_widget.clear_grid -> .clear_grid_and_models, etc.)
+    def _update_ui_for_project_state(self): 
         project_loaded_and_not_processing = self.current_project_path is not None and not self._project_loading_in_progress
         self.drawing_editor_widget.set_enabled_controls(project_loaded_and_not_processing)
         self.properties_widget.set_enabled_controls(project_loaded_and_not_processing)
-        self.glyph_grid_widget.set_search_and_filter_enabled(project_loaded_and_not_processing) # Changed
+        self.glyph_grid_widget.set_search_and_filter_enabled(project_loaded_and_not_processing) 
+
+
+
         if self.batch_adv_width_action: self.batch_adv_width_action.setEnabled(project_loaded_and_not_processing)
         if self.batch_import_glyphs_action: self.batch_import_glyphs_action.setEnabled(project_loaded_and_not_processing)
         if self.batch_import_reference_images_action: self.batch_import_reference_images_action.setEnabled(project_loaded_and_not_processing)
@@ -3173,9 +3371,7 @@ class MainWindow(QMainWindow):
             if not self._project_loading_in_progress: 
                 self.drawing_editor_widget.set_rotated_vrt2_chars(set()) 
                 self.glyph_grid_widget.set_non_rotated_vrt2_chars(set())
-                self.glyph_grid_widget.clear_grid_and_models() # Changed
-                # self._all_standard_glyphs_pixmap_cache.clear() # No longer needed as primary source
-                # self._all_nrvg_pixmap_cache.clear() # No longer needed as primary source
+                self.glyph_grid_widget.clear_grid_and_models() 
                 self.drawing_editor_widget.canvas.reference_image = None
                 self.drawing_editor_widget.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
                 self.drawing_editor_widget.canvas.load_glyph("", None, None, DEFAULT_ADVANCE_WIDTH, is_vrt2=False) 
@@ -3193,7 +3389,7 @@ class MainWindow(QMainWindow):
                     default_kv_font = ""
                     if self.kanji_viewer_font_combo and self.kanji_viewer_font_combo.count() > 0:
                         default_kv_font_display_name = self.kanji_viewer_font_combo.itemText(0)
-                        if default_kv_font_display_name: # この行が修正点です
+                        if default_kv_font_display_name: 
                             default_kv_font = self._get_actual_font_name(default_kv_font_display_name)
                     self._kv_set_label_font_and_text(self.kanji_viewer_display_label, self._kv_initial_char_to_display, default_kv_font, self.kanji_viewer_display_label.rect(), 0.85)
                 if self.kanji_viewer_related_tabs: self.kanji_viewer_related_tabs.clear()
@@ -3233,7 +3429,7 @@ class MainWindow(QMainWindow):
             if len(c) == 1 and c not in seen: unique_ordered_chars.append(c); seen.add(c)
         return sorted(unique_ordered_chars, key=ord)
 
-    def new_project(self): # (glyph_grid_widget.clear_grid -> .clear_grid_and_models)
+    def new_project(self): 
         if self._project_loading_in_progress: QMessageBox.information(self, "処理中", "プロジェクトの読み込みまたは作成処理が進行中です。"); return
         filepath, _ = QFileDialog.getSaveFileName(self, "新規プロジェクトを作成", "", "Font Project Files (*.fontproj)")
         if filepath:
@@ -3254,14 +3450,12 @@ class MainWindow(QMainWindow):
     def _check_and_finalize_loading_state_after_create(self): pass # (変更なし)
 
     @Slot(str)
-    def _on_project_created_and_start_load(self, filepath: str): # (glyph_grid_widget.clear_grid -> .clear_grid_and_models, LoadProjectWorker signal connect change)
+    def _on_project_created_and_start_load(self, filepath: str): 
         self.current_project_path = filepath
         self.db_manager.connect_db(filepath) 
-        # self._all_standard_glyphs_pixmap_cache.clear(); self._all_nrvg_pixmap_cache.clear() # No longer needed
-        self.glyph_grid_widget.clear_grid_and_models() # Changed
+        self.glyph_grid_widget.clear_grid_and_models() 
         load_worker = LoadProjectWorker(self.current_project_path)
         load_worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
-        # load_worker.signals.glyph_batch_loaded.connect(self._on_glyph_batch_loaded) # No longer used by grid directly
         load_worker.signals.load_progress.connect(self._on_load_progress)
         load_worker.signals.error.connect(self._on_project_load_error)
         load_worker.signals.finished.connect(self._check_and_finalize_loading_state) 
@@ -3273,17 +3467,15 @@ class MainWindow(QMainWindow):
         self.current_project_path = None; self.project_glyph_chars_cache.clear(); self.non_rotated_vrt2_chars.clear()
         self._set_project_loading_state(False) 
 
-    def open_project(self): # (glyph_grid_widget.clear_grid -> .clear_grid_and_models, LoadProjectWorker signal connect change)
+    def open_project(self): 
         if self._project_loading_in_progress: QMessageBox.information(self, "処理中", "プロジェクトの読み込みまたは作成処理が進行中です。"); return
         filepath, _ = QFileDialog.getOpenFileName(self, "プロジェクトを開く", "", "Font Project Files (*.fontproj)")
         if filepath:
             self._set_project_loading_state(True) 
             self.current_project_path = filepath; self.db_manager.connect_db(filepath) 
-            # self._all_standard_glyphs_pixmap_cache.clear(); self._all_nrvg_pixmap_cache.clear() # No longer needed
-            self.glyph_grid_widget.clear_grid_and_models() # Changed
+            self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
-            # worker.signals.glyph_batch_loaded.connect(self._on_glyph_batch_loaded) # No longer used
             worker.signals.load_progress.connect(self._on_load_progress)
             worker.signals.error.connect(self._on_project_load_error)
             worker.signals.finished.connect(self._check_and_finalize_loading_state) 
@@ -3309,20 +3501,14 @@ class MainWindow(QMainWindow):
         self.properties_widget.load_font_name(basic_data['font_name']); self.properties_widget.load_font_weight(basic_data['font_weight'])
         self.drawing_editor_widget.apply_gui_settings(basic_data['gui_settings'])
         
-        # Update GlyphGridWidget models with character lists and their initial image state
         self.glyph_grid_widget.populate_models(
             basic_data['char_set_list_with_img_info'],
             basic_data['nr_vrt2_list_with_img_info']
         )
-        # Update internal caches for KV and other functions
-        self.project_glyph_chars_cache = set(basic_data['char_set_list']) # Raw list for this cache
-        # For _all_standard_glyphs_pixmap_cache etc., these are for written glyphs.
-        # KV will now directly use db_manager or model's cache.
-        # self._all_standard_glyphs_pixmap_cache.clear() # No longer needed
-        # self._all_nrvg_pixmap_cache.clear() # No longer needed
+        self.project_glyph_chars_cache = set(basic_data['char_set_list']) 
 
 
-        if self.kanji_viewer_font_combo: # (KV font logic unchanged)
+        if self.kanji_viewer_font_combo: 
             self._populate_kv_fonts() 
             kv_font_actual_name = basic_data['kv_font_actual_name']
             if kv_font_actual_name:
@@ -3356,17 +3542,15 @@ class MainWindow(QMainWindow):
         char_to_load_initially: Optional[str] = None
         load_as_vrt2_initially = False
 
-        # Try to load last active glyph
         if self._last_active_glyph_char_from_load:
             char_key = self._last_active_glyph_char_from_load
             is_vrt2 = self._last_active_glyph_is_vrt2_from_load
-            # Check if this char is still valid in the respective model
             model_to_check = self.glyph_grid_widget.vrt2_glyph_model if is_vrt2 else self.glyph_grid_widget.std_glyph_model
             if model_to_check.get_flat_index_of_char_key(char_key) is not None:
                 char_to_load_initially = char_key
                 load_as_vrt2_initially = is_vrt2
         
-        if not char_to_load_initially: # Fallback to first navigable glyph
+        if not char_to_load_initially: 
             first_nav_info = self.glyph_grid_widget.get_first_navigable_glyph_info()
             if first_nav_info:
                 char_to_load_initially, load_as_vrt2_initially = first_nav_info
@@ -3374,12 +3558,15 @@ class MainWindow(QMainWindow):
         self.drawing_editor_widget.update_vrt2_controls(False, False)
         if char_to_load_initially:
             self.load_glyph_for_editing(char_to_load_initially, is_vrt2_edit_mode=load_as_vrt2_initially)
+            # load_glyph_for_editing handles setting canvas focus
         else: 
             adv_width = DEFAULT_ADVANCE_WIDTH 
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
             self.glyph_grid_widget.set_active_glyph(None)
             self.drawing_editor_widget.update_unicode_display(None)
             self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
+            # Ensure canvas focus even if no glyph is loaded initially
+            self.drawing_editor_widget.canvas.setFocus()
         self._update_bookmark_button_state()
 
     @Slot(int, str)
@@ -3387,12 +3574,10 @@ class MainWindow(QMainWindow):
         if self._project_loading_in_progress: self.statusBar().showMessage(f"{message} ({progress}%)", 0) 
 
     @Slot(str)
-    def _on_project_load_error(self, error_message: str): # (キャッシュクリア変更)
+    def _on_project_load_error(self, error_message: str): 
         QMessageBox.critical(self, "プロジェクト読み込みエラー", f"プロジェクトの読み込みに失敗しました:\n{error_message}")
         self.current_project_path = None; self.db_manager.db_path = None 
         self.project_glyph_chars_cache.clear(); 
-        # self._all_standard_glyphs_pixmap_cache.clear() # No longer needed
-        # self._all_nrvg_pixmap_cache.clear() # No longer needed
         self.non_rotated_vrt2_chars.clear()
         self.statusBar().showMessage("プロジェクトの読み込みに失敗しました。", 5000)
 
@@ -3418,7 +3603,6 @@ class MainWindow(QMainWindow):
                  if not self.drawing_editor_widget.canvas.editing_vrt2_glyph:
                      self._save_current_advance_width_sync(current_canvas_char, current_canvas_adv_width)
         
-        # Kanji Viewer update logic (unchanged)
         if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
             with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = character 
             self._kv_deferred_update_timer.start(self._kv_update_delay_ms) 
@@ -3432,11 +3616,11 @@ class MainWindow(QMainWindow):
             adv_width = DEFAULT_ADVANCE_WIDTH
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
             self.drawing_editor_widget.set_enabled_controls(False)
-            self.glyph_grid_widget.set_active_glyph(None) # Visually clear grid selection
+            self.glyph_grid_widget.set_active_glyph(None) 
             self.drawing_editor_widget.update_unicode_display(None)
             self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
             self.drawing_editor_widget.update_vrt2_controls(False, False)
-            self.drawing_editor_widget.canvas.setFocus() # <<< ADDED: Focus canvas even if no glyph
+            self.drawing_editor_widget.canvas.setFocus() 
             return
         
         adv_width = self.db_manager.load_glyph_advance_width(character)
@@ -3448,7 +3632,6 @@ class MainWindow(QMainWindow):
         self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode)
         self.drawing_editor_widget.set_enabled_controls(True)
         
-        # Tell grid to update its selection visually, but it won't emit signals back due to _is_selecting_programmatically
         self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode) 
         
         self.drawing_editor_widget.update_unicode_display(character)
@@ -3469,7 +3652,7 @@ class MainWindow(QMainWindow):
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_edit_mode))
 
-        self.drawing_editor_widget.canvas.setFocus() # <<< ADDED: Crucial for focus behavior
+        self.drawing_editor_widget.canvas.setFocus() 
 
 
 
@@ -3488,7 +3671,7 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(can_enable_button)
 
     @Slot(str, QPixmap, bool)
-    def on_glyph_save_success(self, character: str, saved_pixmap: QPixmap, is_vrt2_glyph: bool): # (Uses new grid update method)
+    def on_glyph_save_success(self, character: str, saved_pixmap: QPixmap, is_vrt2_glyph: bool): 
         if self._project_loading_in_progress: return 
         if self.current_project_path: 
              self.glyph_grid_widget.update_glyph_preview(character, saved_pixmap, is_vrt2_source=is_vrt2_glyph)
@@ -3556,18 +3739,16 @@ class MainWindow(QMainWindow):
         return sorted(unique_ordered_chars, key=ord)
 
     @Slot(str)
-    def update_project_character_set(self, new_char_string: str): # (Reload logic adapted)
+    def update_project_character_set(self, new_char_string: str): 
         if not self.current_project_path or self._project_loading_in_progress:
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         try:
             self.db_manager.update_project_character_set(processed_chars) 
             self._set_project_loading_state(True) 
-            # self._all_standard_glyphs_pixmap_cache.clear(); self._all_nrvg_pixmap_cache.clear() # No longer needed
-            self.glyph_grid_widget.clear_grid_and_models() # Changed
+            self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
-            # worker.signals.glyph_batch_loaded.connect(self._on_glyph_batch_loaded) # No longer needed
             worker.signals.load_progress.connect(self._on_load_progress)
             worker.signals.error.connect(self._on_project_load_error)
             worker.signals.finished.connect(self._check_and_finalize_loading_state)
@@ -3578,15 +3759,14 @@ class MainWindow(QMainWindow):
             self._set_project_loading_state(False) 
 
     @Slot(str)
-    def update_rotated_vrt2_set(self, new_char_string: str): # (Reload logic adapted)
+    def update_rotated_vrt2_set(self, new_char_string: str): 
         if not self.current_project_path or self._project_loading_in_progress: 
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         try:
             self.db_manager.update_rotated_vrt2_character_set(processed_chars)
             self._set_project_loading_state(True)
-            # self._all_standard_glyphs_pixmap_cache.clear(); self._all_nrvg_pixmap_cache.clear() # No longer needed
-            self.glyph_grid_widget.clear_grid_and_models() # Changed
+            self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
             worker.signals.load_progress.connect(self._on_load_progress)
@@ -3599,7 +3779,7 @@ class MainWindow(QMainWindow):
             self._set_project_loading_state(False)
 
     @Slot(str)
-    def update_non_rotated_vrt2_set(self, new_char_string: str): # (Reload logic adapted)
+    def update_non_rotated_vrt2_set(self, new_char_string: str): 
         if not self.current_project_path or self._project_loading_in_progress:
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
@@ -3611,8 +3791,7 @@ class MainWindow(QMainWindow):
             if len(conflicts_resolved_r_vrt2) != len(r_vrt2_set_from_db): 
                 self.db_manager.update_rotated_vrt2_character_set(conflicts_resolved_r_vrt2)
             self._set_project_loading_state(True)
-            # self._all_standard_glyphs_pixmap_cache.clear(); self._all_nrvg_pixmap_cache.clear() # No longer needed
-            self.glyph_grid_widget.clear_grid_and_models() # Changed
+            self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
             worker.signals.load_progress.connect(self._on_load_progress)
@@ -3638,6 +3817,7 @@ class MainWindow(QMainWindow):
         if self._project_loading_in_progress: return
         current_char = self.drawing_editor_widget.canvas.current_glyph_character
         if current_char: self.load_glyph_for_editing(current_char, is_vrt2_edit_mode=is_editing_vrt2)
+        # load_glyph_for_editing will set canvas focus.
 
     @Slot()
     def handle_transfer_to_vrt2(self): # (変更なし)
@@ -3663,13 +3843,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "転送エラー", f"'{current_char}' の縦書きグリフへのデータ転送開始時にエラーが発生しました: {e}\n{traceback.format_exc()}")
             self._reenable_vrt2_buttons_after_transfer() 
 
-    def _handle_transfer_to_vrt2_result(self, character: str, saved_pixmap: QPixmap, is_vrt2_glyph: bool): # (Uses new grid update)
+    def _handle_transfer_to_vrt2_result(self, character: str, saved_pixmap: QPixmap, is_vrt2_glyph: bool): 
         if not is_vrt2_glyph or self._project_loading_in_progress: return 
         if not self.current_project_path: return
-        self.glyph_grid_widget.update_glyph_preview(character, saved_pixmap, is_vrt2_source=True) # Changed
+        self.glyph_grid_widget.update_glyph_preview(character, saved_pixmap, is_vrt2_source=True) 
         if self.drawing_editor_widget.canvas.editing_vrt2_glyph and \
            self.drawing_editor_widget.canvas.current_glyph_character == character:
             self.load_glyph_for_editing(character, is_vrt2_edit_mode=True)
+            # load_glyph_for_editing sets canvas focus
         self.statusBar().showMessage(f"'{character}' の縦書きグリフへの転送成功。", 3000)
 
     def _handle_transfer_to_vrt2_error(self, error_message: str): # (変更なし)
@@ -3720,9 +3901,9 @@ class MainWindow(QMainWindow):
             canvas.reference_image = saved_ref_pixmap.copy() if saved_ref_pixmap else None; canvas.update()
             self.drawing_editor_widget.delete_ref_button.setEnabled(saved_ref_pixmap is not None)
 
-    def _on_glyph_to_ref_transfer_glyph_reset_success(self, character: str, reset_glyph_pixmap: QPixmap, is_vrt2_glyph_reset: bool): # (Uses new grid update)
+    def _on_glyph_to_ref_transfer_glyph_reset_success(self, character: str, reset_glyph_pixmap: QPixmap, is_vrt2_glyph_reset: bool): 
         if self._project_loading_in_progress: return
-        self.glyph_grid_widget.update_glyph_preview(character, reset_glyph_pixmap, is_vrt2_source=is_vrt2_glyph_reset) # Changed
+        self.glyph_grid_widget.update_glyph_preview(character, reset_glyph_pixmap, is_vrt2_source=is_vrt2_glyph_reset) 
         if hasattr(self.drawing_editor_widget, 'glyph_to_ref_reset_button'):
              self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(False) 
 
@@ -3818,7 +3999,8 @@ class MainWindow(QMainWindow):
 
         focus_widget = QApplication.focusWidget()
 
-        if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox)):
+        # If focus is on an input widget, let it handle keys.
+        if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox, QComboBox)):
             super().keyPressEvent(event); return
 
         is_drawing_canvas_focused_for_tools = (focus_widget == self.drawing_editor_widget.canvas)
@@ -3835,27 +4017,43 @@ class MainWindow(QMainWindow):
         key_nav = event.key()
         
         if key_nav in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
-            is_canvas_focused_for_nav = (focus_widget == self.drawing_editor_widget.canvas)
+            # Check if focus is on the canvas or one of the grid views,
+            # or even the grid widget itself (as a fallback parent).
+            is_canvas_or_grid_focused_for_nav = (
+                focus_widget == self.drawing_editor_widget.canvas or
+                focus_widget == self.glyph_grid_widget.std_glyph_view or
+                focus_widget == self.glyph_grid_widget.vrt2_glyph_view or
+                focus_widget == self.glyph_grid_widget 
+            )
             
-            if is_canvas_focused_for_nav and \
+            if is_canvas_or_grid_focused_for_nav and \
                (event.modifiers() == Qt.NoModifier or event.modifiers() == Qt.KeypadModifier):
-                # If canvas has focus, delegate arrow keys to the grid.
-                # The grid's selection change will trigger load_glyph_for_editing,
-                # which in turn will set focus back to the canvas.
+                # Delegate arrow key navigation to the GlyphGridWidget.
+                # Its keyPressEvent will handle the logic and emit signals that
+                # will eventually call load_glyph_for_editing, which sets canvas focus.
                 self.glyph_grid_widget.keyPressEvent(event)
                 if event.isAccepted():
                     return 
-            elif focus_widget == self.glyph_grid_widget.current_active_view or \
-                 focus_widget == self.glyph_grid_widget:
-                # If grid (or its view) has focus, let it handle its own navigation.
-                # This will also trigger load_glyph_for_editing, setting canvas focus.
-                self.glyph_grid_widget.keyPressEvent(event)
-                if event.isAccepted():
-                    return
         
         super().keyPressEvent(event)
 
 
+
+
+    def mousePressEvent(self, event: QMouseEvent):
+        # MainWindow 自体または centralWidget の背景がクリックされた場合、
+        # かつキャンバスにグリフがロードされていればフォーカスをキャンバスへ
+        clicked_widget = self.childAt(event.position().toPoint())
+
+        # クリックされたのが MainWindow 自身か、MainWindow の直接の子である centralWidget かを確認
+        # (centralWidget 上の他のウィジェットは、それぞれの mousePressEvent で処理されるべき)
+        if clicked_widget is self or clicked_widget is self.centralWidget():
+            if self.drawing_editor_widget.canvas.current_glyph_character:
+                self.drawing_editor_widget.canvas.setFocus()
+                event.accept()
+                return
+        
+        super().mousePressEvent(event)
 
 
 
@@ -3866,6 +4064,9 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             char_spec, adv_width = dialog.get_values()
             if char_spec is not None and adv_width is not None: self._apply_batch_advance_width(char_spec, adv_width)
+        # After dialog closes, ensure canvas has focus if glyph is active
+        if self.drawing_editor_widget.canvas.current_glyph_character:
+            self.drawing_editor_widget.canvas.setFocus()
 
     def _parse_char_specification(self, char_spec: str) -> Tuple[Optional[List[str]], Optional[str]]: # (変更なし)
         target_chars_set: Set[str] = set(); original_spec = char_spec; temp_spec = char_spec 
@@ -3922,8 +4123,8 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget._update_adv_width_ui_no_signal(new_adv_width) 
             self.drawing_editor_widget.canvas.update() 
 
-    def batch_import_glyphs(self): self._process_batch_image_import(import_type="glyph") # (grid update changed)
-    def batch_import_reference_images(self): self._process_batch_image_import(import_type="reference") # (grid update changed)
+    def batch_import_glyphs(self): self._process_batch_image_import(import_type="glyph") 
+    def batch_import_reference_images(self): self._process_batch_image_import(import_type="reference") 
 
 
     def _process_batch_image_import(self, import_type: str):
@@ -3940,6 +4141,8 @@ class MainWindow(QMainWindow):
 
         if not selected_folder_path:
             self._batch_operation_in_progress = False 
+            if self.drawing_editor_widget.canvas.current_glyph_character: # Restore focus
+                self.drawing_editor_widget.canvas.setFocus()
             return
 
         image_extensions = {".png", ".jpg", ".jpeg", ".bmp"}
@@ -3952,11 +4155,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "フォルダ読み込みエラー", f"フォルダ内のファイルリスト作成中にエラーが発生しました:\n{e}")
             self._batch_operation_in_progress = False
+            if self.drawing_editor_widget.canvas.current_glyph_character: # Restore focus
+                self.drawing_editor_widget.canvas.setFocus()
             return
 
         if not file_paths:
             QMessageBox.information(self, "情報", f"選択されたフォルダ '{os.path.basename(selected_folder_path)}' 内に処理対象の画像ファイルが見つかりませんでした。")
             self._batch_operation_in_progress = False
+            if self.drawing_editor_widget.canvas.current_glyph_character: # Restore focus
+                self.drawing_editor_widget.canvas.setFocus()
             return
         
         target_image_size = QSize(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT)
@@ -3998,7 +4205,7 @@ class MainWindow(QMainWindow):
                 if import_type == "reference" and is_vrt2_ref_candidate:
                     if character not in self.non_rotated_vrt2_chars: skipped_char_not_in_project +=1; continue
                     target_is_nrvg_for_ref = True
-                elif character not in self.project_glyph_chars_cache and character != '.notdef': # Allow .notdef
+                elif character not in self.project_glyph_chars_cache and character != '.notdef': 
                      skipped_char_not_in_project += 1; continue
                 
                 try: 
@@ -4030,7 +4237,7 @@ class MainWindow(QMainWindow):
                     is_editor_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
                     if character == current_editor_char:
                         if import_type == "glyph" and not is_editor_vrt2_editing: 
-                            self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) # This will set canvas focus
+                            self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) 
                         elif import_type == "reference":
                             if target_is_nrvg_for_ref and is_editor_vrt2_editing: 
                                 self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
@@ -4042,7 +4249,6 @@ class MainWindow(QMainWindow):
         finally:
             self._batch_operation_in_progress = False 
             self._save_current_editor_state_settings() 
-            # After batch operations, ensure the editor canvas has focus if a glyph is loaded
             if self.drawing_editor_widget.canvas.current_glyph_character:
                 self.drawing_editor_widget.canvas.setFocus()
         
@@ -4054,20 +4260,19 @@ class MainWindow(QMainWindow):
         if skipped_image_load_error > 0: summary_parts.append(f"{skipped_image_load_error} 件: 画像読み込みエラー")
         if db_update_errors > 0: summary_parts.append(f"{db_update_errors} 件: DB更新エラー")
         QMessageBox.information(self, "一括読み込み結果", "\n".join(summary_parts))
-
-
+        if self.drawing_editor_widget.canvas.current_glyph_character: # After QMessageBox, re-focus canvas
+            self.drawing_editor_widget.canvas.setFocus()
 
 
 
     def _save_current_editor_state_settings(self):
-        """Saves the current state of the editor (active glyph and VRT2 mode) to settings."""
         if not self.current_project_path or self._project_loading_in_progress or self._batch_operation_in_progress:
             return
 
         character = self.drawing_editor_widget.canvas.current_glyph_character
         is_vrt2_mode = self.drawing_editor_widget.canvas.editing_vrt2_glyph
 
-        if character: # グリフが実際に選択されている場合のみ保存
+        if character: 
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_mode))
 
@@ -4124,3 +4329,4 @@ if __name__ == "__main__":
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
+
