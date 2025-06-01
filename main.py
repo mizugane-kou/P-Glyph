@@ -889,7 +889,7 @@ class DatabaseManager:
         except Exception: conn.rollback(); return False
         finally: conn.close()
 
-# --- Canvas Widget (変更なし) ---
+# --- Canvas Widget ---
 class Canvas(QWidget):
     pen_width_changed = Signal(int)
     tool_changed = Signal(str)
@@ -901,7 +901,7 @@ class Canvas(QWidget):
     def __init__(self):
         super().__init__()
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True) # Changed to ClickFocus
-        self.ascender_height_for_baseline = DEFAULT_ASCENDER_HEIGHT 
+        self.ascender_height_for_baseline = DEFAULT_ASCENDER_HEIGHT
         self.glyph_margin_width: int = DEFAULT_GLYPH_MARGIN_WIDTH
         self.current_glyph_character: Optional[str] = None
         self.editing_vrt2_glyph: bool = False
@@ -928,7 +928,7 @@ class Canvas(QWidget):
             self.glyph_margin_width_changed.emit(self.glyph_margin_width); self.update()
 
     def set_current_glyph_advance_width(self, width: int):
-        if width >= 0: 
+        if width >= 0:
             self.current_glyph_advance_width = width
             self.glyph_advance_width_changed.emit(width); self.update()
 
@@ -937,7 +937,7 @@ class Canvas(QWidget):
         self.current_glyph_advance_width = advance_width; self.reference_image = reference_pixmap
         if pixmap:
             self.image = pixmap.copy()
-            if self.image.size() != self.image_size: 
+            if self.image.size() != self.image_size:
                 temp_target_pixmap = QPixmap(self.image_size); temp_target_pixmap.fill(Qt.white)
                 painter = QPainter(temp_target_pixmap); painter.drawPixmap(0, 0, self.image); painter.end()
                 self.image = temp_target_pixmap
@@ -947,17 +947,17 @@ class Canvas(QWidget):
 
     def set_reference_image_opacity(self, opacity: float): self.reference_image_opacity = max(0.0, min(1.0, opacity)); self.update()
     def get_current_image_and_type(self) -> Tuple[QPixmap, bool]: return self.image.copy(), self.editing_vrt2_glyph
-    def get_current_image(self) -> QPixmap: return self.image.copy() 
+    def get_current_image(self) -> QPixmap: return self.image.copy()
     def _emit_undo_redo_state(self): self.undo_redo_state_changed.emit(len(self.undo_stack) > 1, bool(self.redo_stack))
 
     def _save_state_to_undo_stack(self, is_initial_load: bool = False):
         if len(self.undo_stack) >= MAX_HISTORY_SIZE: self.undo_stack.pop(0)
         self.undo_stack.append(self.image.copy())
-        if not is_initial_load: self.redo_stack.clear() 
+        if not is_initial_load: self.redo_stack.clear()
         self._emit_undo_redo_state()
 
     def undo(self):
-        if len(self.undo_stack) > 1: 
+        if len(self.undo_stack) > 1:
             popped_state = self.undo_stack.pop(); self.redo_stack.append(popped_state)
             self.image = self.undo_stack[-1].copy(); self.update(); self._emit_undo_redo_state()
             if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
@@ -972,50 +972,50 @@ class Canvas(QWidget):
         self.pen_width = width; self.pen_width_changed.emit(self.pen_width)
         if self.drawing and self.stroke_points: self._rebuild_current_path_from_stroke_points(finalize=False)
 
-    def set_pen_shape(self, shape_name: str): 
+    def set_pen_shape(self, shape_name: str):
         if shape_name == "丸": self.pen_shape = Qt.RoundCap
         elif shape_name == "四角": self.pen_shape = Qt.SquareCap
         if self.drawing and self.stroke_points: self._rebuild_current_path_from_stroke_points(finalize=False)
 
-    def set_current_pen_color(self, color: QColor): 
+    def set_current_pen_color(self, color: QColor):
         self.current_pen_color = color
         if self.drawing and self.stroke_points: self._rebuild_current_path_from_stroke_points(finalize=False)
 
     def set_eraser_mode(self):
-        if self.move_mode: self.move_mode = False; self.unsetCursor() 
-        if self.current_pen_color != Qt.white: self.last_brush_color = self.current_pen_color 
+        if self.move_mode: self.move_mode = False; self.unsetCursor()
+        if self.current_pen_color != Qt.white: self.last_brush_color = self.current_pen_color
         self.set_current_pen_color(QColor(Qt.white)); self.drawing = False; self.current_tool = "eraser"
         self.tool_changed.emit("eraser"); self.update()
 
     def set_brush_mode(self):
-        if self.move_mode: self.move_mode = False; self.unsetCursor() 
+        if self.move_mode: self.move_mode = False; self.unsetCursor()
         self.set_current_pen_color(self.last_brush_color); self.drawing = False; self.current_tool = "brush"
         self.tool_changed.emit("brush"); self.update()
 
     def set_mirror_mode(self, enabled: bool):
         if self.mirror_mode == enabled: return
         self.mirror_mode = enabled
-        if self.drawing: self.drawing = False; self.stroke_points = []; self.current_path = QPainterPath() 
+        if self.drawing: self.drawing = False; self.stroke_points = []; self.current_path = QPainterPath()
         self.update()
 
     def set_move_mode(self, enabled: bool):
-        if enabled and self.current_tool == "move": return 
-        if not enabled and self.current_tool != "move": return 
-        
+        if enabled and self.current_tool == "move": return
+        if not enabled and self.current_tool != "move": return
+
         self.move_mode = enabled; self.moving_image = False; self.move_offset = QPointF()
         if enabled:
-            self.drawing = False 
+            self.drawing = False
             self.setCursor(Qt.OpenHandCursor); self.current_tool = "move"; self.tool_changed.emit("move")
-        else: 
+        else:
             self.unsetCursor()
-            if self.current_tool == "move": 
+            if self.current_tool == "move":
                 if self.current_pen_color == QColor(Qt.white): self.set_eraser_mode()
                 else: self.set_brush_mode()
         self.update()
 
     def _map_view_point_to_logical_point(self, view_point: QPointF) -> QPointF:
         image_local_view_point = view_point - QPointF(VIRTUAL_MARGIN, VIRTUAL_MARGIN)
-        if self.mirror_mode: 
+        if self.mirror_mode:
             return QPointF(self.image_size.width() - image_local_view_point.x(), image_local_view_point.y())
         return image_local_view_point
 
@@ -1023,12 +1023,12 @@ class Canvas(QWidget):
         path = QPainterPath(); n = len(points)
         if n == 0: return path
         path.moveTo(points[0])
-        if n == 1: path.lineTo(points[0]); return path 
+        if n == 1: path.lineTo(points[0]); return path
         for i in range(n - 1):
             p1 = points[i]; p2 = points[i+1]
-            p0 = points[i-1] if i > 0 else p1 
-            p3 = points[i+2] if i + 2 < n else p2 
-            alpha = 0.5 
+            p0 = points[i-1] if i > 0 else p1
+            p3 = points[i+2] if i + 2 < n else p2
+            alpha = 0.5
             cp1_x = p1.x() + (p2.x() - p0.x()) * alpha / 3.0
             cp1_y = p1.y() + (p2.y() - p0.y()) * alpha / 3.0
             cp2_x = p2.x() - (p3.x() - p1.x()) * alpha / 3.0
@@ -1048,67 +1048,67 @@ class Canvas(QWidget):
             painter.setPen(Qt.NoPen); painter.setBrush(self.current_pen_color)
             path_length = path_to_draw.length()
             if path_length == 0 and path_to_draw.elementCount() > 0 and \
-               path_to_draw.elementAt(0).isMoveTo(): 
+               path_to_draw.elementAt(0).isMoveTo():
                 first_point = QPointF(path_to_draw.elementAt(0).x, path_to_draw.elementAt(0).y)
                 rect_size = float(self.pen_width)
                 rect = QRectF(first_point.x() - rect_size / 2.0, first_point.y() - rect_size / 2.0, rect_size, rect_size)
                 painter.drawRect(rect)
                 return
-            sampling_step_length = max(1.0, float(self.pen_width) / 10.0) 
+            sampling_step_length = max(1.0, float(self.pen_width) / 10.0)
             num_samples = 0
             if sampling_step_length > 0: num_samples = max(1, int(path_length / sampling_step_length))
-            else: num_samples = 1 
-            for i in range(num_samples + 1): 
+            else: num_samples = 1
+            for i in range(num_samples + 1):
                 percent = 0.0
                 if num_samples > 0 : percent = float(i) / num_samples
-                else: percent = 0.0 
+                else: percent = 0.0
                 point_on_path = path_to_draw.pointAtPercent(percent)
-                if point_on_path.isNull(): continue 
+                if point_on_path.isNull(): continue
                 rect_size = float(self.pen_width)
                 rect = QRectF(point_on_path.x() - rect_size / 2.0, point_on_path.y() - rect_size / 2.0, rect_size, rect_size)
                 painter.drawRect(rect)
 
     def _apply_image_move(self, view_drag_delta: QPointF):
         logical_offset_x = view_drag_delta.x()
-        if self.mirror_mode: logical_offset_x = -view_drag_delta.x() 
+        if self.mirror_mode: logical_offset_x = -view_drag_delta.x()
         logical_offset_y = view_drag_delta.y()
         int_logical_offset = QPointF(round(logical_offset_x), round(logical_offset_y)).toPoint()
-        if int_logical_offset.x() == 0 and int_logical_offset.y() == 0: return 
-        moved_image = QPixmap(self.image_size); moved_image.fill(QColor(Qt.white)) 
+        if int_logical_offset.x() == 0 and int_logical_offset.y() == 0: return
+        moved_image = QPixmap(self.image_size); moved_image.fill(QColor(Qt.white))
         painter = QPainter(moved_image)
-        painter.drawPixmap(int_logical_offset, self.image) 
+        painter.drawPixmap(int_logical_offset, self.image)
         painter.end()
-        self.image = moved_image 
+        self.image = moved_image
 
     def paintEvent(self, event: QPaintEvent):
         canvas_painter = QPainter(self)
-        canvas_painter.fillRect(self.rect(), QColor(200, 200, 200)) 
+        canvas_painter.fillRect(self.rect(), QColor(200, 200, 200))
         image_area_rect_in_widget = QRectF(VIRTUAL_MARGIN, VIRTUAL_MARGIN, self.image_size.width(), self.image_size.height())
         canvas_painter.fillRect(image_area_rect_in_widget, Qt.white)
-        canvas_painter.save(); canvas_painter.translate(image_area_rect_in_widget.topLeft()) 
+        canvas_painter.save(); canvas_painter.translate(image_area_rect_in_widget.topLeft())
         temp_pixmap_for_drawing_content = QPixmap(self.image_size)
-        temp_pixmap_for_drawing_content.fill(Qt.transparent) 
+        temp_pixmap_for_drawing_content.fill(Qt.transparent)
         image_content_painter = QPainter(temp_pixmap_for_drawing_content)
-        image_content_painter.drawPixmap(0,0, self.image) 
-        if not self.move_mode and self.drawing and not self.current_path.isEmpty(): 
+        image_content_painter.drawPixmap(0,0, self.image)
+        if not self.move_mode and self.drawing and not self.current_path.isEmpty():
             self._draw_path_on_painter(image_content_painter, self.current_path)
         image_content_painter.end()
         preview_draw_offset = QPointF(0,0)
-        if self.move_mode and self.moving_image: preview_draw_offset = self.move_offset 
+        if self.move_mode and self.moving_image: preview_draw_offset = self.move_offset
         if self.mirror_mode:
             canvas_painter.save()
-            canvas_painter.translate(self.image_size.width(), 0); canvas_painter.scale(-1, 1) 
-            mirrored_preview_offset = QPointF(-preview_draw_offset.x(), preview_draw_offset.y()) 
+            canvas_painter.translate(self.image_size.width(), 0); canvas_painter.scale(-1, 1)
+            mirrored_preview_offset = QPointF(-preview_draw_offset.x(), preview_draw_offset.y())
             canvas_painter.drawPixmap(mirrored_preview_offset.toPoint(), temp_pixmap_for_drawing_content)
             canvas_painter.restore()
         else:
             canvas_painter.drawPixmap(preview_draw_offset.toPoint(), temp_pixmap_for_drawing_content)
         if self.reference_image and self.reference_image_opacity > 0.0 and \
-           self.reference_image.size() == self.image_size: 
+           self.reference_image.size() == self.image_size:
             canvas_painter.save()
             canvas_painter.setOpacity(self.reference_image_opacity)
-            canvas_painter.setCompositionMode(QPainter.CompositionMode_Multiply) 
-            if self.mirror_mode: 
+            canvas_painter.setCompositionMode(QPainter.CompositionMode_Multiply)
+            if self.mirror_mode:
                 canvas_painter.save()
                 canvas_painter.translate(self.image_size.width(), 0); canvas_painter.scale(-1, 1)
                 canvas_painter.drawPixmap(QPoint(0,0), self.reference_image)
@@ -1119,65 +1119,104 @@ class Canvas(QWidget):
         img_height = float(self.image_size.height()); img_width = float(self.image_size.width())
         adv_pen = QPen(QColor(255, 0, 0, 180), 1, Qt.DotLine); adv_pen.setCosmetic(True)
         canvas_painter.setPen(adv_pen)
-        if self.editing_vrt2_glyph: 
+        
+        # --- MODIFIED SECTION START for advance width line ---
+        if self.editing_vrt2_glyph:
+            # Vertical advance line (horizontal line on canvas)
+            # This line spans the full width, so horizontal mirroring doesn't change its visual representation.
             line_y_canvas_adv = (float(self.current_glyph_advance_width) / 1000.0) * img_height
-            if line_y_canvas_adv >= 0 : canvas_painter.drawLine(QPointF(0, line_y_canvas_adv), QPointF(img_width, line_y_canvas_adv))
-        else: 
-            line_x_canvas_adv = (float(self.current_glyph_advance_width) / 1000.0) * img_width
-            if line_x_canvas_adv >= 0: canvas_painter.drawLine(QPointF(line_x_canvas_adv, 0), QPointF(line_x_canvas_adv, img_height))
+            if line_y_canvas_adv >= 0 :
+                canvas_painter.drawLine(QPointF(0, line_y_canvas_adv), QPointF(img_width, line_y_canvas_adv))
+        else:
+            # Horizontal advance line (vertical line on canvas)
+            line_x_canvas_adv_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width
+            
+            line_x_to_draw = line_x_canvas_adv_orig
+            if self.mirror_mode:
+                # If mirrored, the advance line's X position is reflected across the image's vertical center.
+                line_x_to_draw = img_width - line_x_canvas_adv_orig
+            
+            if line_x_canvas_adv_orig >= 0: # Based on original value check
+                canvas_painter.drawLine(QPointF(line_x_to_draw, 0), QPointF(line_x_to_draw, img_height))
+        # --- MODIFIED SECTION END for advance width line ---
+
         guideline_pen = QPen(QColor(180, 180, 180), 1, Qt.DashLine); guideline_pen.setCosmetic(True)
         canvas_painter.setPen(guideline_pen)
-        for i in range(1, 3): 
+        for i in range(1, 3):
             y_pos = (img_height * i / 3.0); canvas_painter.drawLine(QPointF(0, y_pos), QPointF(img_width, y_pos))
             x_pos = (img_width * i / 3.0); canvas_painter.drawLine(QPointF(x_pos, 0), QPointF(x_pos, img_height))
         crosshair_pen = QPen(QColor(150, 150, 150), 1, Qt.SolidLine); crosshair_pen.setCosmetic(True)
         canvas_painter.setPen(crosshair_pen)
-        center_x, center_y = img_width / 2.0, img_height / 2.0; CROSSHAIR_ARM_LENGTH = 25 
+        center_x, center_y = img_width / 2.0, img_height / 2.0; CROSSHAIR_ARM_LENGTH = 25
         canvas_painter.drawLine(QPointF(center_x - CROSSHAIR_ARM_LENGTH, center_y), QPointF(center_x + CROSSHAIR_ARM_LENGTH, center_y))
         canvas_painter.drawLine(QPointF(center_x, center_y - CROSSHAIR_ARM_LENGTH), QPointF(center_x, center_y + CROSSHAIR_ARM_LENGTH))
-        base_margin_px = float(self.glyph_margin_width) 
+        
+        base_margin_px = float(self.glyph_margin_width)
         if base_margin_px > 0:
             margin_pen = QPen(QColor(100, 100, 200), 1, Qt.DotLine); margin_pen.setCosmetic(True)
             canvas_painter.setPen(margin_pen)
-            left_x, top_y, right_x, bottom_y = 0.0,0.0,0.0,0.0
+            
+            # --- MODIFIED SECTION START for margin box ---
+            left_x, top_y, right_x, bottom_y = 0.0, 0.0, 0.0, 0.0
+            
             if self.editing_vrt2_glyph:
-                left_x = base_margin_px; right_x = img_width - base_margin_px
+                # For vertical glyphs, horizontal mirroring doesn't change L/R margin positions
+                # relative to image edges, nor T/B margins.
+                left_x = base_margin_px
+                right_x = img_width - base_margin_px
                 top_y = base_margin_px
                 advance_edge_y = (float(self.current_glyph_advance_width) / 1000.0) * img_height
                 bottom_y = advance_edge_y - base_margin_px
-            else: 
-                left_x = base_margin_px
-                advance_edge_x = (float(self.current_glyph_advance_width) / 1000.0) * img_width
-                right_x = advance_edge_x - base_margin_px
-                top_y = base_margin_px; bottom_y = img_height - base_margin_px
+            else: # Standard horizontal glyph
+                advance_edge_x_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width
+                top_y = base_margin_px
+                # Assuming bottom margin is relative to the em-box bottom, not ascender/descender
+                fixed_bottom_em_box_edge = img_height 
+                bottom_y = fixed_bottom_em_box_edge - base_margin_px
+
+                if self.mirror_mode:
+                    # Mirrored:
+                    # The visual "left" side of the glyph box starts at the (mirrored) advance line.
+                    # Margin is inset from this mirrored advance line (which is now on the left).
+                    left_x = (img_width - advance_edge_x_orig) + base_margin_px
+                    # The visual "right" side of the glyph box is the (mirrored) start of the glyph (image right edge).
+                    # Margin is inset from this image right edge.
+                    right_x = img_width - base_margin_px
+                else:
+                    # Normal:
+                    left_x = base_margin_px
+                    right_x = advance_edge_x_orig - base_margin_px
+            # --- MODIFIED SECTION END for margin box ---
+
             margin_rect = QRectF(left_x, top_y, right_x - left_x, bottom_y - top_y)
             if margin_rect.isValid() and margin_rect.width() > 0 and margin_rect.height() > 0 :
                 canvas_painter.drawRect(margin_rect)
-        canvas_painter.restore() 
+                
+        canvas_painter.restore()
         outer_margin_path = QPainterPath()
-        outer_margin_path.setFillRule(Qt.OddEvenFill) 
-        outer_margin_path.addRect(QRectF(self.rect())) 
-        outer_margin_path.addRect(image_area_rect_in_widget) 
+        outer_margin_path.setFillRule(Qt.OddEvenFill)
+        outer_margin_path.addRect(QRectF(self.rect()))
+        outer_margin_path.addRect(image_area_rect_in_widget)
         canvas_painter.save()
-        canvas_painter.setBrush(QColor(200, 200, 200)) 
+        canvas_painter.setBrush(QColor(200, 200, 200))
         canvas_painter.setPen(Qt.NoPen)
         canvas_painter.drawPath(outer_margin_path)
         canvas_painter.restore()
         canvas_painter.save()
-        border_pen = QPen(Qt.darkGray); border_pen.setWidth(1) 
+        border_pen = QPen(Qt.darkGray); border_pen.setWidth(1)
         canvas_painter.setPen(border_pen); canvas_painter.setBrush(Qt.NoBrush)
-        canvas_painter.drawRect(image_area_rect_in_widget.adjusted(0,0,-1,-1)) 
+        canvas_painter.drawRect(image_area_rect_in_widget.adjusted(0,0,-1,-1))
         canvas_painter.restore()
 
     def mousePressEvent(self, event: QMouseEvent):
-        if not self.current_glyph_character: return 
+        if not self.current_glyph_character: return
         if self.move_mode:
             if event.button() == Qt.LeftButton:
                 image_rect_in_widget = QRectF(VIRTUAL_MARGIN, VIRTUAL_MARGIN, self.image_size.width(), self.image_size.height())
                 if image_rect_in_widget.contains(event.position()):
                     self.moving_image = True; self.move_start_pos = event.position(); self.move_offset = QPointF()
                     self.setCursor(Qt.ClosedHandCursor); self.update()
-            return 
+            return
         if event.button() == Qt.LeftButton:
             self.drawing = True; self.current_path = QPainterPath(); self.stroke_points = []
             logical_pos = self._map_view_point_to_logical_point(event.position())
@@ -1189,8 +1228,8 @@ class Canvas(QWidget):
         if self.move_mode and self.moving_image:
             if event.buttons() & Qt.LeftButton:
                 current_pos = event.position(); delta = current_pos - self.move_start_pos
-                self.move_offset = delta 
-                self.update() 
+                self.move_offset = delta
+                self.update()
             return
         if (event.buttons() & Qt.LeftButton) and self.drawing:
             view_pos = event.position()
@@ -1203,27 +1242,27 @@ class Canvas(QWidget):
         if not self.current_glyph_character: return
         if self.move_mode and self.moving_image:
             if event.button() == Qt.LeftButton:
-                self._apply_image_move(self.move_offset) 
-                self.moving_image = False; self.move_offset = QPointF() 
-                if self.move_mode: self.setCursor(Qt.OpenHandCursor) 
-                else: self.unsetCursor() 
-                self._save_state_to_undo_stack() 
+                self._apply_image_move(self.move_offset)
+                self.moving_image = False; self.move_offset = QPointF()
+                if self.move_mode: self.setCursor(Qt.OpenHandCursor)
+                else: self.unsetCursor()
+                self._save_state_to_undo_stack()
                 if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
                 self.update()
             return
         if event.button() == Qt.LeftButton and self.drawing:
-            if self.stroke_points: 
+            if self.stroke_points:
                 view_pos = event.position()
                 final_logical_pos = self._map_view_point_to_logical_point(view_pos)
-                if len(self.stroke_points) == 1 and self.stroke_points[0] == final_logical_pos: pass 
-                elif not self.stroke_points or (final_logical_pos - self.stroke_points[-1]).manhattanLength() >= 0.1: 
+                if len(self.stroke_points) == 1 and self.stroke_points[0] == final_logical_pos: pass
+                elif not self.stroke_points or (final_logical_pos - self.stroke_points[-1]).manhattanLength() >= 0.1:
                     self.stroke_points.append(final_logical_pos)
-                self._rebuild_current_path_from_stroke_points(finalize=True) 
+                self._rebuild_current_path_from_stroke_points(finalize=True)
                 if not self.current_path.isEmpty():
                     image_painter = QPainter(self.image)
                     self._draw_path_on_painter(image_painter, self.current_path)
                     image_painter.end()
-                    self._save_state_to_undo_stack() 
+                    self._save_state_to_undo_stack()
                     if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
             self.drawing = False; self.stroke_points = []; self.current_path = QPainterPath(); self.update()
 
@@ -1251,20 +1290,19 @@ class Canvas(QWidget):
                 target_size = self.image_size
                 scaled_image = dropped_qimage.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
-                final_image.fill(QColor(Qt.white)) 
+                final_image.fill(QColor(Qt.white))
                 painter = QPainter(final_image)
                 x_offset = (target_size.width() - scaled_image.width()) // 2
                 y_offset = (target_size.height() - scaled_image.height()) // 2
                 painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
                 self.image = QPixmap.fromImage(final_image)
-                self._save_state_to_undo_stack() 
+                self._save_state_to_undo_stack()
                 if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
                 self.update(); event.acceptProposedAction()
             except Exception as e:
                 QMessageBox.critical(self, "ドロップ処理エラー", f"画像の処理中にエラーが発生しました: {e}")
                 event.ignore()
         else: event.ignore()
-
 
 
 
@@ -1453,7 +1491,7 @@ class DrawingEditorWidget(QWidget):
         self.ref_opacity_label.setText(str(value))
         self.canvas.set_reference_image_opacity(opacity_float)
         self.gui_setting_changed_signal.emit(SETTING_REFERENCE_IMAGE_OPACITY, str(opacity_float))
-        self.canvas.setFocus()
+        # self.canvas.setFocus() # 問題がある場合はコメントアウトまたは削除を検討
 
     def _update_ref_opacity_slider_no_signal(self, opacity_float: float):
         slider_value = int(round(opacity_float * 100))
@@ -1461,18 +1499,21 @@ class DrawingEditorWidget(QWidget):
         self.ref_opacity_slider.blockSignals(False); self.ref_opacity_label.setText(str(slider_value))
 
     def _on_adv_width_slider_changed(self, value: int):
+        # スライダー操作時はスピンボックスの値を更新し、キャンバスにフォーカスを戻す
         self.adv_width_spinbox.blockSignals(True); self.adv_width_spinbox.setValue(value)
         self.adv_width_spinbox.blockSignals(False); self.canvas.set_current_glyph_advance_width(value)
         if self.canvas.current_glyph_character:
             self.advance_width_changed_signal.emit(self.canvas.current_glyph_character, value)
-        self.canvas.setFocus()
+        if self.sender() == self.adv_width_slider : # ユーザーが直接スライダーを操作した場合のみフォーカス
+            self.canvas.setFocus()
 
     def _on_adv_width_spinbox_changed(self, value: int):
+        # スピンボックスの値変更時はスライダーの値を更新するが、フォーカスはスピンボックスに残す
         self.adv_width_slider.blockSignals(True); self.adv_width_slider.setValue(value)
         self.adv_width_slider.blockSignals(False); self.canvas.set_current_glyph_advance_width(value)
         if self.canvas.current_glyph_character:
             self.advance_width_changed_signal.emit(self.canvas.current_glyph_character, value)
-        self.canvas.setFocus()
+  
 
     def _update_adv_width_ui_no_signal(self, width: int):
         is_vrt2 = self.canvas.editing_vrt2_glyph if self.canvas else False
@@ -1513,10 +1554,17 @@ class DrawingEditorWidget(QWidget):
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, self.canvas.current_tool)
         self.canvas.setFocus()
 
-    def _handle_pen_width_changed(self, width: int):
+    def _handle_pen_width_changed(self, width: int): # スライダーまたはプリセットボタンから呼ばれる
         self.canvas.set_pen_width(width)
         self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width))
-        self.canvas.setFocus()
+        # ユーザーがスライダーを直接操作した場合やボタンをクリックした場合のみフォーカスを移す
+        # QSlider.valueChanged はユーザー操作とプログラム的変更の両方で発火するので注意が必要
+        # ここでは、width が self.slider.value() と異なる場合（つまりユーザーがスライダーを動かした瞬間）
+        # または、sender() が QPushButton の場合（プリセットボタン）にフォーカスを移すなど、より詳細な制御が必要になる場合がある
+        # 一旦、ペン幅変更時は常にフォーカスを戻す挙動のままにして、問題が続くか確認する
+        # もしスライダー操作中にフォーカスが奪われるのが問題なら、スライダーの sliderReleased シグナルを使うなど工夫が必要
+        if QApplication.focusWidget() != self.slider : # プログラム的な値変更でない場合（大まかな判定）
+             self.canvas.setFocus()
 
     def _handle_pen_shape_changed(self, shape_name: str):
         self.canvas.set_pen_shape(shape_name)
@@ -1531,7 +1579,8 @@ class DrawingEditorWidget(QWidget):
     def _handle_glyph_margin_slider_change(self, value: int):
         self.canvas.set_glyph_margin_width(value)
         self.gui_setting_changed_signal.emit(SETTING_GLYPH_MARGIN_WIDTH, str(value))
-        self.canvas.setFocus()
+        if self.sender() == self.margin_slider: # ユーザーが直接スライダーを操作した場合のみフォーカス
+            self.canvas.setFocus()
 
     def _update_slider_value_no_signal(self, width: int):
         self.slider.blockSignals(True); self.slider.setValue(width); self.slider.blockSignals(False)
@@ -2177,21 +2226,20 @@ class GlyphGridWidget(QWidget):
         view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         view.installEventFilter(self)
 
-
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if event.type() == QEvent.Type.KeyPress:
             if watched is self.std_glyph_view or watched is self.vrt2_glyph_view:
-                key_event = QKeyEvent(event) 
+                key_event = QKeyEvent(event)
                 if key_event.key() in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
-                    if key_event.modifiers() == Qt.NoModifier or key_event.modifiers() == Qt.KeypadModifier : 
+                    if key_event.modifiers() == Qt.NoModifier or key_event.modifiers() == Qt.KeypadModifier :
                         self.keyPressEvent(key_event) 
                         if key_event.isAccepted():
                             return True 
-                        else: # If keyPressEvent did not accept, still return True to prevent default TableView nav
+                        else: 
                             return True 
-                    else: # Modifiers are pressed, let default handling occur (e.g. Ctrl+Arrow)
+                    else: 
                         return False 
-                else: # Other keys, let default handling occur
+                else:
                      return False 
         return super().eventFilter(watched, event)
 
@@ -2487,36 +2535,26 @@ class GlyphGridWidget(QWidget):
 
         key = event.key()
         
-        # Check for modifiers. If any modifier (except KeypadModifier for numpad arrows) is pressed,
-        # let the default QTableView behavior or parent handle it.
-        # This allows Ctrl+A, Shift+Arrow for range selection (if enabled), etc.
         if event.modifiers() != Qt.NoModifier and event.modifiers() != Qt.KeypadModifier:
-            if key in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]: # Common navigation keys
-                # If the event is not accepted by super, it means QTableView might not handle it.
-                # We don't want to interfere with potential text input if a cell editor were active.
-                # However, our cells are not directly editable.
+            if key in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
                 super().keyPressEvent(event) 
-                if event.isAccepted(): # If QTableView handled it (e.g. scroll)
+                if event.isAccepted(): 
                     return
-                # If not accepted by super, and it was an arrow key with modifier,
-                # we probably don't want to do custom navigation either.
-                return 
-            else: # Non-arrow key with modifier
+                return
+            else: 
                 super().keyPressEvent(event)
                 return
         
-        # If no modifiers (or only KeypadModifier), and it's not an arrow key, let super handle.
         if key not in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
             super().keyPressEvent(event)
             return
 
-        # At this point, it's an arrow key with no modifiers (or KeypadModifier)
         current_model_idx = view.currentIndex()
         num_cols = model.columnCount()
         total_visible_items = model.get_metadata_count()
 
         if num_cols == 0 or total_visible_items == 0:
-            super().keyPressEvent(event) # Should not happen if items exist, but good guard
+            super().keyPressEvent(event) 
             return
 
         current_flat_idx = -1
@@ -2524,22 +2562,20 @@ class GlyphGridWidget(QWidget):
             current_row_from_idx = current_model_idx.row()
             current_col_from_idx = current_model_idx.column()
             current_flat_idx = current_row_from_idx * num_cols + current_col_from_idx
-            # Validate flat_idx as it might be out of bounds if columns changed or data is sparse
             if not (0 <= current_flat_idx < total_visible_items):
-                current_flat_idx = -1 # Treat as no selection if invalid
+                current_flat_idx = -1 
         
-        if current_flat_idx == -1: # No valid current selection
-            if total_visible_items > 0: # If there are items, select the first one
+        if current_flat_idx == -1: 
+            if total_visible_items > 0:
                 first_item_char_key = model.get_char_key_at_flat_index(0)
                 if first_item_char_key:
-                    # _select_char_in_view will handle emitting signals
                     self._select_char_in_view(first_item_char_key, view, model)
                 event.accept()
-            else: # No items to select
+            else:
                 super().keyPressEvent(event)
             return
         
-        target_flat_idx = current_flat_idx # Default to current if no move happens
+        target_flat_idx = current_flat_idx 
 
         if key == Qt.Key_Left:
             if current_flat_idx > 0:
@@ -2549,24 +2585,20 @@ class GlyphGridWidget(QWidget):
                 target_flat_idx = current_flat_idx + 1
         elif key == Qt.Key_Up:
             potential_target_idx = current_flat_idx - num_cols
-            if potential_target_idx >= 0: # Check if it's a valid index
+            if potential_target_idx >= 0:
                 target_flat_idx = potential_target_idx
         elif key == Qt.Key_Down:
             potential_target_idx = current_flat_idx + num_cols
-            if potential_target_idx < total_visible_items: # Check if it's a valid index
+            if potential_target_idx < total_visible_items:
                 target_flat_idx = potential_target_idx
 
-        if target_flat_idx != current_flat_idx: # If a move is determined
-            # Ensure target_flat_idx is within bounds (already done by checks above, but belt-and-suspenders)
+        if target_flat_idx != current_flat_idx:
             if 0 <= target_flat_idx < total_visible_items:
                 char_to_select = model.get_char_key_at_flat_index(target_flat_idx)
                 if char_to_select: 
-                    # _select_char_in_view will handle emitting signals
                     self._select_char_in_view(char_to_select, view, model)
         
-        event.accept() # We've handled the arrow key navigation
-
-
+        event.accept()
 
 class PropertiesWidget(QWidget):
     character_set_changed_signal = Signal(str)
@@ -3981,12 +4013,16 @@ class MainWindow(QMainWindow):
             self.export_process.deleteLater(); self.export_process = None
 
 
-
-
     def keyPressEvent(self, event: QKeyEvent):
+        focus_widget = QApplication.focusWidget()
+
         if self._project_loading_in_progress:
             event.ignore()
             return
+
+        # フォーカスが特定の入力ウィジェットにある場合は、そのウィジェットにイベント処理を完全に委ねる
+        if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox, QComboBox)):
+            return 
 
         if event.matches(QKeySequence.StandardKey.Undo):
             if self.drawing_editor_widget.undo_button.isEnabled():
@@ -3996,13 +4032,7 @@ class MainWindow(QMainWindow):
             if self.drawing_editor_widget.redo_button.isEnabled():
                 self.drawing_editor_widget.canvas.redo()
             event.accept(); return
-
-        focus_widget = QApplication.focusWidget()
-
-        # If focus is on an input widget, let it handle keys.
-        if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox, QComboBox)):
-            super().keyPressEvent(event); return
-
+        
         is_drawing_canvas_focused_for_tools = (focus_widget == self.drawing_editor_widget.canvas)
         
         if is_drawing_canvas_focused_for_tools and \
@@ -4017,8 +4047,6 @@ class MainWindow(QMainWindow):
         key_nav = event.key()
         
         if key_nav in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
-            # Check if focus is on the canvas or one of the grid views,
-            # or even the grid widget itself (as a fallback parent).
             is_canvas_or_grid_focused_for_nav = (
                 focus_widget == self.drawing_editor_widget.canvas or
                 focus_widget == self.glyph_grid_widget.std_glyph_view or
@@ -4028,16 +4056,11 @@ class MainWindow(QMainWindow):
             
             if is_canvas_or_grid_focused_for_nav and \
                (event.modifiers() == Qt.NoModifier or event.modifiers() == Qt.KeypadModifier):
-                # Delegate arrow key navigation to the GlyphGridWidget.
-                # Its keyPressEvent will handle the logic and emit signals that
-                # will eventually call load_glyph_for_editing, which sets canvas focus.
                 self.glyph_grid_widget.keyPressEvent(event)
                 if event.isAccepted():
                     return 
         
         super().keyPressEvent(event)
-
-
 
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -4329,4 +4352,3 @@ if __name__ == "__main__":
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-
