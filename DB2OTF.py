@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 import argparse
 import io
 import os
@@ -39,6 +39,10 @@ SETTING_ROTATED_VRT2_CHARS = "rotated_vrt2_chars"
 # main.py のデフォルト値
 DEFAULT_FONT_NAME = "MyNewFont"
 DEFAULT_FONT_WEIGHT = "Regular"
+SETTING_COPYRIGHT_INFO = "copyright_info" # From main.py
+SETTING_LICENSE_INFO = "license_info"     # From main.py
+DEFAULT_COPYRIGHT_INFO = ""               # Matches main.py's default
+DEFAULT_LICENSE_INFO = ""                 # Matches main.py's default
 DEFAULT_ASCENDER_HEIGHT = 900 # main.pyのDEFAULT_ASCENDER_HEIGHTに合わせる
 DEFAULT_ADVANCE_WIDTH = 1000
 UNITS_PER_EM = 1000
@@ -71,6 +75,15 @@ class FontBuildDBHelper:
         row = self._execute_query("SELECT value FROM project_settings WHERE key = ?", (SETTING_FONT_WEIGHT,))
         return row[0]['value'] if row and row[0]['value'] else DEFAULT_FONT_WEIGHT
     
+    def get_copyright_info(self) -> str:
+        row = self._execute_query("SELECT value FROM project_settings WHERE key = ?", (SETTING_COPYRIGHT_INFO,))
+        return row[0]['value'] if row and row[0]['value'] is not None else DEFAULT_COPYRIGHT_INFO
+
+    def get_license_info(self) -> str:
+        row = self._execute_query("SELECT value FROM project_settings WHERE key = ?", (SETTING_LICENSE_INFO,))
+        return row[0]['value'] if row and row[0]['value'] is not None else DEFAULT_LICENSE_INFO
+
+
     def get_ascender_height(self) -> int:
         # 固定値としたため、デフォルト値を使用
         return DEFAULT_ASCENDER_HEIGHT
@@ -268,6 +281,8 @@ def step3_build_otf_from_svgs(svg_source_dir: Path, db_helper: FontBuildDBHelper
 
     font_family_name = db_helper.get_font_name()
     font_style_name = db_helper.get_font_weight()
+    copyright_text = db_helper.get_copyright_info()
+    license_text = db_helper.get_license_info()
     ascender = db_helper.get_ascender_height()
     descender = UNITS_PER_EM - ascender
     if descender > 0: descender = -descender # Ensure descender is negative or zero
@@ -296,6 +311,15 @@ def step3_build_otf_from_svgs(svg_source_dir: Path, db_helper: FontBuildDBHelper
     font = ufoLib2.Font()
     font.info.familyName = font_family_name
     font.info.styleName = font_style_name
+
+    if copyright_text:
+        font.info.copyright = copyright_text
+        print(f"  著作権情報: {copyright_text[:70]}{'...' if len(copyright_text)>70 else ''}")
+    if license_text:
+        font.info.openTypeNameLicense = license_text # For 'name' table ID 13
+        font.info.openTypeNameLicenseURL = "" # Often paired, but we only have text for now
+        # font.info.openTypeNameDesigner = "Your Name" # If you want to add more
+        print(f"  ライセンス情報: {license_text[:70]}{'...' if len(license_text)>70 else ''}")
     
     font.info.styleMapFamilyName = font_family_name
     font.info.styleMapStyleName = font_style_name.lower()
