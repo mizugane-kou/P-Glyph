@@ -72,13 +72,7 @@ class FontBuildDBHelper:
         return row[0]['value'] if row and row[0]['value'] else DEFAULT_FONT_WEIGHT
     
     def get_ascender_height(self) -> int:
-        # main.py では SETTING_ASCENDER_HEIGHT は保存されていないため、デフォルト値を使用
-        # もし将来的に保存されるようになった場合は、以下のコメントアウトを解除
-        # row = self._execute_query("SELECT value FROM project_settings WHERE key = ?", (SETTING_ASCENDER_HEIGHT,))
-        # try:
-        #     return int(row[0]['value']) if row and row[0]['value'] else DEFAULT_ASCENDER_HEIGHT
-        # except ValueError:
-        #     return DEFAULT_ASCENDER_HEIGHT
+        # 固定値としたため、デフォルト値を使用
         return DEFAULT_ASCENDER_HEIGHT
 
 
