@@ -67,7 +67,7 @@ DEFAULT_PEN_SHAPE = "丸"
 DEFAULT_CURRENT_TOOL = "brush"
 DEFAULT_MIRROR_MODE = False
 DEFAULT_GLYPH_MARGIN_WIDTH = 0
-DEFAULT_ASCENDER_HEIGHT = 880
+DEFAULT_ASCENDER_HEIGHT = 900
 DEFAULT_ADVANCE_WIDTH = 1000
 
 SETTING_FONT_NAME = "font_name"
@@ -76,6 +76,10 @@ DEFAULT_FONT_NAME = "MyNewFont"
 FONT_WEIGHT_OPTIONS = ["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black"]
 DEFAULT_FONT_WEIGHT = "Regular" 
 
+SETTING_COPYRIGHT_INFO = "copyright_info"
+SETTING_LICENSE_INFO = "license_info"
+DEFAULT_COPYRIGHT_INFO = "" # Or a sensible default like "Copyright (c) [Year] [Author]"
+DEFAULT_LICENSE_INFO = ""   # Or a common license placeholder like "All rights reserved." or "SIL OFL 1.1"
 
 SETTING_REFERENCE_IMAGE_OPACITY = "reference_image_opacity"
 DEFAULT_REFERENCE_IMAGE_OPACITY = 0.5
@@ -483,6 +487,8 @@ class LoadProjectWorker(QRunnable):
         conn.close()
         return results
 
+
+
     @Slot()
     def run(self):
         try:
@@ -519,10 +525,14 @@ class LoadProjectWorker(QRunnable):
             self.signals.load_progress.emit(40, "グリフメタデータを確認中(縦書き)...")
             nr_vrt2_list_with_img_info = self._get_char_list_with_image_info(db_manager, nr_vrt2_list_raw, is_vrt2=True)
 
+
             self.signals.load_progress.emit(60, "GUI設定を読み込み中...")
             font_name = db_manager.load_gui_setting(SETTING_FONT_NAME, DEFAULT_FONT_NAME)
             font_weight = db_manager.load_gui_setting(SETTING_FONT_WEIGHT, DEFAULT_FONT_WEIGHT)
             
+            copyright_info = db_manager.load_gui_setting(SETTING_COPYRIGHT_INFO, DEFAULT_COPYRIGHT_INFO)
+            license_info = db_manager.load_gui_setting(SETTING_LICENSE_INFO, DEFAULT_LICENSE_INFO)
+
             ref_opacity_str = db_manager.load_gui_setting(SETTING_REFERENCE_IMAGE_OPACITY, str(DEFAULT_REFERENCE_IMAGE_OPACITY))
             try: ref_opacity_val = float(ref_opacity_str if ref_opacity_str else DEFAULT_REFERENCE_IMAGE_OPACITY)
             except ValueError: ref_opacity_val = DEFAULT_REFERENCE_IMAGE_OPACITY
@@ -558,6 +568,8 @@ class LoadProjectWorker(QRunnable):
                 'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info, # For vrt2 model
                 'font_name': font_name,
                 'font_weight': font_weight,
+                'copyright_info': copyright_info,
+                'license_info': license_info,
                 'gui_settings': gui_settings,
                 'kv_font_actual_name': kv_font_actual_name,
                 'kv_display_mode_val': kv_display_mode_val,
@@ -709,6 +721,8 @@ class DatabaseManager:
             SETTING_LAST_ACTIVE_GLYPH_IS_VRT2: "False",
             SETTING_FONT_NAME: DEFAULT_FONT_NAME,
             SETTING_FONT_WEIGHT: DEFAULT_FONT_WEIGHT,
+            SETTING_COPYRIGHT_INFO: DEFAULT_COPYRIGHT_INFO,
+            SETTING_LICENSE_INFO: DEFAULT_LICENSE_INFO,
             SETTING_REFERENCE_IMAGE_OPACITY: str(DEFAULT_REFERENCE_IMAGE_OPACITY),
             SETTING_KV_CURRENT_FONT: "", 
             SETTING_KV_DISPLAY_MODE: str(DEFAULT_KV_MODE_FOR_SETTINGS), 
@@ -2606,6 +2620,8 @@ class PropertiesWidget(QWidget):
     non_rotated_vrt2_set_changed_signal = Signal(str)
     font_name_changed_signal = Signal(str)
     font_weight_changed_signal = Signal(str)
+    copyright_info_changed_signal = Signal(str) 
+    license_info_changed_signal = Signal(str) 
     export_font_signal = Signal()
 
     def __init__(self, parent=None):
@@ -2621,6 +2637,31 @@ class PropertiesWidget(QWidget):
         self.font_weight_combobox.currentTextChanged.connect(self._emit_font_weight_change)
         font_weight_layout.addWidget(self.font_weight_combobox); font_weight_layout.addStretch(1)
         layout.addLayout(font_weight_layout); layout.addSpacing(10)
+
+        layout.addWidget(QLabel("著作権情報:"))
+        self.copyright_text_edit = QTextEdit() # Using QTextEdit for potentially multi-line info
+        self.copyright_text_edit.setPlaceholderText("例: (C) 2024 Your Name. All rights reserved.")
+        self.copyright_text_edit.setFixedHeight(60) # Adjust as needed
+        # For QTextEdit, textChanged is better, but can be noisy. We'll use a debounce or save on focus out.
+        # For simplicity, let's connect to a method that MainWindow will call or use a timer.
+        # A simpler approach for now: signal on textChanged and let MainWindow debounce if needed, or save periodically.
+        # Let's use a debouncer here for cleaner signals.
+        self.copyright_text_edit.textChanged.connect(self._on_copyright_text_changed)
+        self._copyright_debounce_timer = QTimer(self)
+        self._copyright_debounce_timer.setSingleShot(True)
+        self._copyright_debounce_timer.timeout.connect(self._emit_copyright_info)
+        layout.addWidget(self.copyright_text_edit)
+
+        layout.addWidget(QLabel("ライセンス情報:"))
+        self.license_text_edit = QTextEdit()
+        self.license_text_edit.setPlaceholderText("例: SIL Open Font License, Version 1.1")
+        self.license_text_edit.setFixedHeight(100) # Adjust as needed
+        self.license_text_edit.textChanged.connect(self._on_license_text_changed)
+        self._license_debounce_timer = QTimer(self)
+        self._license_debounce_timer.setSingleShot(True)
+        self._license_debounce_timer.timeout.connect(self._emit_license_info)
+        layout.addWidget(self.license_text_edit)
+
         layout.addWidget(QLabel("プロジェクトの文字セット:"))
         self.char_set_text_edit = QTextEdit(); self.char_set_text_edit.setPlaceholderText("例: あいうえお漢字...")
         self.char_set_text_edit.setFixedHeight(200); layout.addWidget(self.char_set_text_edit)
@@ -2643,6 +2684,30 @@ class PropertiesWidget(QWidget):
 
     def _emit_font_name_change(self): self.font_name_changed_signal.emit(self.font_name_input.text())
     def _emit_font_weight_change(self, weight_text: str): self.font_weight_changed_signal.emit(weight_text)
+
+
+    def _on_copyright_text_changed(self):
+        self._copyright_debounce_timer.start(750) # Debounce for 750ms
+
+    def _emit_copyright_info(self):
+        self.copyright_info_changed_signal.emit(self.copyright_text_edit.toPlainText())
+
+    def _on_license_text_changed(self):
+        self._license_debounce_timer.start(750) # Debounce for 750ms
+
+    def _emit_license_info(self):
+        self.license_info_changed_signal.emit(self.license_text_edit.toPlainText())
+
+    def load_copyright_info(self, info: str):
+        self.copyright_text_edit.blockSignals(True)
+        self.copyright_text_edit.setText(info if info is not None else DEFAULT_COPYRIGHT_INFO)
+        self.copyright_text_edit.blockSignals(False)
+
+    def load_license_info(self, info: str):
+        self.license_text_edit.blockSignals(True)
+        self.license_text_edit.setText(info if info is not None else DEFAULT_LICENSE_INFO)
+        self.license_text_edit.blockSignals(False)
+
     def _apply_char_set_changes(self): self.character_set_changed_signal.emit(self.char_set_text_edit.toPlainText())
     def _apply_r_vrt2_changes(self): self.rotated_vrt2_set_changed_signal.emit(self.r_vrt2_text_edit.toPlainText())
     def _apply_nr_vrt2_changes(self): self.non_rotated_vrt2_set_changed_signal.emit(self.nr_vrt2_text_edit.toPlainText())
@@ -2658,8 +2723,12 @@ class PropertiesWidget(QWidget):
     def load_r_vrt2_set(self, char_string: str): self.r_vrt2_text_edit.setText(char_string)
     def load_nr_vrt2_set(self, char_string: str): self.nr_vrt2_text_edit.setText(char_string)
     def set_enabled_controls(self, enabled: bool):
-        self.font_name_input.setEnabled(enabled); self.font_weight_combobox.setEnabled(enabled)
-        self.char_set_text_edit.setEnabled(enabled); self.r_vrt2_text_edit.setEnabled(enabled)
+        self.font_name_input.setEnabled(enabled)
+        self.font_weight_combobox.setEnabled(enabled)
+        self.copyright_text_edit.setEnabled(enabled)
+        self.license_text_edit.setEnabled(enabled)
+        self.char_set_text_edit.setEnabled(enabled)
+        self.r_vrt2_text_edit.setEnabled(enabled)
         self.nr_vrt2_text_edit.setEnabled(enabled)
         apply_buttons = [btn for btn in self.findChildren(QPushButton) if btn != self.export_font_button]
         for btn in apply_buttons: btn.setEnabled(enabled)
@@ -2847,6 +2916,12 @@ class MainWindow(QMainWindow):
         self.properties_widget.non_rotated_vrt2_set_changed_signal.connect(self.update_non_rotated_vrt2_set)
         self.properties_widget.font_name_changed_signal.connect(self.update_font_name)
         self.properties_widget.font_weight_changed_signal.connect(self.update_font_weight)
+        self.properties_widget.copyright_info_changed_signal.connect(
+            lambda text: self.save_gui_setting_async(SETTING_COPYRIGHT_INFO, text)
+        )
+        self.properties_widget.license_info_changed_signal.connect(
+            lambda text: self.save_gui_setting_async(SETTING_LICENSE_INFO, text)
+        )
         self.properties_widget.export_font_signal.connect(self.handle_export_font)
         self.drawing_editor_widget.gui_setting_changed_signal.connect(self.save_gui_setting_async)
         self.drawing_editor_widget.vrt2_edit_mode_toggled.connect(self.handle_vrt2_edit_mode_toggle)
@@ -3410,6 +3485,10 @@ class MainWindow(QMainWindow):
                 self.properties_widget.load_character_set(""); self.properties_widget.load_r_vrt2_set("")
                 self.properties_widget.load_nr_vrt2_set(""); self.properties_widget.load_font_name(DEFAULT_FONT_NAME)
                 self.properties_widget.load_font_weight(DEFAULT_FONT_WEIGHT)
+
+                self.properties_widget.load_copyright_info(DEFAULT_COPYRIGHT_INFO)
+                self.properties_widget.load_license_info(DEFAULT_LICENSE_INFO)
+                
                 self.glyph_grid_widget.set_active_glyph(None)
                 self.drawing_editor_widget.update_unicode_display(None)
                 self.project_glyph_chars_cache.clear(); self.non_rotated_vrt2_chars.clear()
@@ -3530,7 +3609,10 @@ class MainWindow(QMainWindow):
         self.properties_widget.load_nr_vrt2_set("".join(basic_data['nr_vrt2_list']))
         self.non_rotated_vrt2_chars = set(basic_data['nr_vrt2_list'])
         self.glyph_grid_widget.set_non_rotated_vrt2_chars(self.non_rotated_vrt2_chars)
-        self.properties_widget.load_font_name(basic_data['font_name']); self.properties_widget.load_font_weight(basic_data['font_weight'])
+        self.properties_widget.load_font_name(basic_data['font_name'])
+        self.properties_widget.load_font_weight(basic_data['font_weight'])
+        self.properties_widget.load_copyright_info(basic_data.get(SETTING_COPYRIGHT_INFO, DEFAULT_COPYRIGHT_INFO))
+        self.properties_widget.load_license_info(basic_data.get(SETTING_LICENSE_INFO, DEFAULT_LICENSE_INFO))
         self.drawing_editor_widget.apply_gui_settings(basic_data['gui_settings'])
         
         self.glyph_grid_widget.populate_models(
