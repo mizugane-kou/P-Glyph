@@ -1753,6 +1753,26 @@ class GlyphTableModel(QAbstractTableModel):
         self._show_written_only = False
         self.non_rotated_vrt2_chars_for_highlight: Set[str] = set() # For standard tab highlight
 
+    def get_total_glyph_count(self) -> int:
+        """
+        このモデルが管理する全グリフの総数を返します。
+        フィルタリング状態には影響されません。
+        """
+        return len(self._glyph_metadata_all)
+
+    def get_written_glyph_count(self) -> int:
+        """
+        このモデルが管理するグリフのうち、書き込み済みのものの数を返します。
+        フィルタリング状態には影響されません。
+        「書き込み済み」とは、初期状態でDBに画像があったか、または現在キャッシュに画像があるものを指します。
+        """
+        written_count = 0
+        for char_key, _, has_initial_image in self._glyph_metadata_all:
+            if has_initial_image or char_key in self._pixmap_cache:
+                written_count += 1
+        return written_count
+
+
     def set_character_data(self, char_data: List[Tuple[str, bool]]): # List of (char, has_initial_image)
         self.beginResetModel()
         self._glyph_metadata_all = []
@@ -2175,9 +2195,18 @@ class GlyphGridWidget(QWidget):
         top_controls_layout.addWidget(self.search_button)
         main_layout.addLayout(top_controls_layout)
 
+        filter_and_count_layout = QHBoxLayout() # チェックボックスとカウント用ラベルを配置する水平レイアウト
         self.show_written_only_checkbox = QCheckBox("書き込み済みグリフのみ表示")
         self.show_written_only_checkbox.toggled.connect(self._on_filter_changed)
-        main_layout.addWidget(self.show_written_only_checkbox)
+        filter_and_count_layout.addWidget(self.show_written_only_checkbox)
+
+        filter_and_count_layout.addStretch(1) # ラベルを右に寄せるためのスペーサー
+
+        self.glyph_count_label = QLabel("-/-")
+        self.glyph_count_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        filter_and_count_layout.addWidget(self.glyph_count_label)
+        
+        main_layout.addLayout(filter_and_count_layout) # メインレイアウトに新しい水平レイアウトを追加
 
         self.tab_widget = QTabWidget()
         main_layout.addWidget(self.tab_widget, 1)
@@ -2287,6 +2316,18 @@ class GlyphGridWidget(QWidget):
         if isinstance(main_window, MainWindow) and main_window.drawing_editor_widget.canvas.current_glyph_character:
             main_window.drawing_editor_widget.canvas.setFocus()
 
+    def _update_glyph_count_label(self):
+        """現在アクティブなタブのグリフ数をラベルに表示します。"""
+        if not hasattr(self, 'glyph_count_label'): # 初期化途中の場合など
+            return
+
+        active_model = self.current_active_view.model()
+        if isinstance(active_model, GlyphTableModel):
+            written_count = active_model.get_written_glyph_count()
+            total_count = active_model.get_total_glyph_count()
+            self.glyph_count_label.setText(f"{written_count}/{total_count}")
+        else:
+            self.glyph_count_label.setText("-/-")
 
     def _on_filter_changed(self, checked: bool):
         self.std_glyph_model.set_filter_written_only(checked)
@@ -2296,6 +2337,7 @@ class GlyphGridWidget(QWidget):
         # This will call _try_to_restore_selection_or_select_first,
         # which in turn ensures the signal is emitted to MainWindow.
         self._try_to_restore_selection_or_select_first(self.current_active_view)
+        self._update_glyph_count_label()
 
 
     def _on_tab_changed(self, index: int):
@@ -2330,6 +2372,8 @@ class GlyphGridWidget(QWidget):
             self._emit_selection_signal(char_key_to_load, is_vrt2)
         else:
             self._emit_selection_signal("", is_vrt2)
+
+        self._update_glyph_count_label()
 
 
     def _on_item_clicked(self, index: QModelIndex):
@@ -2399,6 +2443,7 @@ class GlyphGridWidget(QWidget):
     def clear_grid_and_models(self):
         self.std_glyph_model.set_character_data([])
         self.vrt2_glyph_model.set_character_data([])
+        self._update_glyph_count_label() 
 
     def populate_models(self, 
                         std_char_data: List[Tuple[str, bool]], 
@@ -2409,6 +2454,7 @@ class GlyphGridWidget(QWidget):
             self.vrt2_glyph_model.set_character_data(vrt2_char_data)
         finally:
             self._is_selecting_programmatically = False
+        self._update_glyph_count_label() 
 
 
     def set_active_glyph(self, character: Optional[str], is_vrt2_source: bool = False):
@@ -2508,6 +2554,7 @@ class GlyphGridWidget(QWidget):
     def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool):
         model_to_update = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
         model_to_update.update_glyph_pixmap(character, pixmap)
+        self._update_glyph_count_label()
 
     def get_first_navigable_glyph_info(self) -> Optional[Tuple[str, bool]]:
         active_view_for_info = self.current_active_view
