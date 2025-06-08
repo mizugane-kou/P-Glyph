@@ -1320,6 +1320,7 @@ class Canvas(QWidget):
 
 
 
+
 class DrawingEditorWidget(QWidget):
     gui_setting_changed_signal = Signal(str, str) # key, value
     vrt2_edit_mode_toggled = Signal(bool) # is_editing_vrt2_glyph
@@ -1378,11 +1379,32 @@ class DrawingEditorWidget(QWidget):
             row, col = divmod(i, cols)
             pen_size_grid_layout.addWidget(button, row, col)
         controls_outer_layout.addWidget(self.pen_size_buttons_group)
+
+        # --- START OF NEW BUTTONS AND MODIFIED display_options_layout ---
+        self.copy_button = QPushButton("コピー") # Tooltip will be handled by MainWindow for Ctrl+C
+        self.copy_button.setToolTip("現在のグリフ画像をクリップボードにコピー (Ctrl+C)")
+        self.paste_button = QPushButton("ペースト") # Tooltip will be handled by MainWindow for Ctrl+V
+        self.paste_button.setToolTip("クリップボードから画像をグリフにペースト (Ctrl+V)")
+        self.export_button = QPushButton("書き出し")
+        self.export_button.setToolTip("現在のグリフ画像をファイルに書き出し")
+
+        self.copy_button.clicked.connect(self.copy_to_clipboard)
+        self.paste_button.clicked.connect(self.paste_from_clipboard)
+        self.export_button.clicked.connect(self.export_current_glyph_image)
+        
+        display_options_layout = QHBoxLayout()
+        display_options_layout.addWidget(self.copy_button)
+        display_options_layout.addWidget(self.paste_button)
+        display_options_layout.addWidget(self.export_button)
+        display_options_layout.addSpacing(10) # Spacing before stretch
+        display_options_layout.addStretch(1) # Stretch to push mirror_checkbox to the right
+
         self.mirror_checkbox = QCheckBox("左右反転表示")
         self.mirror_checkbox.toggled.connect(self._handle_mirror_mode_changed)
-        display_options_layout = QHBoxLayout(); display_options_layout.addStretch(1)
         display_options_layout.addWidget(self.mirror_checkbox)
         controls_outer_layout.addLayout(display_options_layout)
+        # --- END OF NEW BUTTONS AND MODIFIED display_options_layout ---
+
         margin_layout = QHBoxLayout(); margin_layout.addWidget(QLabel("グリフマージン:"))
         self.margin_slider = QSlider(Qt.Horizontal)
         max_margin_val = min(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT) // 4
@@ -1458,6 +1480,113 @@ class DrawingEditorWidget(QWidget):
     def set_rotated_vrt2_chars(self, chars: Set[str]):
         self.rotated_vrt2_chars = chars
         self.update_unicode_display(self.canvas.current_glyph_character)
+
+    # --- START OF NEW METHODS for Copy/Paste/Export ---
+    def copy_to_clipboard(self):
+        if not self.canvas.current_glyph_character:
+            # This case should ideally be prevented by button's enabled state
+            return
+        image_to_copy = self.canvas.image.copy()
+        QApplication.clipboard().setImage(image_to_copy.toImage())
+        if self.window() and hasattr(self.window(), 'statusBar'):
+             self.window().statusBar().showMessage("グリフ画像をクリップボードにコピーしました。", 2000)
+        self.canvas.setFocus()
+
+    def paste_from_clipboard(self):
+        if not self.canvas.current_glyph_character:
+            QMessageBox.warning(self, "グリフ未選択", "グリフが選択されていません。画像をペーストできません。")
+            self.canvas.setFocus()
+            return
+
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+
+        if mime_data.hasImage():
+            qimage_from_clipboard = clipboard.image()
+            if qimage_from_clipboard.isNull():
+                QMessageBox.warning(self, "ペーストエラー", "クリップボードから画像を読み込めませんでした。")
+                self.canvas.setFocus()
+                return
+
+            try:
+                target_size = self.canvas.image_size
+                scaled_image = qimage_from_clipboard.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+                final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
+                final_image.fill(QColor(Qt.white)) 
+
+                painter = QPainter(final_image)
+                x_offset = (target_size.width() - scaled_image.width()) // 2
+                y_offset = (target_size.height() - scaled_image.height()) // 2
+                painter.drawImage(x_offset, y_offset, scaled_image)
+                painter.end()
+
+                self.canvas.image = QPixmap.fromImage(final_image)
+                self.canvas._save_state_to_undo_stack() # Add to undo stack
+                if self.canvas.current_glyph_character: # Notify modification
+                    self.canvas.glyph_modified_signal.emit(
+                        self.canvas.current_glyph_character,
+                        self.canvas.image.copy(),
+                        self.canvas.editing_vrt2_glyph
+                    )
+                self.canvas.update()
+                if self.window() and hasattr(self.window(), 'statusBar'):
+                    self.window().statusBar().showMessage("画像をクリップボードからペーストしました。", 2000)
+            except Exception as e:
+                QMessageBox.critical(self, "ペースト処理エラー", f"画像の処理中にエラーが発生しました: {e}")
+        else:
+            QMessageBox.information(self, "ペースト不可", "クリップボードに画像データがありません。")
+        self.canvas.setFocus()
+
+    def export_current_glyph_image(self):
+        if not self.canvas.current_glyph_character:
+            QMessageBox.warning(self, "グリフ未選択", "書き出すグリフが選択されていません。")
+            self.canvas.setFocus()
+            return
+        
+        current_char = self.canvas.current_glyph_character
+        suggested_filename = f"{current_char}.png" # Default
+        if current_char == ".notdef":
+            suggested_filename = ".notdef.png"
+        elif len(current_char) == 1:
+            try:
+                suggested_filename = f"uni{ord(current_char):04X}.png"
+            except TypeError: # Should not happen if len is 1
+                pass 
+        
+        if self.canvas.editing_vrt2_glyph:
+            base, ext = os.path.splitext(suggested_filename)
+            suggested_filename = f"{base}vert{ext}"
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "グリフ画像を書き出し",
+            suggested_filename,
+            "PNG画像 (*.png);;JPEG画像 (*.jpg *.jpeg);;BMP画像 (*.bmp)"
+        )
+
+        if not file_path:
+            self.canvas.setFocus()
+            return
+
+        # Ensure correct extension based on filter, or default to PNG if filter somehow lost
+        actual_ext = ".png" # Default
+        if "(*.png)" in selected_filter: actual_ext = ".png"
+        elif "(*.jpg *.jpeg)" in selected_filter: actual_ext = ".jpg"
+        elif "(*.bmp)" in selected_filter: actual_ext = ".bmp"
+        
+        base_path, _ = os.path.splitext(file_path)
+        file_path_with_correct_ext = base_path + actual_ext
+
+
+        image_to_export = self.canvas.image.copy()
+        if not image_to_export.save(file_path_with_correct_ext):
+            QMessageBox.warning(self, "書き出し失敗", f"画像の書き出しに失敗しました: {file_path_with_correct_ext}")
+        else:
+            if self.window() and hasattr(self.window(), 'statusBar'):
+                self.window().statusBar().showMessage(f"グリフ画像を '{Path(file_path_with_correct_ext).name}' に書き出しました。", 3000)
+        self.canvas.setFocus()
+    # --- END OF NEW METHODS for Copy/Paste/Export ---
 
     def _handle_glyph_to_ref_reset_button_clicked(self):
         self.glyph_to_reference_and_reset_requested.emit(self.canvas.editing_vrt2_glyph)
@@ -1631,7 +1760,15 @@ class DrawingEditorWidget(QWidget):
         self.move_button.setEnabled(enabled); self.slider.setEnabled(enabled)
         if hasattr(self, 'pen_size_buttons_group'):
             for button in self.pen_size_buttons_group.findChildren(QPushButton): button.setEnabled(enabled)
-        self.shape_box.setEnabled(enabled); self.mirror_checkbox.setEnabled(enabled)
+        self.shape_box.setEnabled(enabled)
+        
+        # --- MODIFIED: Enable/Disable new buttons ---
+        self.copy_button.setEnabled(enabled)
+        self.paste_button.setEnabled(enabled)
+        self.export_button.setEnabled(enabled)
+        self.mirror_checkbox.setEnabled(enabled) # This was after new buttons, ensure it's still handled
+        # --- END MODIFIED ---
+
         self.margin_slider.setEnabled(enabled); self.margin_value_label.setEnabled(enabled)
         self.ref_opacity_slider.setEnabled(enabled); self.ref_opacity_label.setEnabled(enabled)
         self.unicode_label.setEnabled(enabled)
@@ -1645,7 +1782,7 @@ class DrawingEditorWidget(QWidget):
              current_glyph_image = self.canvas.image
              current_glyph_has_content = (current_glyph_image and not current_glyph_image.isNull() and
                                           not (current_glyph_image.width() == 1 and current_glyph_image.height() == 1 and
-                                               current_glyph_image.pixelColor(0,0) == QColor(Qt.white).rgba()))
+                                               current_glyph_image.pixelColor(0,0) == QColor(Qt.white).rgba())) # Basic check for non-blank
              self.glyph_to_ref_reset_button.setEnabled(enabled and current_glyph_has_content)
         is_vrt2_widget_visible_and_char_eligible = self.vrt2_controls_widget.isVisible()
         self.vrt2_toggle_button.setEnabled(enabled and is_vrt2_widget_visible_and_char_eligible)
@@ -1702,6 +1839,7 @@ class DrawingEditorWidget(QWidget):
         else:
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
+
 
 
 class ImageLoaderSignals(QObject):
@@ -4161,7 +4299,20 @@ class MainWindow(QMainWindow):
             if self.drawing_editor_widget.redo_button.isEnabled():
                 self.drawing_editor_widget.canvas.redo()
             event.accept(); return
-        
+
+        if self.drawing_editor_widget.pen_button.isEnabled() and \
+           self.drawing_editor_widget.canvas.current_glyph_character:
+
+            if event.matches(QKeySequence.StandardKey.Copy):
+                self.drawing_editor_widget.copy_to_clipboard()
+                event.accept()
+                return
+            if event.matches(QKeySequence.StandardKey.Paste):
+                self.drawing_editor_widget.paste_from_clipboard()
+                event.accept()
+                return
+
+
         is_drawing_canvas_focused_for_tools = (focus_widget == self.drawing_editor_widget.canvas)
         
         if is_drawing_canvas_focused_for_tools and \
