@@ -40,12 +40,6 @@ from PySide6.QtCore import (
 MAX_HISTORY_SIZE = 30
 MAX_EDIT_HISTORY_SIZE = 80
 VIRTUAL_MARGIN = 30
-SETTING_GUIDELINES_U = "guidelines_u" # For horizontal guidelines on canvas
-SETTING_GUIDELINES_V = "guidelines_v" # For vertical guidelines on canvas
-DEFAULT_GUIDELINES_U = ""
-DEFAULT_GUIDELINES_V = ""
-DEFAULT_GUIDELINE_COLOR = QColor(0, 0, 255, 100) # Default: semi-transparent blue
-GUIDELINE_PEN_WIDTH = 1
 CANVAS_IMAGE_WIDTH = 500
 CANVAS_IMAGE_HEIGHT = 500
 DEFAULT_GLYPH_PREVIEW_SIZE = QSize(64, 64) # Used by Delegate for preview calculation
@@ -99,8 +93,9 @@ SETTING_KV_CURRENT_FONT = "kv_current_font"
 SETTING_KV_DISPLAY_MODE = "kv_display_mode" 
 DEFAULT_KV_MODE_FOR_SETTINGS = 1 
 
-# GLYPH_LOAD_BATCH_SIZE = 100 # グリフ読み込みのバッチサイズ # Model handles its own loading
-# GLYPH_UI_UPDATE_BATCH_SIZE = 100 # Batch size for UI updates in GlyphGridWidget # Not used with QTableView
+SETTING_GUIDELINE_U = "guideline_u"
+SETTING_GUIDELINE_V = "guideline_v"
+DEFAULT_GUIDELINE_COLOR = QColor(Qt.blue)
 
 # --- Constants for GlyphTableDelegate ---
 DELEGATE_CHAR_LABEL_PADDING = 3
@@ -113,8 +108,6 @@ DELEGATE_ITEM_MARGIN = 2
 DELEGATE_PLACEHOLDER_COLOR = QColor(220, 220, 220)
 DELEGATE_CELL_BASE_WIDTH = 80 # Approximate base width for item
 DELEGATE_GRID_COLUMNS = 5 # Number of columns in the table view grid
-
-
 
 # --- kanzi2.py の関数群 (変更なし) ---
 def get_data_file_path(filename: str) -> str | None:
@@ -534,6 +527,7 @@ class LoadProjectWorker(QRunnable):
             self.signals.load_progress.emit(40, "グリフメタデータを確認中(縦書き)...")
             nr_vrt2_list_with_img_info = self._get_char_list_with_image_info(db_manager, nr_vrt2_list_raw, is_vrt2=True)
 
+
             self.signals.load_progress.emit(60, "GUI設定を読み込み中...")
             font_name = db_manager.load_gui_setting(SETTING_FONT_NAME, DEFAULT_FONT_NAME)
             font_weight = db_manager.load_gui_setting(SETTING_FONT_WEIGHT, DEFAULT_FONT_WEIGHT)
@@ -551,9 +545,7 @@ class LoadProjectWorker(QRunnable):
                 SETTING_CURRENT_TOOL: db_manager.load_gui_setting(SETTING_CURRENT_TOOL, DEFAULT_CURRENT_TOOL),
                 SETTING_MIRROR_MODE: db_manager.load_gui_setting(SETTING_MIRROR_MODE, str(DEFAULT_MIRROR_MODE)),
                 SETTING_GLYPH_MARGIN_WIDTH: db_manager.load_gui_setting(SETTING_GLYPH_MARGIN_WIDTH, str(DEFAULT_GLYPH_MARGIN_WIDTH)),
-                SETTING_REFERENCE_IMAGE_OPACITY: str(ref_opacity_val),
-                SETTING_GUIDELINES_U: db_manager.load_gui_setting(SETTING_GUIDELINES_U, DEFAULT_GUIDELINES_U),
-                SETTING_GUIDELINES_V: db_manager.load_gui_setting(SETTING_GUIDELINES_V, DEFAULT_GUIDELINES_V),
+                SETTING_REFERENCE_IMAGE_OPACITY: str(ref_opacity_val)
             }
 
             kv_font_actual_name = db_manager.load_gui_setting(SETTING_KV_CURRENT_FONT, "")
@@ -736,8 +728,8 @@ class DatabaseManager:
             SETTING_REFERENCE_IMAGE_OPACITY: str(DEFAULT_REFERENCE_IMAGE_OPACITY),
             SETTING_KV_CURRENT_FONT: "", 
             SETTING_KV_DISPLAY_MODE: str(DEFAULT_KV_MODE_FOR_SETTINGS), 
-            SETTING_GUIDELINES_U: DEFAULT_GUIDELINES_U,
-            SETTING_GUIDELINES_V: DEFAULT_GUIDELINES_V,
+            SETTING_GUIDELINE_U: "", # Empty string for no guidelines by default
+            SETTING_GUIDELINE_V: "",
         }
         for key, value in defaults.items():
             cursor.execute("INSERT OR IGNORE INTO project_settings (key, value) VALUES (?, ?)", (key, value))
@@ -926,7 +918,7 @@ class Canvas(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True) # Changed to ClickFocus
         self.ascender_height_for_baseline = DEFAULT_ASCENDER_HEIGHT
         self.glyph_margin_width: int = DEFAULT_GLYPH_MARGIN_WIDTH
         self.current_glyph_character: Optional[str] = None
@@ -945,69 +937,8 @@ class Canvas(QWidget):
         self.move_start_pos = QPointF(); self.move_offset = QPointF()
         self.undo_stack: List[QPixmap] = []; self.redo_stack: List[QPixmap] = []
         self.current_tool = DEFAULT_CURRENT_TOOL
-
-        # --- NEW Attributes for Custom Guidelines ---
-        self.u_guidelines_str: str = DEFAULT_GUIDELINES_U
-        self.v_guidelines_str: str = DEFAULT_GUIDELINES_V
-        self.parsed_u_guidelines: List[Tuple[int, QColor]] = []
-        self.parsed_v_guidelines: List[Tuple[int, QColor]] = []
-        self._parse_and_set_guidelines() # Initial parse
-        # --- END NEW Attributes ---
-
-    def _parse_guideline_string_to_list(self, line_str: str) -> List[Tuple[int, QColor]]:
-        guidelines = []
-        if not line_str:
-            return guidelines
-        
-        # Regex to capture number and optional color like {RRGGBB}
-        # It splits by comma first, then parses each part.
-        parts = line_str.split(',')
-        entry_pattern = re.compile(r"^\s*(\d+)\s*(?:\{([0-9a-fA-F]{6})\})?\s*$")
-
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            
-            match = entry_pattern.match(part)
-            if match:
-                pos_str, color_hex_str = match.groups()
-                try:
-                    position = int(pos_str)
-                    if not (0 <= position <= 1000): # Validate position range
-                        # Silently skip invalid positions for now, or log warning
-                        continue
-
-                    color = DEFAULT_GUIDELINE_COLOR
-                    if color_hex_str:
-                        try:
-                            color = QColor(f"#{color_hex_str}")
-                            if not color.isValid(): # check if color string was valid
-                                color = DEFAULT_GUIDELINE_COLOR
-                        except ValueError: # QColor might not raise this for bad hex, but good to be safe
-                            color = DEFAULT_GUIDELINE_COLOR
-                    
-                    guidelines.append((position, color))
-                except ValueError:
-                    # Silently skip if position is not a valid int
-                    continue
-        return guidelines
-
-    def _parse_and_set_guidelines(self):
-        self.parsed_u_guidelines = self._parse_guideline_string_to_list(self.u_guidelines_str)
-        self.parsed_v_guidelines = self._parse_guideline_string_to_list(self.v_guidelines_str)
-
-    def set_u_guideline_string(self, u_string: str):
-        if self.u_guidelines_str != u_string:
-            self.u_guidelines_str = u_string
-            self._parse_and_set_guidelines()
-            self.update()
-
-    def set_v_guideline_string(self, v_string: str):
-        if self.v_guidelines_str != v_string:
-            self.v_guidelines_str = v_string
-            self._parse_and_set_guidelines()
-            self.update()
+        self.guidelines_u: List[Tuple[int, QColor]] = []
+        self.guidelines_v: List[Tuple[int, QColor]] = []
 
     def set_glyph_margin_width(self, width: int):
         max_margin = min(self.image_size.width(), self.image_size.height()) // 4
@@ -1169,6 +1100,11 @@ class Canvas(QWidget):
         painter.end()
         self.image = moved_image
 
+    def set_guidelines(self, u_lines: List[Tuple[int, QColor]], v_lines: List[Tuple[int, QColor]]):
+        self.guidelines_u = u_lines
+        self.guidelines_v = v_lines
+        self.update()
+
     def paintEvent(self, event: QPaintEvent):
         canvas_painter = QPainter(self)
         canvas_painter.fillRect(self.rect(), QColor(200, 200, 200))
@@ -1205,82 +1141,108 @@ class Canvas(QWidget):
             else:
                 canvas_painter.drawPixmap(QPoint(0,0), self.reference_image)
             canvas_painter.restore()
-        
-        img_height_float = float(self.image_size.height())
-        img_width_float = float(self.image_size.width())
-        
-        # --- Draw Custom U-Guidelines (Horizontal lines) ---
-        if self.parsed_u_guidelines:
-            for pos_val, color_val in self.parsed_u_guidelines:
-                y_coord = (pos_val / 1000.0) * img_height_float
-                pen = QPen(color_val, GUIDELINE_PEN_WIDTH, Qt.DotLine)
-                pen.setCosmetic(True)
-                canvas_painter.setPen(pen)
-                canvas_painter.drawLine(QPointF(0, y_coord), QPointF(img_width_float, y_coord))
+        img_height = float(self.image_size.height()); img_width = float(self.image_size.width())
 
-        # --- Draw Custom V-Guidelines (Vertical lines) ---
-        if self.parsed_v_guidelines:
-            for pos_val, color_val in self.parsed_v_guidelines:
-                x_coord_orig = (pos_val / 1000.0) * img_width_float
-                x_coord_to_draw = img_width_float - x_coord_orig if self.mirror_mode else x_coord_orig
-                pen = QPen(color_val, GUIDELINE_PEN_WIDTH, Qt.DotLine)
-                pen.setCosmetic(True)
-                canvas_painter.setPen(pen)
-                canvas_painter.drawLine(QPointF(x_coord_to_draw, 0), QPointF(x_coord_to_draw, img_height_float))
+        guideline_pen = QPen(Qt.DotLine)
+        guideline_pen.setWidth(1)
+        guideline_pen.setCosmetic(True)
 
-        # --- Advance Width Line ---
+        # Draw U-direction guidelines (horizontal lines)
+        for pos_y, color in self.guidelines_u:
+            if 0 <= pos_y <= 1000: # Assuming coords are 0-1000 range
+                line_y_canvas = (float(pos_y) / 1000.0) * img_height
+                guideline_pen.setColor(color)
+                canvas_painter.setPen(guideline_pen)
+                canvas_painter.drawLine(QPointF(0, line_y_canvas), QPointF(img_width, line_y_canvas))
+
+        # Draw V-direction guidelines (vertical lines)
+        for pos_x, color in self.guidelines_v:
+            if 0 <= pos_x <= 1000: # Assuming coords are 0-1000 range
+                line_x_canvas_orig = (float(pos_x) / 1000.0) * img_width
+                line_x_to_draw = line_x_canvas_orig
+                if self.mirror_mode:
+                    line_x_to_draw = img_width - line_x_canvas_orig
+                
+                guideline_pen.setColor(color)
+                canvas_painter.setPen(guideline_pen)
+                canvas_painter.drawLine(QPointF(line_x_to_draw, 0), QPointF(line_x_to_draw, img_height))
+
         adv_pen = QPen(QColor(255, 0, 0, 180), 1, Qt.DotLine); adv_pen.setCosmetic(True)
         canvas_painter.setPen(adv_pen)
+        
+        # --- MODIFIED SECTION START for advance width line ---
         if self.editing_vrt2_glyph:
-            line_y_canvas_adv = (float(self.current_glyph_advance_width) / 1000.0) * img_height_float
+            # Vertical advance line (horizontal line on canvas)
+            # This line spans the full width, so horizontal mirroring doesn't change its visual representation.
+            line_y_canvas_adv = (float(self.current_glyph_advance_width) / 1000.0) * img_height
             if line_y_canvas_adv >= 0 :
-                canvas_painter.drawLine(QPointF(0, line_y_canvas_adv), QPointF(img_width_float, line_y_canvas_adv))
+                canvas_painter.drawLine(QPointF(0, line_y_canvas_adv), QPointF(img_width, line_y_canvas_adv))
         else:
-            line_x_canvas_adv_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width_float
-            line_x_to_draw = img_width_float - line_x_canvas_adv_orig if self.mirror_mode else line_x_canvas_adv_orig
-            if line_x_canvas_adv_orig >= 0:
-                canvas_painter.drawLine(QPointF(line_x_to_draw, 0), QPointF(line_x_to_draw, img_height_float))
+            # Horizontal advance line (vertical line on canvas)
+            line_x_canvas_adv_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width
+            
+            line_x_to_draw = line_x_canvas_adv_orig
+            if self.mirror_mode:
+                # If mirrored, the advance line's X position is reflected across the image's vertical center.
+                line_x_to_draw = img_width - line_x_canvas_adv_orig
+            
+            if line_x_canvas_adv_orig >= 0: # Based on original value check
+                canvas_painter.drawLine(QPointF(line_x_to_draw, 0), QPointF(line_x_to_draw, img_height))
+        # --- MODIFIED SECTION END for advance width line ---
 
-        # --- Standard Guidelines (thirds) ---
         guideline_pen = QPen(QColor(180, 180, 180), 1, Qt.DashLine); guideline_pen.setCosmetic(True)
         canvas_painter.setPen(guideline_pen)
         for i in range(1, 3):
-            y_pos = (img_height_float * i / 3.0); canvas_painter.drawLine(QPointF(0, y_pos), QPointF(img_width_float, y_pos))
-            x_pos = (img_width_float * i / 3.0); canvas_painter.drawLine(QPointF(x_pos, 0), QPointF(x_pos, img_height_float))
-        
-        # --- Crosshair ---
+            y_pos = (img_height * i / 3.0); canvas_painter.drawLine(QPointF(0, y_pos), QPointF(img_width, y_pos))
+            x_pos = (img_width * i / 3.0); canvas_painter.drawLine(QPointF(x_pos, 0), QPointF(x_pos, img_height))
         crosshair_pen = QPen(QColor(150, 150, 150), 1, Qt.SolidLine); crosshair_pen.setCosmetic(True)
         canvas_painter.setPen(crosshair_pen)
-        center_x, center_y = img_width_float / 2.0, img_height_float / 2.0; CROSSHAIR_ARM_LENGTH = 25
+        center_x, center_y = img_width / 2.0, img_height / 2.0; CROSSHAIR_ARM_LENGTH = 25
         canvas_painter.drawLine(QPointF(center_x - CROSSHAIR_ARM_LENGTH, center_y), QPointF(center_x + CROSSHAIR_ARM_LENGTH, center_y))
         canvas_painter.drawLine(QPointF(center_x, center_y - CROSSHAIR_ARM_LENGTH), QPointF(center_x, center_y + CROSSHAIR_ARM_LENGTH))
         
-        # --- Margin Box ---
         base_margin_px = float(self.glyph_margin_width)
         if base_margin_px > 0:
             margin_pen = QPen(QColor(100, 100, 200), 1, Qt.DotLine); margin_pen.setCosmetic(True)
             canvas_painter.setPen(margin_pen)
+            
+            # --- MODIFIED SECTION START for margin box ---
             left_x, top_y, right_x, bottom_y = 0.0, 0.0, 0.0, 0.0
+            
             if self.editing_vrt2_glyph:
-                left_x = base_margin_px; right_x = img_width_float - base_margin_px
+                # For vertical glyphs, horizontal mirroring doesn't change L/R margin positions
+                # relative to image edges, nor T/B margins.
+                left_x = base_margin_px
+                right_x = img_width - base_margin_px
                 top_y = base_margin_px
-                advance_edge_y = (float(self.current_glyph_advance_width) / 1000.0) * img_height_float
+                advance_edge_y = (float(self.current_glyph_advance_width) / 1000.0) * img_height
                 bottom_y = advance_edge_y - base_margin_px
-            else:
-                advance_edge_x_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width_float
+            else: # Standard horizontal glyph
+                advance_edge_x_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width
                 top_y = base_margin_px
-                fixed_bottom_em_box_edge = img_height_float 
+                # Assuming bottom margin is relative to the em-box bottom, not ascender/descender
+                fixed_bottom_em_box_edge = img_height 
                 bottom_y = fixed_bottom_em_box_edge - base_margin_px
+
                 if self.mirror_mode:
-                    left_x = (img_width_float - advance_edge_x_orig) + base_margin_px
-                    right_x = img_width_float - base_margin_px
+                    # Mirrored:
+                    # The visual "left" side of the glyph box starts at the (mirrored) advance line.
+                    # Margin is inset from this mirrored advance line (which is now on the left).
+                    left_x = (img_width - advance_edge_x_orig) + base_margin_px
+                    # The visual "right" side of the glyph box is the (mirrored) start of the glyph (image right edge).
+                    # Margin is inset from this image right edge.
+                    right_x = img_width - base_margin_px
                 else:
-                    left_x = base_margin_px; right_x = advance_edge_x_orig - base_margin_px
+                    # Normal:
+                    left_x = base_margin_px
+                    right_x = advance_edge_x_orig - base_margin_px
+            # --- MODIFIED SECTION END for margin box ---
+
             margin_rect = QRectF(left_x, top_y, right_x - left_x, bottom_y - top_y)
             if margin_rect.isValid() and margin_rect.width() > 0 and margin_rect.height() > 0 :
                 canvas_painter.drawRect(margin_rect)
                 
-        canvas_painter.restore() # Back to widget coordinates
+        canvas_painter.restore()
         outer_margin_path = QPainterPath()
         outer_margin_path.setFillRule(Qt.OddEvenFill)
         outer_margin_path.addRect(QRectF(self.rect()))
@@ -1295,6 +1257,8 @@ class Canvas(QWidget):
         canvas_painter.setPen(border_pen); canvas_painter.setBrush(Qt.NoBrush)
         canvas_painter.drawRect(image_area_rect_in_widget.adjusted(0,0,-1,-1))
         canvas_painter.restore()
+
+
 
     def mousePressEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
@@ -1393,7 +1357,7 @@ class Canvas(QWidget):
         else: event.ignore()
 
 
-        
+
 
 class DrawingEditorWidget(QWidget):
 
@@ -1405,8 +1369,10 @@ class DrawingEditorWidget(QWidget):
     reference_image_deleted_signal = Signal(str, bool) # char, is_vrt2
     glyph_to_reference_and_reset_requested = Signal(bool) # is_vrt2_target
 
+    # --- NEW SIGNALS for history navigation ---
     navigate_history_back_requested = Signal()
     navigate_history_forward_requested = Signal()
+    # --- END NEW SIGNALS ---
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1458,19 +1424,23 @@ class DrawingEditorWidget(QWidget):
             pen_size_grid_layout.addWidget(button, row, col)
         controls_outer_layout.addWidget(self.pen_size_buttons_group)
 
+        # --- MODIFIED SECTION for history, copy, paste, export buttons ---
+        # --- START OF NEW HISTORY BUTTONS ---
         self.history_back_button = QPushButton("<")
         self.history_back_button.setToolTip("編集履歴を戻る (Alt+Left)")
-        self.history_back_button.setFixedWidth(35)
+        self.history_back_button.setFixedWidth(35) # Adjust as needed
         self.history_back_button.clicked.connect(self.navigate_history_back_requested)
-        self.history_back_button.setEnabled(False)
+        self.history_back_button.setEnabled(False) # Initial state
         self.history_back_button.setShortcut(QKeySequence(Qt.ALT | Qt.Key_Left))
+
 
         self.history_forward_button = QPushButton(">")
         self.history_forward_button.setToolTip("編集履歴を進む (Alt+Right)")
-        self.history_forward_button.setFixedWidth(35)
+        self.history_forward_button.setFixedWidth(35) # Adjust as needed
         self.history_forward_button.clicked.connect(self.navigate_history_forward_requested)
-        self.history_forward_button.setEnabled(False)
+        self.history_forward_button.setEnabled(False) # Initial state
         self.history_forward_button.setShortcut(QKeySequence(Qt.ALT | Qt.Key_Right))
+        # --- END OF NEW HISTORY BUTTONS ---
 
         self.copy_button = QPushButton("コピー")
         self.copy_button.setToolTip("現在のグリフ画像をクリップボードにコピー (Ctrl+C)")
@@ -1484,9 +1454,11 @@ class DrawingEditorWidget(QWidget):
         self.export_button.clicked.connect(self.export_current_glyph_image)
         
         display_options_layout = QHBoxLayout()
+        # Add history buttons before copy button
         display_options_layout.addWidget(self.history_back_button)
         display_options_layout.addWidget(self.history_forward_button)
-        display_options_layout.addSpacing(10)
+        display_options_layout.addSpacing(10) # Spacing after history buttons
+
         display_options_layout.addWidget(self.copy_button)
         display_options_layout.addWidget(self.paste_button)
         display_options_layout.addWidget(self.export_button)
@@ -1497,31 +1469,21 @@ class DrawingEditorWidget(QWidget):
         self.mirror_checkbox.toggled.connect(self._handle_mirror_mode_changed)
         display_options_layout.addWidget(self.mirror_checkbox)
         controls_outer_layout.addLayout(display_options_layout)
-
-        # --- Guideline Inputs (Horizontally Aligned) ---
-        guideline_horizontal_layout = QHBoxLayout() # Use QHBoxLayout for side-by-side
-        guideline_horizontal_layout.setContentsMargins(0, 5, 0, 5)
+        guideline_layout = QHBoxLayout()
+        guideline_layout.addWidget(QLabel("補助線 U:"))
+        self.guideline_u_input = QLineEdit()
+        self.guideline_u_input.setPlaceholderText("例: 100,200{ff0000},300")
+        self.guideline_u_input.editingFinished.connect(self._handle_guideline_u_changed)
+        guideline_layout.addWidget(self.guideline_u_input)
         
-        u_layout = QHBoxLayout() # Layout for U-axis label and input
-        u_layout.addWidget(QLabel("U軸:"))
-        self.u_guideline_input = QLineEdit()
-        self.u_guideline_input.setPlaceholderText("100,250{FF0000}")
-        self.u_guideline_input.editingFinished.connect(self._handle_u_guideline_changed)
-        u_layout.addWidget(self.u_guideline_input)
-        guideline_horizontal_layout.addLayout(u_layout, 1) # Add U-axis layout, stretch factor 1
+        guideline_layout.addSpacing(10)
+        guideline_layout.addWidget(QLabel("V:"))
+        self.guideline_v_input = QLineEdit()
+        self.guideline_v_input.setPlaceholderText("例: 50,150{0000ff}")
+        self.guideline_v_input.editingFinished.connect(self._handle_guideline_v_changed)
+        guideline_layout.addWidget(self.guideline_v_input)
+        controls_outer_layout.addLayout(guideline_layout)
 
-        guideline_horizontal_layout.addSpacing(10) # Add some space between U and V inputs
-
-        v_layout = QHBoxLayout() # Layout for V-axis label and input
-        v_layout.addWidget(QLabel("V軸:"))
-        self.v_guideline_input = QLineEdit()
-        self.v_guideline_input.setPlaceholderText("100,750{00FF00}")
-        self.v_guideline_input.editingFinished.connect(self._handle_v_guideline_changed)
-        v_layout.addWidget(self.v_guideline_input)
-        guideline_horizontal_layout.addLayout(v_layout, 1) # Add V-axis layout, stretch factor 1
-        
-        controls_outer_layout.addLayout(guideline_horizontal_layout)
-        # --- End Guideline Inputs ---
 
         margin_layout = QHBoxLayout(); margin_layout.addWidget(QLabel("グリフマージン:"))
         self.margin_slider = QSlider(Qt.Horizontal)
@@ -1532,7 +1494,6 @@ class DrawingEditorWidget(QWidget):
         self.margin_value_label = QLabel(str(self.canvas.glyph_margin_width))
         margin_layout.addWidget(self.margin_slider, 1); margin_layout.addWidget(self.margin_value_label)
         controls_outer_layout.addLayout(margin_layout)
-
         ref_opacity_layout = QHBoxLayout(); ref_opacity_layout.addWidget(QLabel("下書き透明度:"))
         self.ref_opacity_slider = QSlider(Qt.Horizontal); self.ref_opacity_slider.setRange(0, 100)
         self.ref_opacity_slider.setValue(int(DEFAULT_REFERENCE_IMAGE_OPACITY * 100))
@@ -1540,7 +1501,6 @@ class DrawingEditorWidget(QWidget):
         self.ref_opacity_label = QLabel(str(int(DEFAULT_REFERENCE_IMAGE_OPACITY * 100)))
         ref_opacity_layout.addWidget(self.ref_opacity_slider, 1); ref_opacity_layout.addWidget(self.ref_opacity_label)
         controls_outer_layout.addLayout(ref_opacity_layout)
-
         adv_width_layout = QHBoxLayout()
         self.adv_width_label = QLabel("文字送り幅:")
         adv_width_layout.addWidget(self.adv_width_label)
@@ -1552,7 +1512,6 @@ class DrawingEditorWidget(QWidget):
         self.adv_width_spinbox.valueChanged.connect(self._on_adv_width_spinbox_changed)
         adv_width_layout.addWidget(self.adv_width_slider, 1); adv_width_layout.addWidget(self.adv_width_spinbox)
         controls_outer_layout.addLayout(adv_width_layout)
-
         self.vrt2_and_ref_controls_layout = QHBoxLayout()
         self.vrt2_and_ref_controls_layout.setContentsMargins(0, 5, 0, 0)
         self.vrt2_controls_widget = QWidget()
@@ -1582,7 +1541,6 @@ class DrawingEditorWidget(QWidget):
         controls_outer_layout.addLayout(self.vrt2_and_ref_controls_layout)
         self.vrt2_controls_widget.setVisible(False)
         main_layout.addLayout(controls_outer_layout)
-
         self.canvas.pen_width_changed.connect(self._update_slider_value_no_signal)
         self.canvas.tool_changed.connect(self._update_tool_buttons_state_no_signal)
         self.canvas.undo_redo_state_changed.connect(self._update_undo_redo_buttons_state)
@@ -1603,24 +1561,12 @@ class DrawingEditorWidget(QWidget):
         self.rotated_vrt2_chars = chars
         self.update_unicode_display(self.canvas.current_glyph_character)
 
+    # --- NEW METHOD for updating history button states ---
     def update_history_buttons_state(self, can_go_back: bool, can_go_forward: bool):
-        is_editor_enabled = self.pen_button.isEnabled()
+        is_editor_enabled = self.pen_button.isEnabled() # General check if editor is active
         self.history_back_button.setEnabled(can_go_back and is_editor_enabled)
         self.history_forward_button.setEnabled(can_go_forward and is_editor_enabled)
-
-    # --- NEW Guideline Handlers ---
-    def _handle_u_guideline_changed(self):
-        u_str = self.u_guideline_input.text()
-        self.canvas.set_u_guideline_string(u_str)
-        self.gui_setting_changed_signal.emit(SETTING_GUIDELINES_U, u_str)
-        self.canvas.setFocus()
-
-    def _handle_v_guideline_changed(self):
-        v_str = self.v_guideline_input.text()
-        self.canvas.set_v_guideline_string(v_str)
-        self.gui_setting_changed_signal.emit(SETTING_GUIDELINES_V, v_str)
-        self.canvas.setFocus()
-    # --- END NEW Guideline Handlers ---
+    # --- END NEW METHOD ---
 
     def copy_to_clipboard(self):
         if not self.canvas.current_glyph_character:
@@ -1727,6 +1673,59 @@ class DrawingEditorWidget(QWidget):
     def _handle_glyph_to_ref_reset_button_clicked(self):
         self.glyph_to_reference_and_reset_requested.emit(self.canvas.editing_vrt2_glyph)
         self.canvas.setFocus()
+
+
+
+
+    def _parse_guideline_string(self, line_str: str) -> List[Tuple[int, QColor]]:
+        parsed_lines: List[Tuple[int, QColor]] = []
+        if not line_str.strip():
+            return parsed_lines
+
+        parts = line_str.split(',')
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            color_match = re.search(r"\{([0-9a-fA-F]{6})\}$", part)
+            color = DEFAULT_GUIDELINE_COLOR
+            coord_str = part
+
+            if color_match:
+                hex_color_str = color_match.group(1)
+                color = QColor(f"#{hex_color_str}")
+                coord_str = part[:color_match.start()].strip()
+
+            try:
+                coord = int(coord_str)
+                if 0 <= coord <= 1000: # Assuming 0-1000 range for guidelines
+                    parsed_lines.append((coord, color))
+                else:
+                    # Optionally show warning for out-of-range coords
+                    # print(f"Guideline coordinate {coord} out of range (0-1000).")
+                    pass
+            except ValueError:
+                # Optionally show warning for invalid coordinate format
+                # print(f"Invalid guideline coordinate format: {coord_str}")
+                pass
+        return parsed_lines
+
+    def _handle_guideline_u_changed(self):
+        u_str = self.guideline_u_input.text()
+        self.canvas.set_guidelines(self._parse_guideline_string(u_str), self.canvas.guidelines_v)
+        self.gui_setting_changed_signal.emit(SETTING_GUIDELINE_U, u_str)
+        self.canvas.setFocus()
+
+
+    def _handle_guideline_v_changed(self):
+        v_str = self.guideline_v_input.text()
+        self.canvas.set_guidelines(self.canvas.guidelines_u, self._parse_guideline_string(v_str))
+        self.gui_setting_changed_signal.emit(SETTING_GUIDELINE_V, v_str)
+        self.canvas.setFocus()
+
+
+
 
     def _handle_load_reference_image_button_clicked(self):
         if not self.canvas.current_glyph_character:
@@ -1892,14 +1891,13 @@ class DrawingEditorWidget(QWidget):
         self.export_button.setEnabled(enabled)
         self.mirror_checkbox.setEnabled(enabled)
         
+
         if not enabled: 
             self.history_back_button.setEnabled(False)
             self.history_forward_button.setEnabled(False)
+        self.guideline_u_input.setEnabled(enabled)
+        self.guideline_v_input.setEnabled(enabled)
 
-        # --- Guideline Inputs Enable/Disable ---
-        self.u_guideline_input.setEnabled(enabled)
-        self.v_guideline_input.setEnabled(enabled)
-        # --- End Guideline Inputs Enable/Disable ---
 
         self.margin_slider.setEnabled(enabled); self.margin_value_label.setEnabled(enabled)
         self.ref_opacity_slider.setEnabled(enabled); self.ref_opacity_label.setEnabled(enabled)
@@ -1926,16 +1924,13 @@ class DrawingEditorWidget(QWidget):
             self.canvas.reference_image = None
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
-            # Reset guideline inputs if editor disabled
-            self.u_guideline_input.setText(DEFAULT_GUIDELINES_U)
-            self.v_guideline_input.setText(DEFAULT_GUIDELINES_V)
-            self.canvas.set_u_guideline_string(DEFAULT_GUIDELINES_U)
-            self.canvas.set_v_guideline_string(DEFAULT_GUIDELINES_V)
-
         if not enabled:
             self.canvas.current_glyph_character = None
             inactive_canvas_fill_color = QColor(220, 220, 220)
             self.canvas.image.fill(inactive_canvas_fill_color)
+            self.guideline_u_input.setText("")
+            self.guideline_v_input.setText("")
+            self.canvas.set_guidelines([], [])
             self.canvas.update(); self.update_unicode_display(None)
 
     def _update_undo_redo_buttons_state(self, can_undo: bool, can_redo: bool):
@@ -1977,20 +1972,16 @@ class DrawingEditorWidget(QWidget):
         else:
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
+        guideline_u_str = settings.get(SETTING_GUIDELINE_U, "")
+        self.guideline_u_input.setText(guideline_u_str)
+        parsed_u_lines = self._parse_guideline_string(guideline_u_str)
 
-        # --- Apply Guideline Settings ---
-        u_guidelines = settings.get(SETTING_GUIDELINES_U, DEFAULT_GUIDELINES_U)
-        self.u_guideline_input.blockSignals(True)
-        self.u_guideline_input.setText(u_guidelines)
-        self.u_guideline_input.blockSignals(False)
-        self.canvas.set_u_guideline_string(u_guidelines)
+        guideline_v_str = settings.get(SETTING_GUIDELINE_V, "")
+        self.guideline_v_input.setText(guideline_v_str)
+        parsed_v_lines = self._parse_guideline_string(guideline_v_str)
+        
+        self.canvas.set_guidelines(parsed_u_lines, parsed_v_lines)
 
-        v_guidelines = settings.get(SETTING_GUIDELINES_V, DEFAULT_GUIDELINES_V)
-        self.v_guideline_input.blockSignals(True)
-        self.v_guideline_input.setText(v_guidelines)
-        self.v_guideline_input.blockSignals(False)
-        self.canvas.set_v_guideline_string(v_guidelines)
-        # --- End Apply Guideline Settings ---
 
 
 
@@ -2460,6 +2451,8 @@ class GlyphTableDelegate(QStyledItemDelegate):
 
 
 
+# --- GlyphGridWidget の修正箇所 ---
+
 class GlyphGridWidget(QWidget):
     glyph_selected_signal = Signal(str)
     vrt2_glyph_selected_signal = Signal(str)
@@ -2567,12 +2560,12 @@ class GlyphGridWidget(QWidget):
                         self.keyPressEvent(key_event) 
                         if key_event.isAccepted():
                             return True 
-                        else: # Even if not accepted by custom handler, consume it to prevent default TableView handling
-                            return True # This line was corrected to True
-                    else: # Modifiers are present, let default handling occur (e.g., Ctrl+Arrow for text edit)
-                        return False # Pass to default event handling
-                else: # Not an arrow key
-                     return False # Pass to default event handling
+                        else: 
+                            return True 
+                    else: 
+                        return False 
+                else:
+                     return False 
         return super().eventFilter(watched, event)
 
     def set_search_and_filter_enabled(self, enabled: bool):
@@ -2837,46 +2830,13 @@ class GlyphGridWidget(QWidget):
         elif model_to_update.get_metadata_count() > 0:
             char_to_set = model_to_update.get_char_key_at_flat_index(0) # Fallback to first
         
-        # _select_char_in_view を呼び出す前にフラグを管理する
-        old_is_selecting_programmatically = self._is_selecting_programmatically
-        self._is_selecting_programmatically = True
-        try:
-            self._select_char_in_view(char_to_set, view_to_update, model_to_update)
-        finally:
-            self._is_selecting_programmatically = old_is_selecting_programmatically
+        self._select_char_in_view(char_to_set, view_to_update, model_to_update)
 
 
-    # --- MODIFIED update_glyph_preview ---
     def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool):
         model_to_update = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
-        view_to_update = self.vrt2_glyph_view if is_vrt2_source else self.std_glyph_view
-        
-        main_window = self.window()
-        currently_editing_char: Optional[str] = None
-        currently_editing_is_vrt2: bool = False
-
-        if isinstance(main_window, MainWindow):
-            currently_editing_char = main_window.drawing_editor_widget.canvas.current_glyph_character
-            currently_editing_is_vrt2 = main_window.drawing_editor_widget.canvas.editing_vrt2_glyph
-
         model_to_update.update_glyph_pixmap(character, pixmap)
         self._update_glyph_count_label()
-
-        if currently_editing_char and currently_editing_char == character and currently_editing_is_vrt2 == is_vrt2_source:
-            flat_idx = model_to_update.get_flat_index_of_char_key(character)
-            if flat_idx is not None:
-                # 保存していた _is_selecting_programmatically の状態を復元
-                old_is_selecting_programmatically = self._is_selecting_programmatically
-                self._is_selecting_programmatically = True
-                try:
-                    self._select_char_in_view(character, view_to_update, model_to_update)
-                finally:
-                    self._is_selecting_programmatically = old_is_selecting_programmatically
-            else:
-                # 編集中のグリフがフィルタで消えた場合、現在のタブで最初のアイテムを選択しようと試みる
-                # あるいは何も選択しない (もしタブが空なら)
-                self._try_to_restore_selection_or_select_first(view_to_update)
-    # --- END MODIFIED update_glyph_preview ---
 
     def get_first_navigable_glyph_info(self) -> Optional[Tuple[str, bool]]:
         active_view_for_info = self.current_active_view
@@ -2923,8 +2883,8 @@ class GlyphGridWidget(QWidget):
                 super().keyPressEvent(event) 
                 if event.isAccepted(): 
                     return
-                return # Let the view handle it if not accepted (e.g., for text editing if it were enabled)
-            else: # Not an arrow key with modifiers
+                return
+            else: 
                 super().keyPressEvent(event)
                 return
         
@@ -2937,7 +2897,7 @@ class GlyphGridWidget(QWidget):
         total_visible_items = model.get_metadata_count()
 
         if num_cols == 0 or total_visible_items == 0:
-            super().keyPressEvent(event) # Or just accept and do nothing
+            super().keyPressEvent(event) 
             return
 
         current_flat_idx = -1
@@ -2945,22 +2905,20 @@ class GlyphGridWidget(QWidget):
             current_row_from_idx = current_model_idx.row()
             current_col_from_idx = current_model_idx.column()
             current_flat_idx = current_row_from_idx * num_cols + current_col_from_idx
-            # Validate if this flat index is actually within the range of visible items
             if not (0 <= current_flat_idx < total_visible_items):
-                current_flat_idx = -1 # Treat as no selection if index is out of bounds
+                current_flat_idx = -1 
         
-        if current_flat_idx == -1: # No valid current selection, or selection out of sync
+        if current_flat_idx == -1: 
             if total_visible_items > 0:
-                # Select the first item if available
                 first_item_char_key = model.get_char_key_at_flat_index(0)
                 if first_item_char_key:
                     self._select_char_in_view(first_item_char_key, view, model)
                 event.accept()
             else:
-                super().keyPressEvent(event) # No items to select
+                super().keyPressEvent(event)
             return
         
-        target_flat_idx = current_flat_idx # Default to current if no move happens
+        target_flat_idx = current_flat_idx 
 
         if key == Qt.Key_Left:
             if current_flat_idx > 0:
@@ -2977,13 +2935,13 @@ class GlyphGridWidget(QWidget):
             if potential_target_idx < total_visible_items:
                 target_flat_idx = potential_target_idx
 
-        if target_flat_idx != current_flat_idx: # If a move is calculated
-            if 0 <= target_flat_idx < total_visible_items: # Ensure target is valid
+        if target_flat_idx != current_flat_idx:
+            if 0 <= target_flat_idx < total_visible_items:
                 char_to_select = model.get_char_key_at_flat_index(target_flat_idx)
-                if char_to_select: # Should always be true if target_flat_idx is valid
+                if char_to_select: 
                     self._select_char_in_view(char_to_select, view, model)
         
-        event.accept() # Consume the event as we've handled it
+        event.accept()
 
 class PropertiesWidget(QWidget):
     character_set_changed_signal = Signal(str)
@@ -4046,6 +4004,9 @@ class MainWindow(QMainWindow):
             if self.current_project_path: 
                 self.statusBar().showMessage(f"プロジェクト '{os.path.basename(self.current_project_path)}' の読み込み完了。", 5000)
 
+
+
+
     @Slot(dict)
     def _on_project_basic_info_loaded(self, basic_data: dict):
         if not self.current_project_path: return 
@@ -4059,13 +4020,16 @@ class MainWindow(QMainWindow):
         self.properties_widget.load_font_weight(basic_data['font_weight'])
         self.properties_widget.load_copyright_info(basic_data.get(SETTING_COPYRIGHT_INFO, DEFAULT_COPYRIGHT_INFO))
         self.properties_widget.load_license_info(basic_data.get(SETTING_LICENSE_INFO, DEFAULT_LICENSE_INFO))
-        self.drawing_editor_widget.apply_gui_settings(basic_data['gui_settings'])
+        
+
+        self.drawing_editor_widget.apply_gui_settings(basic_data['gui_settings']) 
         
         self.glyph_grid_widget.populate_models(
             basic_data['char_set_list_with_img_info'],
             basic_data['nr_vrt2_list_with_img_info']
         )
         self.project_glyph_chars_cache = set(basic_data['char_set_list']) 
+
 
 
         if self.kanji_viewer_font_combo: 
