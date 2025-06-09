@@ -36,6 +36,8 @@ from PySide6.QtCore import (
 )
 
 
+
+
 # --- Constants ---
 MAX_HISTORY_SIZE = 30
 MAX_EDIT_HISTORY_SIZE = 80
@@ -54,7 +56,9 @@ R_VERT_FILENAME = "r_vert.txt"
 VERT_FILENAME = "vert.txt"
 DEFAULT_R_VERT_CHARS = "≠≦≧〈〉《》「」『』【】〔〕〜゠ー（）：；＜＝＞［］＿｛｜｝～￣"
 DEFAULT_VERT_CHARS = "‥…‘’“”、。，．"
-SETTING_PEN_WIDTH = "pen_width"
+
+SETTING_PEN_WIDTH = "pen_width"  # これはブラシの太さとして扱います
+SETTING_ERASER_WIDTH = "eraser_width" # 消しゴムの太さのための新しい設定キー
 SETTING_PEN_SHAPE = "pen_shape"
 SETTING_CURRENT_TOOL = "current_tool"
 SETTING_MIRROR_MODE = "mirror_mode"
@@ -63,7 +67,9 @@ SETTING_LAST_ACTIVE_GLYPH = "last_active_glyph"
 SETTING_LAST_ACTIVE_GLYPH_IS_VRT2 = "last_active_glyph_is_vrt2" # New setting for active tab/type
 SETTING_ROTATED_VRT2_CHARS = "rotated_vrt2_chars"
 SETTING_NON_ROTATED_VRT2_CHARS = "non_rotated_vrt2_chars"
-DEFAULT_PEN_WIDTH = 2
+
+DEFAULT_PEN_WIDTH = 2  # これはデフォルトのブラシ太さとして扱います
+DEFAULT_ERASER_WIDTH = 2 # デフォルトの消しゴム太さ (ブラシと同じで開始)
 DEFAULT_PEN_SHAPE = "丸"
 DEFAULT_CURRENT_TOOL = "brush"
 DEFAULT_MIRROR_MODE = False
@@ -109,7 +115,8 @@ DELEGATE_PLACEHOLDER_COLOR = QColor(220, 220, 220)
 DELEGATE_CELL_BASE_WIDTH = 80 # Approximate base width for item
 DELEGATE_GRID_COLUMNS = 5 # Number of columns in the table view grid
 
-# --- kanzi2.py の関数群 (変更なし) ---
+
+
 def get_data_file_path(filename: str) -> str | None:
     script_dir = os.path.dirname(os.path.abspath(__file__)) 
     data_path_local = os.path.join(script_dir, "data", filename)
@@ -464,8 +471,7 @@ class LoadProjectWorkerSignals(QObject):
 
 
 
-
-class LoadProjectWorker(QRunnable): # MODIFIED CLASS
+class LoadProjectWorker(QRunnable):
     def __init__(self, db_path: str):
         super().__init__()
         self.db_path = db_path
@@ -524,19 +530,36 @@ class LoadProjectWorker(QRunnable): # MODIFIED CLASS
             try: ref_opacity_val = float(ref_opacity_str if ref_opacity_str else DEFAULT_REFERENCE_IMAGE_OPACITY)
             except ValueError: ref_opacity_val = DEFAULT_REFERENCE_IMAGE_OPACITY
 
-            # ADDED: Load guideline settings
-            guideline_u_str = db_manager.load_gui_setting(SETTING_GUIDELINE_U, "") # Default to empty string
-            guideline_v_str = db_manager.load_gui_setting(SETTING_GUIDELINE_V, "") # Default to empty string
+            guideline_u_str = db_manager.load_gui_setting(SETTING_GUIDELINE_U, "")
+            guideline_v_str = db_manager.load_gui_setting(SETTING_GUIDELINE_V, "")
 
+            # ブラシ幅の読み込み
+            loaded_brush_width_str = db_manager.load_gui_setting(SETTING_PEN_WIDTH, str(DEFAULT_PEN_WIDTH))
+            try:
+                loaded_brush_width_val = int(loaded_brush_width_str)
+            except ValueError:
+                loaded_brush_width_val = DEFAULT_PEN_WIDTH
+
+            # 消しゴム幅の読み込み (互換性対応)
+            loaded_eraser_width_str = db_manager.load_gui_setting(SETTING_ERASER_WIDTH)
+            if loaded_eraser_width_str is not None: # SETTING_ERASER_WIDTH が存在する場合
+                try:
+                    loaded_eraser_width_val = int(loaded_eraser_width_str)
+                except ValueError: # 値が不正ならブラシ幅にフォールバック
+                    loaded_eraser_width_val = loaded_brush_width_val
+            else: # SETTING_ERASER_WIDTH が存在しない古いプロジェクトの場合、ブラシ幅を使用
+                loaded_eraser_width_val = loaded_brush_width_val
+            
             gui_settings = {
-                SETTING_PEN_WIDTH: db_manager.load_gui_setting(SETTING_PEN_WIDTH, str(DEFAULT_PEN_WIDTH)),
+                SETTING_PEN_WIDTH: str(loaded_brush_width_val), # ブラシ幅として保存
+                SETTING_ERASER_WIDTH: str(loaded_eraser_width_val), # 消しゴム幅として保存
                 SETTING_PEN_SHAPE: db_manager.load_gui_setting(SETTING_PEN_SHAPE, DEFAULT_PEN_SHAPE),
                 SETTING_CURRENT_TOOL: db_manager.load_gui_setting(SETTING_CURRENT_TOOL, DEFAULT_CURRENT_TOOL),
                 SETTING_MIRROR_MODE: db_manager.load_gui_setting(SETTING_MIRROR_MODE, str(DEFAULT_MIRROR_MODE)),
                 SETTING_GLYPH_MARGIN_WIDTH: db_manager.load_gui_setting(SETTING_GLYPH_MARGIN_WIDTH, str(DEFAULT_GLYPH_MARGIN_WIDTH)),
                 SETTING_REFERENCE_IMAGE_OPACITY: str(ref_opacity_val),
-                SETTING_GUIDELINE_U: guideline_u_str, # ADDED
-                SETTING_GUIDELINE_V: guideline_v_str, # ADDED
+                SETTING_GUIDELINE_U: guideline_u_str,
+                SETTING_GUIDELINE_V: guideline_v_str,
             }
 
             kv_font_actual_name = db_manager.load_gui_setting(SETTING_KV_CURRENT_FONT, "")
@@ -562,7 +585,7 @@ class LoadProjectWorker(QRunnable): # MODIFIED CLASS
                 'font_weight': font_weight,
                 'copyright_info': copyright_info,
                 'license_info': license_info,
-                'gui_settings': gui_settings, # This now includes guideline strings
+                'gui_settings': gui_settings, 
                 'kv_font_actual_name': kv_font_actual_name,
                 'kv_display_mode_val': kv_display_mode_val,
                 'last_active_glyph_char': last_active_glyph_char,
@@ -609,7 +632,6 @@ class CreateProjectWorker(QRunnable):
             self.signals.error.emit(f"プロジェクトデータベースの作成に失敗しました: {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
-
 
 
 class DatabaseManager:
@@ -699,12 +721,13 @@ class DatabaseManager:
             if len(char_val) == 1: 
                  cursor.execute("INSERT OR IGNORE INTO vrt2_glyphs (character) VALUES (?)", (char_val,))
         
-        self._save_default_gui_settings(cursor) # MODIFIED: Call to updated method
+        self._save_default_gui_settings(cursor) 
         conn.commit(); conn.close()
 
     def _save_default_gui_settings(self, cursor: sqlite3.Cursor): # MODIFIED METHOD
         defaults = {
-            SETTING_PEN_WIDTH: str(DEFAULT_PEN_WIDTH),
+            SETTING_PEN_WIDTH: str(DEFAULT_PEN_WIDTH), # これはブラシ幅のデフォルト
+            SETTING_ERASER_WIDTH: str(DEFAULT_ERASER_WIDTH), # 消しゴム幅のデフォルトを追加
             SETTING_PEN_SHAPE: DEFAULT_PEN_SHAPE,
             SETTING_CURRENT_TOOL: DEFAULT_CURRENT_TOOL,
             SETTING_MIRROR_MODE: str(DEFAULT_MIRROR_MODE),
@@ -718,13 +741,12 @@ class DatabaseManager:
             SETTING_REFERENCE_IMAGE_OPACITY: str(DEFAULT_REFERENCE_IMAGE_OPACITY),
             SETTING_KV_CURRENT_FONT: "", 
             SETTING_KV_DISPLAY_MODE: str(DEFAULT_KV_MODE_FOR_SETTINGS), 
-            SETTING_GUIDELINE_U: "", # ADDED: Default empty string for U guidelines
-            SETTING_GUIDELINE_V: "", # ADDED: Default empty string for V guidelines
+            SETTING_GUIDELINE_U: "", 
+            SETTING_GUIDELINE_V: "", 
         }
         for key, value in defaults.items():
             cursor.execute("INSERT OR IGNORE INTO project_settings (key, value) VALUES (?, ?)", (key, value))
 
-    # ... (rest of DatabaseManager remains the same) ...
     def get_project_character_set(self) -> List[str]: return self._get_char_set_from_settings('character_set')
     def get_rotated_vrt2_character_set(self) -> List[str]: return self._get_char_set_from_settings(SETTING_ROTATED_VRT2_CHARS)
     def get_non_rotated_vrt2_character_set(self) -> List[str]: return self._get_char_set_from_settings(SETTING_NON_ROTATED_VRT2_CHARS)
@@ -899,9 +921,9 @@ class DatabaseManager:
         finally: conn.close()
 
 
-
 class Canvas(QWidget):
-    pen_width_changed = Signal(int)
+    brush_width_changed = Signal(int)   # ブラシ太さ変更シグナル
+    eraser_width_changed = Signal(int)  # 消しゴム太さ変更シグナル
     tool_changed = Signal(str)
     undo_redo_state_changed = Signal(bool, bool)
     glyph_modified_signal = Signal(str, QPixmap, bool) # char, pixmap, is_vrt2
@@ -921,7 +943,10 @@ class Canvas(QWidget):
         self.image = QPixmap(self.image_size); self.image.fill(QColor(Qt.white))
         self.reference_image: Optional[QPixmap] = None
         self.reference_image_opacity: float = DEFAULT_REFERENCE_IMAGE_OPACITY
-        self.pen_width = DEFAULT_PEN_WIDTH
+        
+        self.brush_width = DEFAULT_PEN_WIDTH   # ブラシの太さ
+        self.eraser_width = DEFAULT_ERASER_WIDTH # 消しゴムの太さ
+        
         self.pen_shape = Qt.RoundCap if DEFAULT_PEN_SHAPE == "丸" else Qt.SquareCap
         self.current_pen_color = QColor(Qt.black); self.last_brush_color = QColor(Qt.black)
         self.drawing = False; self.stroke_points: list[QPointF] = []; self.current_path = QPainterPath()
@@ -980,14 +1005,32 @@ class Canvas(QWidget):
             self.image = popped_state.copy(); self.update(); self._emit_undo_redo_state()
             if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
 
-    def set_pen_width(self, width: int):
-        self.pen_width = width; self.pen_width_changed.emit(self.pen_width)
-        if self.drawing and self.stroke_points: self._rebuild_current_path_from_stroke_points(finalize=False)
+    def set_brush_width(self, width: int):
+        """ブラシの太さを設定します。"""
+        self.brush_width = max(1, width) # 最小値を1に制限
+        self.brush_width_changed.emit(self.brush_width)
+        if self.current_tool == "brush" and self.drawing and self.stroke_points:
+            self._rebuild_current_path_from_stroke_points(finalize=False)
+
+    def set_eraser_width(self, width: int):
+        """消しゴムの太さを設定します。"""
+        self.eraser_width = max(1, width) # 最小値を1に制限
+        self.eraser_width_changed.emit(self.eraser_width)
+        if self.current_tool == "eraser" and self.drawing and self.stroke_points:
+            self._rebuild_current_path_from_stroke_points(finalize=False)
+
+    def get_current_active_width(self) -> int:
+        """現在アクティブなツールの太さを取得します。"""
+        if self.current_tool == "eraser":
+            return self.eraser_width
+        return self.brush_width # デフォルトはブラシの太さ
 
     def set_pen_shape(self, shape_name: str):
         if shape_name == "丸": self.pen_shape = Qt.RoundCap
         elif shape_name == "四角": self.pen_shape = Qt.SquareCap
-        if self.drawing and self.stroke_points: self._rebuild_current_path_from_stroke_points(finalize=False)
+        # ペンの形状はブラシと消しゴムで共通なので、現在アクティブなツールに関わらず更新
+        if self.drawing and self.stroke_points:
+            self._rebuild_current_path_from_stroke_points(finalize=False)
 
     def set_current_pen_color(self, color: QColor):
         self.current_pen_color = color
@@ -996,13 +1039,19 @@ class Canvas(QWidget):
     def set_eraser_mode(self):
         if self.move_mode: self.move_mode = False; self.unsetCursor()
         if self.current_pen_color != Qt.white: self.last_brush_color = self.current_pen_color
-        self.set_current_pen_color(QColor(Qt.white)); self.drawing = False; self.current_tool = "eraser"
-        self.tool_changed.emit("eraser"); self.update()
+        self.set_current_pen_color(QColor(Qt.white))
+        self.drawing = False
+        self.current_tool = "eraser"
+        self.tool_changed.emit("eraser") # UI(スライダー等)更新のためシグナル発行
+        self.update()
 
     def set_brush_mode(self):
         if self.move_mode: self.move_mode = False; self.unsetCursor()
-        self.set_current_pen_color(self.last_brush_color); self.drawing = False; self.current_tool = "brush"
-        self.tool_changed.emit("brush"); self.update()
+        self.set_current_pen_color(self.last_brush_color)
+        self.drawing = False
+        self.current_tool = "brush"
+        self.tool_changed.emit("brush") # UI(スライダー等)更新のためシグナル発行
+        self.update()
 
     def set_mirror_mode(self, enabled: bool):
         if self.mirror_mode == enabled: return
@@ -1053,8 +1102,11 @@ class Canvas(QWidget):
     def _draw_path_on_painter(self, painter: QPainter, path_to_draw: QPainterPath):
         if path_to_draw.isEmpty(): return
         painter.setRenderHint(QPainter.Antialiasing, True)
+        
+        active_width = float(self.get_current_active_width()) # 現在のツールに応じた太さを取得
+
         if self.pen_shape == Qt.RoundCap:
-            pen = QPen(self.current_pen_color, float(self.pen_width), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            pen = QPen(self.current_pen_color, active_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
             painter.setPen(pen); painter.drawPath(path_to_draw)
         elif self.pen_shape == Qt.SquareCap:
             painter.setPen(Qt.NoPen); painter.setBrush(self.current_pen_color)
@@ -1062,21 +1114,23 @@ class Canvas(QWidget):
             if path_length == 0 and path_to_draw.elementCount() > 0 and \
                path_to_draw.elementAt(0).isMoveTo():
                 first_point = QPointF(path_to_draw.elementAt(0).x, path_to_draw.elementAt(0).y)
-                rect_size = float(self.pen_width)
+                rect_size = active_width
                 rect = QRectF(first_point.x() - rect_size / 2.0, first_point.y() - rect_size / 2.0, rect_size, rect_size)
                 painter.drawRect(rect)
                 return
-            sampling_step_length = max(1.0, float(self.pen_width) / 10.0)
+            
+            sampling_step_length = max(1.0, active_width / 10.0) # ステップ長もアクティブな太さに応じる
             num_samples = 0
             if sampling_step_length > 0: num_samples = max(1, int(path_length / sampling_step_length))
             else: num_samples = 1
+            
             for i in range(num_samples + 1):
                 percent = 0.0
                 if num_samples > 0 : percent = float(i) / num_samples
                 else: percent = 0.0
                 point_on_path = path_to_draw.pointAtPercent(percent)
                 if point_on_path.isNull(): continue
-                rect_size = float(self.pen_width)
+                rect_size = active_width
                 rect = QRectF(point_on_path.x() - rect_size / 2.0, point_on_path.y() - rect_size / 2.0, rect_size, rect_size)
                 painter.drawRect(rect)
 
@@ -1250,8 +1304,6 @@ class Canvas(QWidget):
         canvas_painter.drawRect(image_area_rect_in_widget.adjusted(0,0,-1,-1))
         canvas_painter.restore()
 
-
-
     def mousePressEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
         if self.move_mode:
@@ -1350,7 +1402,6 @@ class Canvas(QWidget):
 
 
 
-
 class DrawingEditorWidget(QWidget):
 
     gui_setting_changed_signal = Signal(str, str) # key, value
@@ -1397,22 +1448,29 @@ class DrawingEditorWidget(QWidget):
         self.shape_box.currentTextChanged.connect(self._handle_pen_shape_changed)
         top_controls_layout.addWidget(self.shape_box); top_controls_layout.addStretch(1)
         controls_outer_layout.addLayout(top_controls_layout)
-        slider_layout = QHBoxLayout(); slider_layout.addWidget(QLabel("太さ:"))
+        
+        slider_layout = QHBoxLayout()
+        self.width_label = QLabel("太さ:") # ラベルは汎用的に「太さ」
+        slider_layout.addWidget(self.width_label)
         self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(1, 100); self.slider.setValue(self.canvas.pen_width)
-        self.slider.valueChanged.connect(self._handle_pen_width_changed)
+        self.slider.setRange(1, 100)
+        self.slider.setValue(self.canvas.get_current_active_width()) # 初期値はアクティブなツールの太さ
+        self.slider.valueChanged.connect(self._handle_active_tool_width_slider_changed) # スライダー変更時のハンドラ
         slider_layout.addWidget(self.slider, 1)
         controls_outer_layout.addLayout(slider_layout)
+        
         self.pen_size_buttons_group = QWidget()
         pen_size_grid_layout = QGridLayout(self.pen_size_buttons_group); pen_size_grid_layout.setSpacing(5)
         pen_sizes = [2, 5, 8, 10, 15, 20, 25, 30, 40, 50]
         cols = 5
         for i, size_val in enumerate(pen_sizes):
             button = QPushButton(str(size_val)); button.setToolTip(f"{size_val}px")
-            button.clicked.connect(lambda checked=False, s=size_val: self._handle_pen_width_changed(s))
+            # プリセットボタンもアクティブなツールの太さを変更
+            button.clicked.connect(lambda checked=False, s=size_val: self._handle_active_tool_width_slider_changed(s))
             row, col = divmod(i, cols)
             pen_size_grid_layout.addWidget(button, row, col)
         controls_outer_layout.addWidget(self.pen_size_buttons_group)
+        
         self.history_back_button = QPushButton("<")
         self.history_back_button.setToolTip("編集履歴を戻る (Alt+Left)")
         self.history_back_button.setFixedWidth(35) 
@@ -1516,13 +1574,17 @@ class DrawingEditorWidget(QWidget):
         controls_outer_layout.addLayout(self.vrt2_and_ref_controls_layout)
         self.vrt2_controls_widget.setVisible(False)
         main_layout.addLayout(controls_outer_layout)
-        self.canvas.pen_width_changed.connect(self._update_slider_value_no_signal)
-        self.canvas.tool_changed.connect(self._update_tool_buttons_state_no_signal)
+
+        self.canvas.brush_width_changed.connect(self._update_slider_for_brush_width) 
+        self.canvas.eraser_width_changed.connect(self._update_slider_for_eraser_width) 
+        self.canvas.tool_changed.connect(self._on_canvas_tool_changed) 
+
         self.canvas.undo_redo_state_changed.connect(self._update_undo_redo_buttons_state)
         self.canvas.glyph_margin_width_changed.connect(self._update_glyph_margin_slider_and_label_no_signal)
         self.canvas.glyph_advance_width_changed.connect(self._update_adv_width_ui_no_signal)
-        self._update_tool_buttons_state_no_signal(self.canvas.current_tool)
-        self._update_slider_value_no_signal(self.canvas.pen_width)
+        
+        self._on_canvas_tool_changed(self.canvas.current_tool) 
+
         self.shape_box.setCurrentText(DEFAULT_PEN_SHAPE if self.canvas.pen_shape == Qt.RoundCap else "四角")
         self.mirror_checkbox.setChecked(self.canvas.mirror_mode)
         self._update_glyph_margin_slider_and_label_no_signal(self.canvas.glyph_margin_width)
@@ -1532,21 +1594,14 @@ class DrawingEditorWidget(QWidget):
         self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
         self.set_enabled_controls(False)
 
-
-
-
-
-
     def set_rotated_vrt2_chars(self, chars: Set[str]):
         self.rotated_vrt2_chars = chars
         self.update_unicode_display(self.canvas.current_glyph_character)
 
-    # --- NEW METHOD for updating history button states ---
     def update_history_buttons_state(self, can_go_back: bool, can_go_forward: bool):
-        is_editor_enabled = self.pen_button.isEnabled() # General check if editor is active
+        is_editor_enabled = self.pen_button.isEnabled() 
         self.history_back_button.setEnabled(can_go_back and is_editor_enabled)
         self.history_forward_button.setEnabled(can_go_forward and is_editor_enabled)
-    # --- END NEW METHOD ---
 
     def copy_to_clipboard(self):
         if not self.canvas.current_glyph_character:
@@ -1654,9 +1709,6 @@ class DrawingEditorWidget(QWidget):
         self.glyph_to_reference_and_reset_requested.emit(self.canvas.editing_vrt2_glyph)
         self.canvas.setFocus()
 
-
-
-
     def _parse_guideline_string(self, line_str: str) -> List[Tuple[int, QColor]]:
         parsed_lines: List[Tuple[int, QColor]] = []
         if not line_str.strip():
@@ -1682,11 +1734,9 @@ class DrawingEditorWidget(QWidget):
                 if 0 <= coord <= 1000: # Assuming 0-1000 range for guidelines
                     parsed_lines.append((coord, color))
                 else:
-                    # Optionally show warning for out-of-range coords
                     # print(f"Guideline coordinate {coord} out of range (0-1000).")
                     pass
             except ValueError:
-                # Optionally show warning for invalid coordinate format
                 # print(f"Invalid guideline coordinate format: {coord_str}")
                 pass
         return parsed_lines
@@ -1703,9 +1753,6 @@ class DrawingEditorWidget(QWidget):
         self.canvas.set_guidelines(self.canvas.guidelines_u, self._parse_guideline_string(v_str))
         self.gui_setting_changed_signal.emit(SETTING_GUIDELINE_V, v_str)
         self.canvas.setFocus()
-
-
-
 
     def _handle_load_reference_image_button_clicked(self):
         if not self.canvas.current_glyph_character:
@@ -1791,27 +1838,51 @@ class DrawingEditorWidget(QWidget):
             self.vrt2_toggle_button.setText("縦書きグリフ編集中" if is_editing_vrt2 else "標準グリフ編集中")
             self.vrt2_toggle_button.blockSignals(False)
 
+    def _update_slider_for_brush_width(self, width: int):
+        """ブラシの太さがCanvas側で変更された場合にスライダーを更新 (ツールがブラシの場合のみ)"""
+        if self.canvas.current_tool == "brush":
+            self._update_slider_value_no_signal(width)
+
+    def _update_slider_for_eraser_width(self, width: int):
+        """消しゴムの太さがCanvas側で変更された場合にスライダーを更新 (ツールが消しゴムの場合のみ)"""
+        if self.canvas.current_tool == "eraser":
+            self._update_slider_value_no_signal(width)
+
+    def _on_canvas_tool_changed(self, tool_name: str):
+        """Canvasのツールが変更された時の処理。UIのツールボタンとスライダー値を更新。"""
+        self._update_tool_buttons_state_no_signal(tool_name)
+        active_width = self.canvas.get_current_active_width()
+        self._update_slider_value_no_signal(active_width)
+        # self.width_label.setText(f"{'ブラシ' if tool_name == 'brush' else '消しゴム'}太さ:") # オプション: ラベルも変更
+
     def _handle_pen_button_clicked(self):
-        self.canvas.set_brush_mode()
+        self.canvas.set_brush_mode() # Canvas内でtool_changedシグナルが発行される
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "brush")
         self.canvas.setFocus()
 
     def _handle_eraser_button_clicked(self):
-        self.canvas.set_eraser_mode()
+        self.canvas.set_eraser_mode() # Canvas内でtool_changedシグナルが発行される
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "eraser")
         self.canvas.setFocus()
 
     def _handle_move_button_clicked(self):
         is_move_tool_selected = self.move_button.isChecked()
-        self.canvas.set_move_mode(is_move_tool_selected)
+        self.canvas.set_move_mode(is_move_tool_selected) # Canvas内でtool_changedシグナルが発行される場合がある
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, self.canvas.current_tool)
         self.canvas.setFocus()
 
-    def _handle_pen_width_changed(self, width: int): 
-        self.canvas.set_pen_width(width)
-        self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width))
-        if QApplication.focusWidget() != self.slider : 
-             self.canvas.setFocus()
+    def _handle_active_tool_width_slider_changed(self, width: int):
+        """スライダーやプリセットボタンで太さが変更された時の処理。アクティブなツールの太さを更新。"""
+        current_tool = self.canvas.current_tool
+        if current_tool == "brush":
+            self.canvas.set_brush_width(width)
+            self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width)) # SETTING_PEN_WIDTH はブラシ用
+        elif current_tool == "eraser":
+            self.canvas.set_eraser_width(width)
+            self.gui_setting_changed_signal.emit(SETTING_ERASER_WIDTH, str(width)) # SETTING_ERASER_WIDTH は消しゴム用
+        
+        if QApplication.focusWidget() != self.slider:
+            self.canvas.setFocus()
 
     def _handle_pen_shape_changed(self, shape_name: str):
         self.canvas.set_pen_shape(shape_name)
@@ -1830,7 +1901,10 @@ class DrawingEditorWidget(QWidget):
             self.canvas.setFocus()
 
     def _update_slider_value_no_signal(self, width: int):
-        self.slider.blockSignals(True); self.slider.setValue(width); self.slider.blockSignals(False)
+        """スライダーの値をシグナルを発行せずに更新します。"""
+        self.slider.blockSignals(True)
+        self.slider.setValue(width)
+        self.slider.blockSignals(False)
 
     def _update_tool_buttons_state_no_signal(self, tool_name: str):
         self.pen_button.blockSignals(True); self.eraser_button.blockSignals(True); self.move_button.blockSignals(True)
@@ -1871,13 +1945,11 @@ class DrawingEditorWidget(QWidget):
         self.export_button.setEnabled(enabled)
         self.mirror_checkbox.setEnabled(enabled)
         
-
         if not enabled: 
             self.history_back_button.setEnabled(False)
             self.history_forward_button.setEnabled(False)
         self.guideline_u_input.setEnabled(enabled)
         self.guideline_v_input.setEnabled(enabled)
-
 
         self.margin_slider.setEnabled(enabled); self.margin_value_label.setEnabled(enabled)
         self.ref_opacity_slider.setEnabled(enabled); self.ref_opacity_label.setEnabled(enabled)
@@ -1918,30 +1990,51 @@ class DrawingEditorWidget(QWidget):
         self.undo_button.setEnabled(can_undo and controls_are_generally_enabled)
         self.redo_button.setEnabled(can_redo and controls_are_generally_enabled)
 
+    def apply_gui_settings(self, settings: Dict[str, Any]):
+        # ブラシ幅の読み込み (旧 PEN_WIDTH)
+        brush_width_str = settings.get(SETTING_PEN_WIDTH)
+        if brush_width_str is not None:
+            try:
+                self.canvas.set_brush_width(int(brush_width_str))
+            except ValueError:
+                self.canvas.set_brush_width(DEFAULT_PEN_WIDTH)
+        else: # 古いプロジェクト等で PEN_WIDTH がない場合
+            self.canvas.set_brush_width(DEFAULT_PEN_WIDTH)
 
+        # 消しゴム幅の読み込み (新 ERASER_WIDTH)
+        eraser_width_str = settings.get(SETTING_ERASER_WIDTH)
+        if eraser_width_str is not None:
+            try:
+                self.canvas.set_eraser_width(int(eraser_width_str))
+            except ValueError: # ERASER_WIDTH が不正な値の場合、ブラシ幅かデフォルト値にフォールバック
+                self.canvas.set_eraser_width(self.canvas.brush_width) # ブラシ幅と同じにする
+        else: # 古いプロジェクトで ERASER_WIDTH がない場合、ブラシ幅と同じにする
+            self.canvas.set_eraser_width(self.canvas.brush_width)
 
-    def apply_gui_settings(self, settings: Dict[str, Any]): # MODIFIED METHOD
-        pen_width_str = settings.get(SETTING_PEN_WIDTH)
-        if pen_width_str is not None:
-            try: self.canvas.set_pen_width(int(pen_width_str))
-            except ValueError: pass
         pen_shape = settings.get(SETTING_PEN_SHAPE)
         if pen_shape is not None:
             self.shape_box.blockSignals(True); self.shape_box.setCurrentText(pen_shape); self.shape_box.blockSignals(False)
             self.canvas.set_pen_shape(pen_shape)
+        
         current_tool = settings.get(SETTING_CURRENT_TOOL)
-        if current_tool == "eraser": self.canvas.set_eraser_mode()
-        elif current_tool == "move": self.canvas.set_move_mode(True)
-        else: self.canvas.set_brush_mode()
+        if current_tool == "eraser":
+            self.canvas.set_eraser_mode() # これにより _on_canvas_tool_changed が呼ばれスライダー値も更新されるはず
+        elif current_tool == "move":
+            self.canvas.set_move_mode(True)
+        else: # "brush" or default
+            self.canvas.set_brush_mode() # これにより _on_canvas_tool_changed が呼ばれスライダー値も更新されるはず
+        
         mirror_mode_str = settings.get(SETTING_MIRROR_MODE)
         if mirror_mode_str is not None:
             checked = mirror_mode_str.lower() == 'true'
             self.mirror_checkbox.blockSignals(True); self.mirror_checkbox.setChecked(checked); self.mirror_checkbox.blockSignals(False)
             self.canvas.set_mirror_mode(checked)
+        
         margin_width_str = settings.get(SETTING_GLYPH_MARGIN_WIDTH)
         if margin_width_str is not None:
             try: self.canvas.set_glyph_margin_width(int(margin_width_str))
             except ValueError: pass
+        
         ref_opacity_str = settings.get(SETTING_REFERENCE_IMAGE_OPACITY)
         if ref_opacity_str is not None:
             try:
@@ -1955,16 +2048,15 @@ class DrawingEditorWidget(QWidget):
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
         
-        # ADDED: Apply guideline settings
-        guideline_u_str = settings.get(SETTING_GUIDELINE_U, "") # Default to empty string
-        self.guideline_u_input.setText(guideline_u_str) # Set text in QLineEdit
+        guideline_u_str = settings.get(SETTING_GUIDELINE_U, "")
+        self.guideline_u_input.setText(guideline_u_str)
         parsed_u_lines = self._parse_guideline_string(guideline_u_str)
 
-        guideline_v_str = settings.get(SETTING_GUIDELINE_V, "") # Default to empty string
-        self.guideline_v_input.setText(guideline_v_str) # Set text in QLineEdit
+        guideline_v_str = settings.get(SETTING_GUIDELINE_V, "")
+        self.guideline_v_input.setText(guideline_v_str)
         parsed_v_lines = self._parse_guideline_string(guideline_v_str)
         
-        self.canvas.set_guidelines(parsed_u_lines, parsed_v_lines) # Apply to canvas
+        self.canvas.set_guidelines(parsed_u_lines, parsed_v_lines)
 
 
 class ImageLoaderSignals(QObject):
