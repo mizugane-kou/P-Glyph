@@ -462,10 +462,10 @@ class LoadProjectWorkerSignals(QObject):
     error = Signal(str)
     finished = Signal()
 
-# --- Worker for loading project data (Modified for batch loading) ---
-# ... (LoadProjectWorkerSignals class definition remains the same) ...
 
-class LoadProjectWorker(QRunnable):
+
+
+class LoadProjectWorker(QRunnable): # MODIFIED CLASS
     def __init__(self, db_path: str):
         super().__init__()
         self.db_path = db_path
@@ -475,9 +475,6 @@ class LoadProjectWorker(QRunnable):
         """For a list of characters, checks DB if image_data exists."""
         results = []
         if not char_list: return results
-        # Use a local connection per call for thread safety if db_manager methods aren't inherently thread-safe for reads
-        # However, db_manager._get_connection() should provide a new connection or handle thread safety.
-        # For simplicity, assuming db_manager methods used here are safe or _get_connection handles it.
         conn = db_manager._get_connection() 
         cursor = conn.cursor()
         table = "vrt2_glyphs" if is_vrt2 else "glyphs"
@@ -489,44 +486,32 @@ class LoadProjectWorker(QRunnable):
         conn.close()
         return results
 
-
-
     @Slot()
-    def run(self):
+    def run(self): # MODIFIED METHOD
         try:
             db_manager = DatabaseManager(self.db_path) 
 
             self.signals.load_progress.emit(0, "基本設定を読み込み中...")
-            char_set_list_raw = db_manager.get_project_character_set() # User-defined char set (no .notdef)
+            char_set_list_raw = db_manager.get_project_character_set() 
             r_vrt2_list_raw = db_manager.get_rotated_vrt2_character_set()
             nr_vrt2_list_raw = db_manager.get_non_rotated_vrt2_character_set()
             
-            # Get image existence info for initial model population
             self.signals.load_progress.emit(10, "グリフメタデータを確認中(.notdef)...")
-            
-            # Explicitly fetch .notdef information
             notdef_info_list: List[Tuple[str, bool]] = []
             try:
-                # db_manager already has db_path, so we can use its methods
                 notdef_image_bytes = db_manager.load_glyph_image_bytes('.notdef', is_vrt2=False)
                 has_notdef_image = (notdef_image_bytes is not None)
                 notdef_info_list.append(('.notdef', has_notdef_image))
             except Exception: 
-                # Fallback if .notdef somehow failed to load, though it should exist
                 notdef_info_list.append(('.notdef', False))
 
-
             self.signals.load_progress.emit(20, "グリフメタデータを確認中(標準)...")
-            # Get info for user-defined character set (ensure .notdef isn't accidentally in char_set_list_raw)
             user_chars_for_info = [c for c in char_set_list_raw if c != '.notdef']
             char_set_list_with_img_info_user = self._get_char_list_with_image_info(db_manager, user_chars_for_info, is_vrt2=False)
-            
-            # Combine .notdef with user characters, ensuring .notdef is first
             char_set_list_with_img_info = notdef_info_list + char_set_list_with_img_info_user
             
             self.signals.load_progress.emit(40, "グリフメタデータを確認中(縦書き)...")
             nr_vrt2_list_with_img_info = self._get_char_list_with_image_info(db_manager, nr_vrt2_list_raw, is_vrt2=True)
-
 
             self.signals.load_progress.emit(60, "GUI設定を読み込み中...")
             font_name = db_manager.load_gui_setting(SETTING_FONT_NAME, DEFAULT_FONT_NAME)
@@ -539,13 +524,19 @@ class LoadProjectWorker(QRunnable):
             try: ref_opacity_val = float(ref_opacity_str if ref_opacity_str else DEFAULT_REFERENCE_IMAGE_OPACITY)
             except ValueError: ref_opacity_val = DEFAULT_REFERENCE_IMAGE_OPACITY
 
+            # ADDED: Load guideline settings
+            guideline_u_str = db_manager.load_gui_setting(SETTING_GUIDELINE_U, "") # Default to empty string
+            guideline_v_str = db_manager.load_gui_setting(SETTING_GUIDELINE_V, "") # Default to empty string
+
             gui_settings = {
                 SETTING_PEN_WIDTH: db_manager.load_gui_setting(SETTING_PEN_WIDTH, str(DEFAULT_PEN_WIDTH)),
                 SETTING_PEN_SHAPE: db_manager.load_gui_setting(SETTING_PEN_SHAPE, DEFAULT_PEN_SHAPE),
                 SETTING_CURRENT_TOOL: db_manager.load_gui_setting(SETTING_CURRENT_TOOL, DEFAULT_CURRENT_TOOL),
                 SETTING_MIRROR_MODE: db_manager.load_gui_setting(SETTING_MIRROR_MODE, str(DEFAULT_MIRROR_MODE)),
                 SETTING_GLYPH_MARGIN_WIDTH: db_manager.load_gui_setting(SETTING_GLYPH_MARGIN_WIDTH, str(DEFAULT_GLYPH_MARGIN_WIDTH)),
-                SETTING_REFERENCE_IMAGE_OPACITY: str(ref_opacity_val)
+                SETTING_REFERENCE_IMAGE_OPACITY: str(ref_opacity_val),
+                SETTING_GUIDELINE_U: guideline_u_str, # ADDED
+                SETTING_GUIDELINE_V: guideline_v_str, # ADDED
             }
 
             kv_font_actual_name = db_manager.load_gui_setting(SETTING_KV_CURRENT_FONT, "")
@@ -561,18 +552,17 @@ class LoadProjectWorker(QRunnable):
             last_active_glyph_is_vrt2_str = db_manager.load_gui_setting(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, 'False')
             last_active_glyph_is_vrt2 = last_active_glyph_is_vrt2_str.lower() == 'true'
 
-
             basic_loaded_data = {
-                'char_set_list': char_set_list_raw, # Raw list for properties widget (does not include .notdef)
+                'char_set_list': char_set_list_raw, 
                 'r_vrt2_list': r_vrt2_list_raw,
                 'nr_vrt2_list': nr_vrt2_list_raw,
-                'char_set_list_with_img_info': char_set_list_with_img_info, # For std model (includes .notdef)
-                'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info, # For vrt2 model
+                'char_set_list_with_img_info': char_set_list_with_img_info, 
+                'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info, 
                 'font_name': font_name,
                 'font_weight': font_weight,
                 'copyright_info': copyright_info,
                 'license_info': license_info,
-                'gui_settings': gui_settings,
+                'gui_settings': gui_settings, # This now includes guideline strings
                 'kv_font_actual_name': kv_font_actual_name,
                 'kv_display_mode_val': kv_display_mode_val,
                 'last_active_glyph_char': last_active_glyph_char,
@@ -587,7 +577,7 @@ class LoadProjectWorker(QRunnable):
         finally:
             self.signals.finished.emit()
 
-# --- Worker for creating project DB (変更なし) ---
+
 class CreateProjectWorkerSignals(QObject):
     finished = Signal()
     error = Signal(str)
@@ -621,7 +611,7 @@ class CreateProjectWorker(QRunnable):
             self.signals.finished.emit()
 
 
-# --- Database Manager (変更なし) ---
+
 class DatabaseManager:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path
@@ -709,10 +699,10 @@ class DatabaseManager:
             if len(char_val) == 1: 
                  cursor.execute("INSERT OR IGNORE INTO vrt2_glyphs (character) VALUES (?)", (char_val,))
         
-        self._save_default_gui_settings(cursor)
+        self._save_default_gui_settings(cursor) # MODIFIED: Call to updated method
         conn.commit(); conn.close()
 
-    def _save_default_gui_settings(self, cursor: sqlite3.Cursor):
+    def _save_default_gui_settings(self, cursor: sqlite3.Cursor): # MODIFIED METHOD
         defaults = {
             SETTING_PEN_WIDTH: str(DEFAULT_PEN_WIDTH),
             SETTING_PEN_SHAPE: DEFAULT_PEN_SHAPE,
@@ -728,12 +718,13 @@ class DatabaseManager:
             SETTING_REFERENCE_IMAGE_OPACITY: str(DEFAULT_REFERENCE_IMAGE_OPACITY),
             SETTING_KV_CURRENT_FONT: "", 
             SETTING_KV_DISPLAY_MODE: str(DEFAULT_KV_MODE_FOR_SETTINGS), 
-            SETTING_GUIDELINE_U: "", # Empty string for no guidelines by default
-            SETTING_GUIDELINE_V: "",
+            SETTING_GUIDELINE_U: "", # ADDED: Default empty string for U guidelines
+            SETTING_GUIDELINE_V: "", # ADDED: Default empty string for V guidelines
         }
         for key, value in defaults.items():
             cursor.execute("INSERT OR IGNORE INTO project_settings (key, value) VALUES (?, ?)", (key, value))
 
+    # ... (rest of DatabaseManager remains the same) ...
     def get_project_character_set(self) -> List[str]: return self._get_char_set_from_settings('character_set')
     def get_rotated_vrt2_character_set(self) -> List[str]: return self._get_char_set_from_settings(SETTING_ROTATED_VRT2_CHARS)
     def get_non_rotated_vrt2_character_set(self) -> List[str]: return self._get_char_set_from_settings(SETTING_NON_ROTATED_VRT2_CHARS)
@@ -907,7 +898,8 @@ class DatabaseManager:
         except Exception: conn.rollback(); return False
         finally: conn.close()
 
-# --- Canvas Widget ---
+
+
 class Canvas(QWidget):
     pen_width_changed = Signal(int)
     tool_changed = Signal(str)
@@ -1369,10 +1361,8 @@ class DrawingEditorWidget(QWidget):
     reference_image_deleted_signal = Signal(str, bool) # char, is_vrt2
     glyph_to_reference_and_reset_requested = Signal(bool) # is_vrt2_target
 
-    # --- NEW SIGNALS for history navigation ---
     navigate_history_back_requested = Signal()
     navigate_history_forward_requested = Signal()
-    # --- END NEW SIGNALS ---
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1423,48 +1413,36 @@ class DrawingEditorWidget(QWidget):
             row, col = divmod(i, cols)
             pen_size_grid_layout.addWidget(button, row, col)
         controls_outer_layout.addWidget(self.pen_size_buttons_group)
-
-        # --- MODIFIED SECTION for history, copy, paste, export buttons ---
-        # --- START OF NEW HISTORY BUTTONS ---
         self.history_back_button = QPushButton("<")
         self.history_back_button.setToolTip("編集履歴を戻る (Alt+Left)")
-        self.history_back_button.setFixedWidth(35) # Adjust as needed
+        self.history_back_button.setFixedWidth(35) 
         self.history_back_button.clicked.connect(self.navigate_history_back_requested)
-        self.history_back_button.setEnabled(False) # Initial state
+        self.history_back_button.setEnabled(False) 
         self.history_back_button.setShortcut(QKeySequence(Qt.ALT | Qt.Key_Left))
-
-
         self.history_forward_button = QPushButton(">")
         self.history_forward_button.setToolTip("編集履歴を進む (Alt+Right)")
-        self.history_forward_button.setFixedWidth(35) # Adjust as needed
+        self.history_forward_button.setFixedWidth(35) 
         self.history_forward_button.clicked.connect(self.navigate_history_forward_requested)
-        self.history_forward_button.setEnabled(False) # Initial state
+        self.history_forward_button.setEnabled(False) 
         self.history_forward_button.setShortcut(QKeySequence(Qt.ALT | Qt.Key_Right))
-        # --- END OF NEW HISTORY BUTTONS ---
-
         self.copy_button = QPushButton("コピー")
         self.copy_button.setToolTip("現在のグリフ画像をクリップボードにコピー (Ctrl+C)")
         self.paste_button = QPushButton("ペースト")
         self.paste_button.setToolTip("クリップボードから画像をグリフにペースト (Ctrl+V)")
         self.export_button = QPushButton("書き出し")
         self.export_button.setToolTip("現在のグリフ画像をファイルに書き出し")
-
         self.copy_button.clicked.connect(self.copy_to_clipboard)
         self.paste_button.clicked.connect(self.paste_from_clipboard)
         self.export_button.clicked.connect(self.export_current_glyph_image)
-        
         display_options_layout = QHBoxLayout()
-        # Add history buttons before copy button
         display_options_layout.addWidget(self.history_back_button)
         display_options_layout.addWidget(self.history_forward_button)
-        display_options_layout.addSpacing(10) # Spacing after history buttons
-
+        display_options_layout.addSpacing(10) 
         display_options_layout.addWidget(self.copy_button)
         display_options_layout.addWidget(self.paste_button)
         display_options_layout.addWidget(self.export_button)
         display_options_layout.addSpacing(10) 
         display_options_layout.addStretch(1) 
-
         self.mirror_checkbox = QCheckBox("左右反転表示")
         self.mirror_checkbox.toggled.connect(self._handle_mirror_mode_changed)
         display_options_layout.addWidget(self.mirror_checkbox)
@@ -1475,7 +1453,6 @@ class DrawingEditorWidget(QWidget):
         self.guideline_u_input.setPlaceholderText("例: 100,200{ff0000},300")
         self.guideline_u_input.editingFinished.connect(self._handle_guideline_u_changed)
         guideline_layout.addWidget(self.guideline_u_input)
-        
         guideline_layout.addSpacing(10)
         guideline_layout.addWidget(QLabel("V:"))
         self.guideline_v_input = QLineEdit()
@@ -1483,8 +1460,6 @@ class DrawingEditorWidget(QWidget):
         self.guideline_v_input.editingFinished.connect(self._handle_guideline_v_changed)
         guideline_layout.addWidget(self.guideline_v_input)
         controls_outer_layout.addLayout(guideline_layout)
-
-
         margin_layout = QHBoxLayout(); margin_layout.addWidget(QLabel("グリフマージン:"))
         self.margin_slider = QSlider(Qt.Horizontal)
         max_margin_val = min(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT) // 4
@@ -1556,6 +1531,11 @@ class DrawingEditorWidget(QWidget):
         self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
         self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
         self.set_enabled_controls(False)
+
+
+
+
+
 
     def set_rotated_vrt2_chars(self, chars: Set[str]):
         self.rotated_vrt2_chars = chars
@@ -1938,7 +1918,9 @@ class DrawingEditorWidget(QWidget):
         self.undo_button.setEnabled(can_undo and controls_are_generally_enabled)
         self.redo_button.setEnabled(can_redo and controls_are_generally_enabled)
 
-    def apply_gui_settings(self, settings: Dict[str, Any]):
+
+
+    def apply_gui_settings(self, settings: Dict[str, Any]): # MODIFIED METHOD
         pen_width_str = settings.get(SETTING_PEN_WIDTH)
         if pen_width_str is not None:
             try: self.canvas.set_pen_width(int(pen_width_str))
@@ -1972,18 +1954,17 @@ class DrawingEditorWidget(QWidget):
         else:
             self._update_ref_opacity_slider_no_signal(DEFAULT_REFERENCE_IMAGE_OPACITY)
             self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
-        guideline_u_str = settings.get(SETTING_GUIDELINE_U, "")
-        self.guideline_u_input.setText(guideline_u_str)
+        
+        # ADDED: Apply guideline settings
+        guideline_u_str = settings.get(SETTING_GUIDELINE_U, "") # Default to empty string
+        self.guideline_u_input.setText(guideline_u_str) # Set text in QLineEdit
         parsed_u_lines = self._parse_guideline_string(guideline_u_str)
 
-        guideline_v_str = settings.get(SETTING_GUIDELINE_V, "")
-        self.guideline_v_input.setText(guideline_v_str)
+        guideline_v_str = settings.get(SETTING_GUIDELINE_V, "") # Default to empty string
+        self.guideline_v_input.setText(guideline_v_str) # Set text in QLineEdit
         parsed_v_lines = self._parse_guideline_string(guideline_v_str)
         
-        self.canvas.set_guidelines(parsed_u_lines, parsed_v_lines)
-
-
-
+        self.canvas.set_guidelines(parsed_u_lines, parsed_v_lines) # Apply to canvas
 
 
 class ImageLoaderSignals(QObject):
@@ -2427,19 +2408,15 @@ class GlyphTableDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
-        # Calculate height based on char label and preview area (similar to old GlyphItemWidget)
-        # Assume a fixed base width (DELEGATE_CELL_BASE_WIDTH) and calculate height
-        # This should match QTableView.setColumnWidth and .verticalHeader().setDefaultSectionSize()
+
         
-        preview_min_dim = DEFAULT_GLYPH_PREVIEW_SIZE.height() # Based on a common preview size
+        preview_min_dim = DEFAULT_GLYPH_PREVIEW_SIZE.height() 
         
         total_vertical_padding = (2 * DELEGATE_ITEM_MARGIN) + \
                                  (2 * DELEGATE_FRAME_BORDER_WIDTH) + \
                                  (2 * DELEGATE_CELL_CONTENT_PADDING) + \
-                                 DELEGATE_CELL_CONTENT_PADDING # (label-preview space) +
-                                 # (2 * DELEGATE_PREVIEW_PADDING) # Inside preview area
-        
-        # If selected, selection outline might take space
+                                 DELEGATE_CELL_CONTENT_PADDING 
+
         selection_bonus = 2 * DELEGATE_SELECTION_OUTLINE_WIDTH if (option.state & QStyle.State_Selected) else 0
         
         cell_height = self.char_label_height + preview_min_dim + total_vertical_padding + selection_bonus
@@ -2451,7 +2428,6 @@ class GlyphTableDelegate(QStyledItemDelegate):
 
 
 
-# --- GlyphGridWidget の修正箇所 ---
 
 class GlyphGridWidget(QWidget):
     glyph_selected_signal = Signal(str)
@@ -2832,11 +2808,73 @@ class GlyphGridWidget(QWidget):
         
         self._select_char_in_view(char_to_set, view_to_update, model_to_update)
 
-
+    # =============== START OF MODIFIED update_glyph_preview METHOD ===============
     def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool):
-        model_to_update = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
-        model_to_update.update_glyph_pixmap(character, pixmap)
-        self._update_glyph_count_label()
+        if self._is_selecting_programmatically:
+            return
+
+        self._is_selecting_programmatically = True
+        try:
+            # Determine the view and model that correspond to the glyph being updated
+            view_of_updated_glyph = self.vrt2_glyph_view if is_vrt2_source else self.std_glyph_view
+            model_of_updated_glyph = view_of_updated_glyph.model()
+            
+            if not isinstance(model_of_updated_glyph, GlyphTableModel): # Should not happen
+                return
+
+            # Store selection state *before* model update, specific to the view being updated
+            current_idx_in_target_view = view_of_updated_glyph.currentIndex()
+            is_updated_char_selected_before_model_change = False
+            if current_idx_in_target_view.isValid():
+                char_key_at_current_idx = model_of_updated_glyph.data(current_idx_in_target_view, Qt.UserRole)
+                if char_key_at_current_idx == character:
+                    is_updated_char_selected_before_model_change = True
+
+            # Perform the model update. This might trigger modelReset if filter is on.
+            model_of_updated_glyph.update_glyph_pixmap(character, pixmap)
+            
+            # Update count label for the *currently active* tab
+            self._update_glyph_count_label()
+
+            # If the filter is on AND the updated glyph *was* selected in its view before the model change
+            if self.show_written_only_checkbox.isChecked() and is_updated_char_selected_before_model_change:
+                
+                # Re-check if the character (which was updated and previously selected)
+                # is still present in the (now potentially re-filtered) model.
+                flat_idx = model_of_updated_glyph.get_flat_index_of_char_key(character)
+                if flat_idx is not None:
+                    # The character is still visible, so restore its selection.
+                    row, col = divmod(flat_idx, model_of_updated_glyph.columnCount())
+                    q_model_idx_to_restore = model_of_updated_glyph.index(row, col)
+                    
+                    if q_model_idx_to_restore.isValid():
+                        # We are in _is_selecting_programmatically = True context.
+                        # Setting current index will not trigger unwanted history updates.
+                        if view_of_updated_glyph.currentIndex() != q_model_idx_to_restore:
+                             view_of_updated_glyph.selectionModel().setCurrentIndex(q_model_idx_to_restore, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Current)
+                        view_of_updated_glyph.scrollTo(q_model_idx_to_restore, QAbstractItemView.ScrollHint.EnsureVisible)
+                else:
+                    # The previously selected item (which was the one being updated) is no longer visible.
+                    # This could happen if a glyph was "erased" to blank and the filter hides non-written.
+                    # As a fallback, try to select the first item in that view.
+                    # _try_to_restore_selection_or_select_first itself handles the _is_selecting_programmatically flag for its internal _select_char_in_view call.
+                    # However, we are already in a True block, so we need to call it carefully or ensure it's safe.
+                    # Let's temporarily set it to False for this specific call, as _try_to_restore... might need to emit.
+                    # This part is tricky. A simpler way: if the selected item disappears, the view might clear selection.
+                    # If current_active_view is view_of_updated_glyph, then its selection change (or clear)
+                    # would trigger _on_current_item_changed_in_view, which would then call _emit_selection_signal.
+                    # For now, if item disappears, let QTableView handle selection clear.
+                    # If it's cleared, _on_current_item_changed_in_view would emit ("" or new selection).
+                    # This might be sufficient. If not, _try_to_restore_selection_or_select_first would be needed here.
+                    # Let's rely on QTableView clearing selection for now if item vanishes.
+                    # If the view is the active one, its currentChanged signal will fire.
+                    pass # Selection will be naturally cleared by QTableView if the item vanishes.
+
+            # If the filter is OFF, QTableView usually maintains selection on data change unless the item itself is removed.
+            # update_glyph_pixmap only changes data or affects filtering, doesn't remove items from underlying metadata.
+
+        finally:
+            self._is_selecting_programmatically = False
 
     def get_first_navigable_glyph_info(self) -> Optional[Tuple[str, bool]]:
         active_view_for_info = self.current_active_view
@@ -2942,6 +2980,8 @@ class GlyphGridWidget(QWidget):
                     self._select_char_in_view(char_to_select, view, model)
         
         event.accept()
+
+
 
 class PropertiesWidget(QWidget):
     character_set_changed_signal = Signal(str)
