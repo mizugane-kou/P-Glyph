@@ -1,5 +1,4 @@
 
-
 import sys
 import os
 import sqlite3
@@ -8,6 +7,11 @@ import re
 import json 
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any, Set, Union
+import cv2
+import numpy as np
+import math
+from scipy.spatial import cKDTree
+
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -115,6 +119,526 @@ DELEGATE_PLACEHOLDER_COLOR = QColor(220, 220, 220)
 DELEGATE_CELL_BASE_WIDTH = 80 # Approximate base width for item
 DELEGATE_GRID_COLUMNS = 5 # Number of columns in the table view grid
 
+def qpixmap_to_cv_np(pixmap: QPixmap) -> np.ndarray:
+    """QPixmapをOpenCVのnumpy配列(BGR)に変換する"""
+    qimage = pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
+    width, height = qimage.width(), qimage.height()
+    ptr = qimage.bits()
+    # ptr.setsize(...) の行を削除しました。memoryviewはサイズ指定が不要です。
+    # BGRAフォーマットで読み込み
+    arr = np.array(ptr).reshape(height, width, 4)
+    # BGRに変換
+    return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+
+def cv_np_to_qpixmap(cv_img: np.ndarray) -> QPixmap:
+    """OpenCVのnumpy配列をQPixmapに変換する"""
+    height, width, channel = cv_img.shape
+    if channel == 3: # BGR
+        bytes_per_line = 3 * width
+        q_img = QImage(cv_img.data, width, height, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
+    elif channel == 4: # BGRA
+        bytes_per_line = 4 * width
+        q_img = QImage(cv_img.data, width, height, bytes_per_line, QImage.Format_ARGB32)
+    else: # Grayscale
+        bytes_per_line = width
+        q_img = QImage(cv_img.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+    return QPixmap.fromImage(q_img)
+
+
+# --- 平滑化-角 調整可能なパラメータ  ---
+# 水平・垂直とみなす角度の許容範囲（度）。この範囲内であれば、直線は水平または垂直にスナップされる。
+HV_TOLERANCE = 6.0
+# セグメントを同一グループとして結合するための角度の許容範囲（度）。
+GROUPING_ANGLE_TOLERANCE = 12
+# ノイズとみなすセグメントの最大長さ（ピクセル）。これより短いセグメントはノイズとして結合対象になる。
+NOISE_LENGTH_THRESHOLD = 15.0
+# 直線を結合する際に、共線とみなす角度の許容範囲（度）。対角線も含む。
+DIAGONAL_ANGLE_TOLERANCE = 15.0
+# 特徴（線）の細さを判断する閾値（ピクセル）。KDTreeを用いて計算される局所的な厚みがこの値より小さい場合、細い特徴とみなされる。
+THIN_FEATURE_THRESHOLD = 10.0
+# 短い水平・垂直線を対角線にマージするための最大長さ（ピクセル）。
+# この値より短いH/V線で、両隣が対角線の場合にマージされる可能性がある。
+SHORT_HV_MERGE_THRESHOLD = 25.0
+# 斜め線を結合する際の角度の許容範囲（度）。この値が小さいほど厳密になる。
+DIAGONAL_MERGE_ANGLE_TOLERANCE = 20.0
+# 間の短い水平・垂直線を斜め線にマージする際の、斜め線の角度の許容範囲（度）。
+# マージされるH/V線の両隣の斜め線がこの角度範囲内にある必要がある。
+HV_TO_DIAGONAL_MERGE_ANGLE_TOLERANCE = 15.0
+# 間の短い水平・垂直線を斜め線にマージする際に、H/V線とみなす長さの閾値。
+# この値より短いH/V線がマージ対象となる。
+HV_TO_DIAGONAL_MERGE_LENGTH_THRESHOLD = 25.0
+
+# main.py の既存の定数
+IMG_WIDTH = 500
+IMG_HEIGHT = 500
+
+
+
+
+class ContourProcessor:
+    """輪郭処理のロジックをカプセル化するクラス（hosei_debug2.pyベース）"""
+
+    def __init__(self, image_np: np.ndarray):
+        """画像をNumpy配列として受け取り、前処理を行う"""
+        image = image_np
+        
+        # 色空間とフォーマットをBGRに統一
+        if len(image.shape) == 2 or image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
+        # 背景色判定と反転処理
+        # 左上のピクセルの平均輝度が128未満なら背景が暗いとみなし、色を反転する
+        if np.mean(image[0, 0]) < 128:
+            print("背景が暗いと判断し、色を反転します。")
+            image = cv2.bitwise_not(image)
+        
+        # main.pyの定数サイズにリサイズ
+        image = cv2.resize(image, (IMG_WIDTH, IMG_HEIGHT))
+        self.original_image = image
+
+    def run(self) -> Optional[np.ndarray]:
+        """全ての処理を実行し、処理後の画像をNumpy配列で返す"""
+        contours, hierarchy = self._find_contours()
+        if not contours:
+            return None
+
+        all_groups, all_contour_points = self._create_and_group_segments(contours)
+        if not all_groups:
+            return None
+
+        # hosei_debug2.pyからの処理フロー
+        merged_groups = self._merge_noisy_groups(all_groups, all_contour_points)
+        collinear_merged_groups = self._merge_collinear_groups(merged_groups)
+        snapped_groups = self._recalculate_and_snap_groups(collinear_merged_groups)
+        hv_merged_groups = self._merge_consecutive_hv_groups(snapped_groups)
+        diag_merged_groups = self._merge_consecutive_diagonal_groups(hv_merged_groups)
+        short_hv_merged_groups = self._merge_short_hv_into_diagonals(diag_merged_groups)
+        remerged_diag_groups = self._merge_consecutive_diagonal_groups(short_hv_merged_groups)
+        
+        cleanup_pass_2_hv = self._merge_short_hv_into_diagonals(remerged_diag_groups)
+        cleanup_pass_2_diag = self._merge_consecutive_diagonal_groups(cleanup_pass_2_hv)
+        
+        corrected_contours = self._correct_contours(cleanup_pass_2_diag)
+        final_contours = self._finalize_contour_alignment(corrected_contours)
+        
+        # 最終的に塗りつぶした画像を返す
+        final_filled_image = self._draw_filled_contour(final_contours)
+        
+        return final_filled_image
+
+    def _find_contours(self):
+        gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+        # hosei_debug2.pyの実装に合わせて輪郭検出方法を変更
+        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_TC89_L1)
+        return contours, hierarchy
+
+    def _create_and_group_segments(self, contours):
+        all_groups = []
+        all_contour_points = []
+        for contour in contours:
+            if len(contour) < 2: continue
+            contour_points = contour.squeeze(axis=1)
+            all_contour_points.append(contour_points)
+            segments = []
+            point_list = contour_points.tolist()
+            point_list.append(point_list[0])
+            points = np.array(point_list)
+            for i in range(len(points) - 1):
+                p1, p2 = points[i], points[i+1]
+                if np.array_equal(p1, p2): continue
+                original_angle = self._calculate_angle(p1, p2)
+                length = np.linalg.norm(p2 - p1)
+                segments.append({'p1': p1, 'p2': p2, 'original_angle': original_angle, 'len': length})
+            if not segments: continue
+            groups = []
+            current_group = [segments[0]]
+            for i in range(1, len(segments)):
+                if abs(self._angle_diff(segments[i]['original_angle'], current_group[-1]['original_angle'])) < GROUPING_ANGLE_TOLERANCE:
+                    current_group.append(segments[i])
+                else:
+                    groups.append(current_group)
+                    current_group = [segments[i]]
+            groups.append(current_group)
+            if len(groups) > 1 and abs(self._angle_diff(groups[0][0]['original_angle'], groups[-1][0]['original_angle'])) < GROUPING_ANGLE_TOLERANCE:
+                groups[0].extend(groups.pop(-1))
+            for group in groups: self._recalculate_single_group_angle(group, snap=False)
+            all_groups.append(groups)
+        return all_groups, all_contour_points
+
+    def _get_local_thickness(self, group, kdtree):
+        if not group: return float('inf')
+        group_points = np.array([s['p1'] for s in group])
+        if len(group_points) == 0: return float('inf')
+        midpoint = np.mean(group_points, axis=0)
+        distance, _ = kdtree.query(midpoint)
+        return distance
+    
+    def _merge_noisy_groups(self, all_groups, all_contour_points):
+        merged_all_groups = []
+        for i, groups in enumerate(all_groups):
+            contour_points = all_contour_points[i]
+            if len(groups) <= 2 or len(contour_points) == 0:
+                merged_all_groups.append(groups)
+                continue
+            kdtree = cKDTree(contour_points)
+            while True:
+                merged_in_pass = False
+                sorted_indices = sorted(range(len(groups)), key=lambda k: sum(s['len'] for s in groups[k]))
+                for group_idx in sorted_indices:
+                    if len(groups) <= 2: break
+                    group_to_check = groups[group_idx]
+                    group_len = sum(s['len'] for s in group_to_check)
+                    if group_len >= NOISE_LENGTH_THRESHOLD: continue
+                    thickness = self._get_local_thickness(group_to_check, kdtree)
+                    if thickness < THIN_FEATURE_THRESHOLD: continue
+                    num_groups = len(groups)
+                    prev_idx = (group_idx - 1 + num_groups) % num_groups
+                    next_idx = (group_idx + 1) % num_groups
+                    prev_group = groups[prev_idx]
+                    next_group = groups[next_idx]
+                    if self._angle_diff(prev_group[0]['angle'], next_group[0]['angle']) < DIAGONAL_ANGLE_TOLERANCE:
+                        group_to_merge_obj = groups[group_idx]
+                        if sum(s['len'] for s in prev_group) > sum(s['len'] for s in next_group):
+                            target_group = prev_group
+                        else:
+                            target_group = next_group
+                        target_group.extend(group_to_merge_obj)
+                        groups.remove(group_to_merge_obj)
+                        self._recalculate_single_group_angle(target_group, snap=False)
+                        merged_in_pass = True
+                        break
+                if not merged_in_pass: break
+            merged_all_groups.append(groups)
+        return merged_all_groups
+    
+    def _merge_collinear_groups(self, all_groups):
+        merged_all_groups = []
+        for groups in all_groups:
+            if len(groups) < 2:
+                merged_all_groups.append(groups)
+                continue
+            merged_in_pass = True
+            while merged_in_pass:
+                merged_in_pass = False
+                i = 0
+                while i < len(groups):
+                    num_groups = len(groups)
+                    if num_groups < 2: break
+                    current_group = groups[i]
+                    next_idx = (i + 1) % num_groups
+                    next_group = groups[next_idx]
+                    angle1 = current_group[0]['angle']
+                    angle2 = next_group[0]['angle']
+                    if self._angle_diff(angle1, angle2) < DIAGONAL_ANGLE_TOLERANCE:
+                        target_group = current_group
+                        group_to_merge_obj = next_group
+                        target_group.extend(group_to_merge_obj)
+                        groups.pop(next_idx)
+                        if next_idx < i: i -= 1
+                        self._recalculate_single_group_angle(target_group, snap=False)
+                        merged_in_pass = True
+                        i = 0
+                        continue
+                    i += 1
+            merged_all_groups.append(groups)
+        return merged_all_groups
+
+    def _recalculate_and_snap_groups(self, all_groups):
+        snapped_all_groups = []
+        for groups in all_groups:
+            new_groups = []
+            for group in groups:
+                if not group: continue
+                self._recalculate_single_group_angle(group, snap=True)
+                new_groups.append(group)
+            snapped_all_groups.append(new_groups)
+        return snapped_all_groups
+        
+    def _merge_consecutive_hv_groups(self, all_groups):
+        final_all_groups = []
+        for groups in all_groups:
+            if len(groups) < 2:
+                final_all_groups.append(groups)
+                continue
+            merged_groups = [groups[0]]
+            for i in range(1, len(groups)):
+                current_group, last_merged_group = groups[i], merged_groups[-1]
+                if current_group[0]['angle'] in [0.0, 90.0] and current_group[0]['angle'] == last_merged_group[0]['angle']:
+                    last_merged_group.extend(current_group)
+                else: merged_groups.append(current_group)
+            if len(merged_groups) > 1 and merged_groups[-1][0]['angle'] in [0.0, 90.0] and merged_groups[-1][0]['angle'] == merged_groups[0][0]['angle']:
+                merged_groups[0].extend(merged_groups.pop(-1))
+            final_all_groups.append(merged_groups)
+        return final_all_groups
+
+    def _merge_consecutive_diagonal_groups(self, all_groups):
+        final_all_groups = []
+        for groups in all_groups:
+            if len(groups) < 2:
+                final_all_groups.append(groups); continue
+            merged_groups = []
+            if not groups:
+                final_all_groups.append(merged_groups); continue
+            merged_groups.append(groups[0])
+            for i in range(1, len(groups)):
+                current_group = groups[i]
+                last_merged_group = merged_groups[-1]
+                is_last_diag = last_merged_group and last_merged_group[0]['angle'] not in [0.0, 90.0]
+                is_current_diag = current_group and current_group[0]['angle'] not in [0.0, 90.0]
+                if is_last_diag and is_current_diag and abs(self._angle_diff(last_merged_group[0]['angle'], current_group[0]['angle'])) < DIAGONAL_MERGE_ANGLE_TOLERANCE:
+                    last_merged_group.extend(current_group)
+                    self._recalculate_single_group_angle(last_merged_group, snap=False)
+                else:
+                    merged_groups.append(current_group)
+            if len(merged_groups) > 1:
+                first_group = merged_groups[0]
+                last_group = merged_groups[-1]
+                is_first_diag = first_group and first_group[0]['angle'] not in [0.0, 90.0]
+                is_last_diag = last_group and last_group[0]['angle'] not in [0.0, 90.0]
+                if first_group is not last_group and is_first_diag and is_last_diag and abs(self._angle_diff(first_group[0]['angle'], last_group[0]['angle'])) < DIAGONAL_MERGE_ANGLE_TOLERANCE:
+                    first_group.extend(merged_groups.pop(-1))
+                    self._recalculate_single_group_angle(first_group, snap=False)
+            final_all_groups.append(merged_groups)
+        return final_all_groups
+
+    def _merge_short_hv_into_diagonals(self, all_groups):
+        corrected_all_groups = []
+        for groups in all_groups:
+            if len(groups) < 3:
+                corrected_all_groups.append(groups); continue
+            merged_in_pass = True
+            while merged_in_pass:
+                merged_in_pass = False
+                num_groups = len(groups)
+                if num_groups < 3: break
+                # Use a while loop for safe index handling after pop
+                i = 0
+                while i < len(groups):
+                    num_groups = len(groups) # Recalculate size in each iteration
+                    current_idx = i
+                    prev_idx = (i - 1 + num_groups) % num_groups
+                    next_idx = (i + 1) % num_groups
+                    current_group, prev_group, next_group = groups[current_idx], groups[prev_idx], groups[next_idx]
+                    is_hv = current_group[0]['angle'] in [0.0, 90.0]
+                    is_short = sum(s['len'] for s in current_group) < HV_TO_DIAGONAL_MERGE_LENGTH_THRESHOLD
+                    if not (is_hv and is_short):
+                        i += 1
+                        continue
+                    is_prev_diag = prev_group[0]['angle'] not in [0.0, 90.0]
+                    is_next_diag = next_group[0]['angle'] not in [0.0, 90.0]
+                    if not (is_prev_diag and is_next_diag):
+                        i += 1
+                        continue
+                    if self._angle_diff(prev_group[0]['angle'], next_group[0]['angle']) < HV_TO_DIAGONAL_MERGE_ANGLE_TOLERANCE:
+                        prev_group.extend(current_group)
+                        prev_group.extend(next_group)
+                        self._recalculate_single_group_angle(prev_group, snap=False)
+                        
+                        # Determine which indices to pop based on their order
+                        if current_idx > next_idx:
+                            groups.pop(current_idx)
+                            groups.pop(next_idx)
+                        else:
+                            groups.pop(next_idx)
+                            groups.pop(current_idx)
+                        
+                        merged_in_pass = True
+                        break # Break from inner loop to restart scanning from the beginning
+                    else:
+                        i += 1 # Move to next group if no merge happened
+                if not merged_in_pass:
+                    break # Exit while loop if no merges in a full pass
+            corrected_all_groups.append(groups)
+        return corrected_all_groups
+
+    def _correct_contours(self, all_groups):
+        corrected_contours = []
+        for groups in all_groups:
+            if len(groups) < 2: continue
+            lines = []
+            for group in groups:
+                representative_angle_rad = np.deg2rad(group[0]['angle'])
+                points = np.array([s['p1'] for s in group] + [group[-1]['p2']])
+                centroid = np.mean(points, axis=0)
+                direction = np.array([np.cos(representative_angle_rad), np.sin(representative_angle_rad)])
+                p1, p2 = centroid - direction * 10000, centroid + direction * 10000
+                lines.append((p1, p2))
+
+            num_lines = len(lines)
+            if num_lines == 0: continue
+            new_points = []
+            for i in range(num_lines):
+                group1 = groups[i]
+                group2 = groups[(i + 1) % num_lines]
+                line1 = lines[i]
+                line2 = lines[(i + 1) % num_lines]
+                intersection_point = self._line_intersection(line1, line2)
+                if intersection_point is None:
+                    p1_end = group1[-1]['p2']
+                    p2_start = group2[0]['p1']
+                    intersection_point = tuple(np.mean([p1_end, p2_start], axis=0).astype(int))
+                new_points.append([intersection_point])
+            if new_points:
+                corrected_contours.append(np.array(new_points, dtype=np.int32))
+        return corrected_contours
+
+    def _finalize_contour_alignment(self, contours):
+        finalized_contours = []
+        ALIGN_TOLERANCE = 2.5
+        for contour in contours:
+            num_points = len(contour)
+            if num_points < 2:
+                finalized_contours.append(contour); continue
+            points = contour.copy().squeeze(axis=1)
+            new_points = points.copy()
+            edge_types = []
+            for i in range(num_points):
+                p1 = points[i]
+                p2 = points[(i + 1) % num_points]
+                angle = self._calculate_angle(p1, p2)
+                abs_angle = abs((angle + 180) % 360 - 180)
+                if abs_angle <= ALIGN_TOLERANCE or abs_angle >= (180 - ALIGN_TOLERANCE):
+                    edge_types.append(0) # Horizontal
+                elif abs(abs_angle - 90) <= ALIGN_TOLERANCE:
+                    edge_types.append(1) # Vertical
+                else:
+                    edge_types.append(-1) # Diagonal
+            for edge_type_to_process in [0, 1]:
+                i = 0
+                while i < num_points:
+                    if edge_types[i] == edge_type_to_process:
+                        j = i
+                        while edge_types[j % num_points] == edge_type_to_process:
+                            j += 1
+                        sequence_indices = [(k % num_points) for k in range(i, j + 1)]
+                        unique_indices = sorted(list(set(sequence_indices)))
+                        if edge_type_to_process == 0:
+                            coords = [new_points[k][1] for k in unique_indices]
+                            avg_coord = int(round(np.mean(coords)))
+                            for k in unique_indices: new_points[k][1] = avg_coord
+                        else:
+                            coords = [new_points[k][0] for k in unique_indices]
+                            avg_coord = int(round(np.mean(coords)))
+                            for k in unique_indices: new_points[k][0] = avg_coord
+                        i = j
+                    else:
+                        i += 1
+            finalized_contours.append(new_points.reshape(-1, 1, 2))
+        return finalized_contours
+
+    def _recalculate_single_group_angle(self, group, snap=True):
+        if not group: return
+        total_len = sum(s['len'] for s in group)
+        if total_len == 0:
+            final_angle = group[0].get('original_angle', 0.0)
+        else:
+            sum_x = sum(s['len'] * np.cos(np.deg2rad(s['original_angle'])) for s in group)
+            sum_y = sum(s['len'] * np.sin(np.deg2rad(s['original_angle'])) for s in group)
+            avg_original_angle = np.rad2deg(np.arctan2(sum_y, sum_x))
+            final_angle = self._snap_angle(avg_original_angle) if snap else avg_original_angle
+        for segment in group:
+            segment['angle'] = final_angle
+
+    @staticmethod
+    def _calculate_angle(p1, p2): 
+        dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
+        return np.rad2deg(np.arctan2(dy, dx))
+
+    @staticmethod
+    def _snap_angle(angle):
+        angle_180 = (angle + 180) % 360 - 180
+        abs_angle = abs(angle_180)
+        if abs_angle <= HV_TOLERANCE or abs_angle >= (180 - HV_TOLERANCE): return 0.0
+        if abs(abs_angle - 90) <= HV_TOLERANCE: return 90.0
+        return angle_180
+
+    @staticmethod
+    def _angle_diff(a1, a2):
+        diff = abs(a1 - a2)
+        while diff > 180: diff = 360 - diff
+        return diff
+
+    @staticmethod
+    def _line_intersection(line1, line2):
+        p1, p2 = line1; p3, p4 = line2
+        x1, y1 = p1; x2, y2 = p2; x3, y3 = p3; x4, y4 = p4
+        den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(den) < 1e-6: return None
+        t_num = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)
+        t = t_num / den
+        intersect_x = x1 + t * (x2 - x1); intersect_y = y1 + t * (y2 - y1)
+        return (int(round(intersect_x)), int(round(intersect_y)))
+
+    def _draw_filled_contour(self, contours) -> np.ndarray:
+        """指定された輪郭で塗りつぶした純粋な画像をNumpy配列として返す"""
+        img = np.full((IMG_HEIGHT, IMG_WIDTH, 3), 255, dtype=np.uint8)
+        if contours:
+            cv2.drawContours(img, contours, -1, (0, 0, 0), cv2.FILLED)
+        return img
+
+
+
+    def _handle_smooth_button_clicked(self):
+        """「平滑化-角」ボタンがクリックされたときの処理 (try...finally を使用)"""
+        try:
+            # グリフが選択されていない場合
+            if not self.canvas.current_glyph_character:
+                QMessageBox.warning(self, "グリフ未選択", "平滑化するグリフが選択されていません。")
+                return
+
+            # 1. 現在のグリフ画像を取得
+            current_pixmap = self.canvas.get_current_image()
+            
+            # 2. QPixmapをOpenCVのnumpy配列に変換
+            try:
+                cv_image = qpixmap_to_cv_np(current_pixmap)
+            except Exception as e:
+                QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
+                return
+                
+            # 3. ContourProcessorで平滑化処理を実行
+            try:
+                processor = ContourProcessor(cv_image)
+                smoothed_image_np = processor.run()
+
+                if smoothed_image_np is None:
+                    QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
+                    return
+
+            except Exception as e:
+                import traceback
+                QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
+                return
+                
+            # 4. 処理結果のnumpy配列をQPixmapに変換
+            smoothed_pixmap = cv_np_to_qpixmap(smoothed_image_np)
+
+            # 5. Canvasの表示を更新し、アンドゥスタックに保存
+            self.canvas.image = smoothed_pixmap
+            self.canvas._save_state_to_undo_stack()
+            self.canvas.update()
+
+            # 6. データベース保存のためにシグナルを発行
+            self.canvas.glyph_modified_signal.emit(
+                self.canvas.current_glyph_character,
+                self.canvas.image.copy(),
+                self.canvas.editing_vrt2_glyph
+            )
+            
+            # 7. ステータスバーにメッセージを表示
+            main_window = self.window()
+            if main_window and hasattr(main_window, 'statusBar'):
+                main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' を平滑化しました。", 3000)
+
+        finally:
+            # このブロックは、tryブロックの処理がどのように終了しても必ず実行される
+            # これにより、ダイアログ表示後でも確実にフォーカスがキャンバスに戻る
+            self.canvas.setFocus()
+
+
 
 
 def get_data_file_path(filename: str) -> str | None:
@@ -167,7 +691,8 @@ def find_kanji_by_shared_radical_per_radical(
             if filtered_kanji_list: results_per_radical[radical] = filtered_kanji_list
     return results_per_radical
 
-# --- カスタム縦書きタブバー (変更なし) ---
+
+# --- カスタム縦書きタブバー (フォーカス制御機能追加) ---
 class VerticalTabBar(QTabBar):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -196,6 +721,21 @@ class VerticalTabBar(QTabBar):
             return QSize(self.tab_fixed_width, self.char_height + 2 * self.vertical_padding)
         text_visual_height = self.char_height * len(text) + 2 * self.vertical_padding
         return QSize(self.tab_fixed_width, text_visual_height)
+
+    # ▼▼▼【ここからが追加/変更部分】▼▼▼
+    def mousePressEvent(self, event: QMouseEvent):
+        """
+        タブがクリックされた際に、デフォルトの動作を実行した後、
+        メインウィンドウのキャンバスにフォーカスを戻す。
+        """
+        super().mousePressEvent(event) # 本来のクリック処理を先に実行
+
+        # MainWindowインスタンスを探し、キャンバスにフォーカスをセットする
+        main_window = self.window()
+        if isinstance(main_window, MainWindow):
+            if main_window.drawing_editor_widget.canvas.current_glyph_character:
+                main_window.drawing_editor_widget.canvas.setFocus()
+    # ▲▲▲【ここまでが追加/変更部分】▲▲▲
 
     def paintEvent(self, event: QPaintEvent):
         painter = QPainter(self)
@@ -921,6 +1461,9 @@ class DatabaseManager:
         finally: conn.close()
 
 
+
+
+
 class Canvas(QWidget):
     brush_width_changed = Signal(int)   # ブラシ太さ変更シグナル
     eraser_width_changed = Signal(int)  # 消しゴム太さ変更シグナル
@@ -932,7 +1475,8 @@ class Canvas(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True) # Changed to ClickFocus
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True) 
+        self.setMouseTracking(True) # Enable mouse tracking for Shift hover preview
         self.ascender_height_for_baseline = DEFAULT_ASCENDER_HEIGHT
         self.glyph_margin_width: int = DEFAULT_GLYPH_MARGIN_WIDTH
         self.current_glyph_character: Optional[str] = None
@@ -944,8 +1488,8 @@ class Canvas(QWidget):
         self.reference_image: Optional[QPixmap] = None
         self.reference_image_opacity: float = DEFAULT_REFERENCE_IMAGE_OPACITY
         
-        self.brush_width = DEFAULT_PEN_WIDTH   # ブラシの太さ
-        self.eraser_width = DEFAULT_ERASER_WIDTH # 消しゴムの太さ
+        self.brush_width = DEFAULT_PEN_WIDTH   
+        self.eraser_width = DEFAULT_ERASER_WIDTH 
         
         self.pen_shape = Qt.RoundCap if DEFAULT_PEN_SHAPE == "丸" else Qt.SquareCap
         self.current_pen_color = QColor(Qt.black); self.last_brush_color = QColor(Qt.black)
@@ -956,6 +1500,14 @@ class Canvas(QWidget):
         self.current_tool = DEFAULT_CURRENT_TOOL
         self.guidelines_u: List[Tuple[int, QColor]] = []
         self.guidelines_v: List[Tuple[int, QColor]] = []
+        self.last_stroke_end_point: Optional[QPointF] = None 
+        self.straight_line_preview_active = False # Flag to indicate if line preview is active
+
+    def _reset_straight_line_mode(self):
+        self.straight_line_preview_active = False
+        self.current_path = QPainterPath() 
+        self.update() 
+
 
     def set_glyph_margin_width(self, width: int):
         max_margin = min(self.image_size.width(), self.image_size.height()) // 4
@@ -970,6 +1522,8 @@ class Canvas(QWidget):
             self.glyph_advance_width_changed.emit(width); self.update()
 
     def load_glyph(self, character: str, pixmap: Optional[QPixmap], reference_pixmap: Optional[QPixmap], advance_width: int, is_vrt2: bool = False):
+        self._reset_straight_line_mode() 
+        self.last_stroke_end_point = None 
         self.current_glyph_character = character; self.editing_vrt2_glyph = is_vrt2
         self.current_glyph_advance_width = advance_width; self.reference_image = reference_pixmap
         if pixmap:
@@ -995,66 +1549,81 @@ class Canvas(QWidget):
 
     def undo(self):
         if len(self.undo_stack) > 1:
+            self.last_stroke_end_point = None 
+            self._reset_straight_line_mode()
             popped_state = self.undo_stack.pop(); self.redo_stack.append(popped_state)
             self.image = self.undo_stack[-1].copy(); self.update(); self._emit_undo_redo_state()
             if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
 
     def redo(self):
         if self.redo_stack:
+            self.last_stroke_end_point = None 
+            self._reset_straight_line_mode()
             popped_state = self.redo_stack.pop(); self.undo_stack.append(popped_state)
             self.image = popped_state.copy(); self.update(); self._emit_undo_redo_state()
             if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
 
     def set_brush_width(self, width: int):
-        """ブラシの太さを設定します。"""
-        self.brush_width = max(1, width) # 最小値を1に制限
+        self.brush_width = max(1, width) 
         self.brush_width_changed.emit(self.brush_width)
-        if self.current_tool == "brush" and self.drawing and self.stroke_points:
-            self._rebuild_current_path_from_stroke_points(finalize=False)
+        if self.current_tool == "brush":
+            if self.drawing and self.stroke_points:
+                self._rebuild_current_path_from_stroke_points(finalize=False)
+            elif self.straight_line_preview_active and self.last_stroke_end_point:
+                self._rebuild_straight_line_preview(QCursor.pos()) # Rebuild with current cursor for width
 
     def set_eraser_width(self, width: int):
-        """消しゴムの太さを設定します。"""
-        self.eraser_width = max(1, width) # 最小値を1に制限
+        self.eraser_width = max(1, width) 
         self.eraser_width_changed.emit(self.eraser_width)
-        if self.current_tool == "eraser" and self.drawing and self.stroke_points:
-            self._rebuild_current_path_from_stroke_points(finalize=False)
+        if self.current_tool == "eraser":
+            if self.drawing and self.stroke_points:
+                self._rebuild_current_path_from_stroke_points(finalize=False)
+            elif self.straight_line_preview_active and self.last_stroke_end_point:
+                self._rebuild_straight_line_preview(QCursor.pos()) # Rebuild with current cursor for width
+
 
     def get_current_active_width(self) -> int:
-        """現在アクティブなツールの太さを取得します。"""
         if self.current_tool == "eraser":
             return self.eraser_width
-        return self.brush_width # デフォルトはブラシの太さ
+        return self.brush_width 
 
     def set_pen_shape(self, shape_name: str):
         if shape_name == "丸": self.pen_shape = Qt.RoundCap
         elif shape_name == "四角": self.pen_shape = Qt.SquareCap
-        # ペンの形状はブラシと消しゴムで共通なので、現在アクティブなツールに関わらず更新
-        if self.drawing and self.stroke_points:
+        if self.drawing and self.stroke_points: 
             self._rebuild_current_path_from_stroke_points(finalize=False)
+        elif self.straight_line_preview_active and self.last_stroke_end_point: 
+             self._rebuild_straight_line_preview(QCursor.pos())
+
 
     def set_current_pen_color(self, color: QColor):
         self.current_pen_color = color
         if self.drawing and self.stroke_points: self._rebuild_current_path_from_stroke_points(finalize=False)
+        elif self.straight_line_preview_active and self.last_stroke_end_point: 
+            self._rebuild_straight_line_preview(QCursor.pos())
 
     def set_eraser_mode(self):
+        self._reset_straight_line_mode()
         if self.move_mode: self.move_mode = False; self.unsetCursor()
         if self.current_pen_color != Qt.white: self.last_brush_color = self.current_pen_color
         self.set_current_pen_color(QColor(Qt.white))
         self.drawing = False
         self.current_tool = "eraser"
-        self.tool_changed.emit("eraser") # UI(スライダー等)更新のためシグナル発行
+        self.tool_changed.emit("eraser") 
         self.update()
 
     def set_brush_mode(self):
+        self._reset_straight_line_mode()
         if self.move_mode: self.move_mode = False; self.unsetCursor()
         self.set_current_pen_color(self.last_brush_color)
         self.drawing = False
         self.current_tool = "brush"
-        self.tool_changed.emit("brush") # UI(スライダー等)更新のためシグナル発行
+        self.tool_changed.emit("brush") 
         self.update()
 
     def set_mirror_mode(self, enabled: bool):
         if self.mirror_mode == enabled: return
+        self._reset_straight_line_mode()
         self.mirror_mode = enabled
         if self.drawing: self.drawing = False; self.stroke_points = []; self.current_path = QPainterPath()
         self.update()
@@ -1062,6 +1631,9 @@ class Canvas(QWidget):
     def set_move_mode(self, enabled: bool):
         if enabled and self.current_tool == "move": return
         if not enabled and self.current_tool != "move": return
+        
+        if enabled: 
+            self._reset_straight_line_mode()
 
         self.move_mode = enabled; self.moving_image = False; self.move_offset = QPointF()
         if enabled:
@@ -1097,13 +1669,25 @@ class Canvas(QWidget):
             path.cubicTo(QPointF(cp1_x, cp1_y), QPointF(cp2_x, cp2_y), p2)
         return path
 
-    def _rebuild_current_path_from_stroke_points(self, finalize=False): self.current_path = self._generate_path_from_points(self.stroke_points, finalize); self.update()
+    def _rebuild_current_path_from_stroke_points(self, finalize=False): 
+        self.current_path = self._generate_path_from_points(self.stroke_points, finalize)
+        self.update()
+
+    def _rebuild_straight_line_preview(self, current_mouse_view_pos: QPoint):
+        if self.last_stroke_end_point:
+            logical_end_pos = self._map_view_point_to_logical_point(QPointF(current_mouse_view_pos))
+            path = QPainterPath()
+            path.moveTo(self.last_stroke_end_point)
+            path.lineTo(logical_end_pos)
+            self.current_path = path
+            self.update()
+
 
     def _draw_path_on_painter(self, painter: QPainter, path_to_draw: QPainterPath):
         if path_to_draw.isEmpty(): return
         painter.setRenderHint(QPainter.Antialiasing, True)
         
-        active_width = float(self.get_current_active_width()) # 現在のツールに応じた太さを取得
+        active_width = float(self.get_current_active_width()) 
 
         if self.pen_shape == Qt.RoundCap:
             pen = QPen(self.current_pen_color, active_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
@@ -1119,7 +1703,7 @@ class Canvas(QWidget):
                 painter.drawRect(rect)
                 return
             
-            sampling_step_length = max(1.0, active_width / 10.0) # ステップ長もアクティブな太さに応じる
+            sampling_step_length = max(1.0, active_width / 10.0) 
             num_samples = 0
             if sampling_step_length > 0: num_samples = max(1, int(path_length / sampling_step_length))
             else: num_samples = 1
@@ -1160,10 +1744,14 @@ class Canvas(QWidget):
         temp_pixmap_for_drawing_content = QPixmap(self.image_size)
         temp_pixmap_for_drawing_content.fill(Qt.transparent)
         image_content_painter = QPainter(temp_pixmap_for_drawing_content)
-        image_content_painter.drawPixmap(0,0, self.image)
-        if not self.move_mode and self.drawing and not self.current_path.isEmpty():
-            self._draw_path_on_painter(image_content_painter, self.current_path)
+        
+        image_content_painter.drawPixmap(0,0, self.image) 
+        if not self.move_mode and not self.current_path.isEmpty():
+            if self.drawing or self.straight_line_preview_active:
+                 self._draw_path_on_painter(image_content_painter, self.current_path)
         image_content_painter.end()
+
+
         preview_draw_offset = QPointF(0,0)
         if self.move_mode and self.moving_image: preview_draw_offset = self.move_offset
         if self.mirror_mode:
@@ -1193,17 +1781,15 @@ class Canvas(QWidget):
         guideline_pen.setWidth(1)
         guideline_pen.setCosmetic(True)
 
-        # Draw U-direction guidelines (horizontal lines)
         for pos_y, color in self.guidelines_u:
-            if 0 <= pos_y <= 1000: # Assuming coords are 0-1000 range
+            if 0 <= pos_y <= 1000: 
                 line_y_canvas = (float(pos_y) / 1000.0) * img_height
                 guideline_pen.setColor(color)
                 canvas_painter.setPen(guideline_pen)
                 canvas_painter.drawLine(QPointF(0, line_y_canvas), QPointF(img_width, line_y_canvas))
 
-        # Draw V-direction guidelines (vertical lines)
         for pos_x, color in self.guidelines_v:
-            if 0 <= pos_x <= 1000: # Assuming coords are 0-1000 range
+            if 0 <= pos_x <= 1000: 
                 line_x_canvas_orig = (float(pos_x) / 1000.0) * img_width
                 line_x_to_draw = line_x_canvas_orig
                 if self.mirror_mode:
@@ -1216,25 +1802,17 @@ class Canvas(QWidget):
         adv_pen = QPen(QColor(255, 0, 0, 180), 1, Qt.DotLine); adv_pen.setCosmetic(True)
         canvas_painter.setPen(adv_pen)
         
-        # --- MODIFIED SECTION START for advance width line ---
         if self.editing_vrt2_glyph:
-            # Vertical advance line (horizontal line on canvas)
-            # This line spans the full width, so horizontal mirroring doesn't change its visual representation.
             line_y_canvas_adv = (float(self.current_glyph_advance_width) / 1000.0) * img_height
             if line_y_canvas_adv >= 0 :
                 canvas_painter.drawLine(QPointF(0, line_y_canvas_adv), QPointF(img_width, line_y_canvas_adv))
         else:
-            # Horizontal advance line (vertical line on canvas)
             line_x_canvas_adv_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width
-            
             line_x_to_draw = line_x_canvas_adv_orig
             if self.mirror_mode:
-                # If mirrored, the advance line's X position is reflected across the image's vertical center.
                 line_x_to_draw = img_width - line_x_canvas_adv_orig
-            
-            if line_x_canvas_adv_orig >= 0: # Based on original value check
+            if line_x_canvas_adv_orig >= 0: 
                 canvas_painter.drawLine(QPointF(line_x_to_draw, 0), QPointF(line_x_to_draw, img_height))
-        # --- MODIFIED SECTION END for advance width line ---
 
         guideline_pen = QPen(QColor(180, 180, 180), 1, Qt.DashLine); guideline_pen.setCosmetic(True)
         canvas_painter.setPen(guideline_pen)
@@ -1252,37 +1830,25 @@ class Canvas(QWidget):
             margin_pen = QPen(QColor(100, 100, 200), 1, Qt.DotLine); margin_pen.setCosmetic(True)
             canvas_painter.setPen(margin_pen)
             
-            # --- MODIFIED SECTION START for margin box ---
             left_x, top_y, right_x, bottom_y = 0.0, 0.0, 0.0, 0.0
             
             if self.editing_vrt2_glyph:
-                # For vertical glyphs, horizontal mirroring doesn't change L/R margin positions
-                # relative to image edges, nor T/B margins.
                 left_x = base_margin_px
                 right_x = img_width - base_margin_px
                 top_y = base_margin_px
                 advance_edge_y = (float(self.current_glyph_advance_width) / 1000.0) * img_height
                 bottom_y = advance_edge_y - base_margin_px
-            else: # Standard horizontal glyph
+            else: 
                 advance_edge_x_orig = (float(self.current_glyph_advance_width) / 1000.0) * img_width
                 top_y = base_margin_px
-                # Assuming bottom margin is relative to the em-box bottom, not ascender/descender
                 fixed_bottom_em_box_edge = img_height 
                 bottom_y = fixed_bottom_em_box_edge - base_margin_px
-
                 if self.mirror_mode:
-                    # Mirrored:
-                    # The visual "left" side of the glyph box starts at the (mirrored) advance line.
-                    # Margin is inset from this mirrored advance line (which is now on the left).
                     left_x = (img_width - advance_edge_x_orig) + base_margin_px
-                    # The visual "right" side of the glyph box is the (mirrored) start of the glyph (image right edge).
-                    # Margin is inset from this image right edge.
                     right_x = img_width - base_margin_px
                 else:
-                    # Normal:
                     left_x = base_margin_px
                     right_x = advance_edge_x_orig - base_margin_px
-            # --- MODIFIED SECTION END for margin box ---
 
             margin_rect = QRectF(left_x, top_y, right_x - left_x, bottom_y - top_y)
             if margin_rect.isValid() and margin_rect.width() > 0 and margin_rect.height() > 0 :
@@ -1306,6 +1872,54 @@ class Canvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
+
+        is_shift_pressed = bool(event.modifiers() & Qt.ShiftModifier)
+        logical_pos = self._map_view_point_to_logical_point(event.position())
+
+        if self.current_tool in ["brush", "eraser"] and event.button() == Qt.LeftButton:
+            if is_shift_pressed:
+                self.drawing = False  
+                self.stroke_points = [] 
+                self.straight_line_preview_active = False # Finalize any active preview
+
+                if self.last_stroke_end_point is not None:
+                    # This is the second tap (or click after Shift was pressed)
+                    path_to_draw = QPainterPath()
+                    path_to_draw.moveTo(self.last_stroke_end_point)
+                    path_to_draw.lineTo(logical_pos)
+                    
+                    image_painter = QPainter(self.image)
+                    self._draw_path_on_painter(image_painter, path_to_draw)
+                    image_painter.end()
+
+                    self._save_state_to_undo_stack()
+                    if self.current_glyph_character:
+                        self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                    
+                    self.last_stroke_end_point = logical_pos 
+                    self.current_path = QPainterPath() 
+                    self.update()
+                else:
+                    # First tap with Shift, or no previous pen stroke.
+                    # Set this as the start point for a potential line.
+                    self.last_stroke_end_point = logical_pos
+                    # Start previewing immediately if Shift remains pressed.
+                    if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+                         self.straight_line_preview_active = True
+                         self._rebuild_straight_line_preview(event.position().toPoint()) # Use view pos for initial preview
+                    else: # Shift was released after click
+                         self._reset_straight_line_mode()
+                    self.update()
+                return 
+            else: # Regular click without Shift - start freehand drawing
+                self._reset_straight_line_mode() 
+                self.drawing = True
+                self.current_path = QPainterPath()
+                self.stroke_points = [logical_pos]
+                self._rebuild_current_path_from_stroke_points(finalize=False)
+                self.update()
+                return
+
         if self.move_mode:
             if event.button() == Qt.LeftButton:
                 image_rect_in_widget = QRectF(VIRTUAL_MARGIN, VIRTUAL_MARGIN, self.image_size.width(), self.image_size.height())
@@ -1313,29 +1927,103 @@ class Canvas(QWidget):
                     self.moving_image = True; self.move_start_pos = event.position(); self.move_offset = QPointF()
                     self.setCursor(Qt.ClosedHandCursor); self.update()
             return
-        if event.button() == Qt.LeftButton:
-            self.drawing = True; self.current_path = QPainterPath(); self.stroke_points = []
-            logical_pos = self._map_view_point_to_logical_point(event.position())
-            self.stroke_points.append(logical_pos)
-            self._rebuild_current_path_from_stroke_points(finalize=False); self.update()
+
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
+
+        is_shift_pressed = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+        
+        if self.current_tool in ["brush", "eraser"]:
+            if is_shift_pressed and self.last_stroke_end_point is not None:
+                # Shift is held, and we have a starting point for a line. Preview it.
+                self.drawing = False # Ensure freehand mode is off
+                self.straight_line_preview_active = True
+                self._rebuild_straight_line_preview(event.position().toPoint())   # Use view coordinates for mapping
+                return # Handled by straight line preview
+            elif self.straight_line_preview_active and not is_shift_pressed:
+                # Shift was released while a line preview was active. Cancel preview.
+                self._reset_straight_line_mode()
+                # Do not return, allow freehand logic if button is pressed.
+
         if self.move_mode and self.moving_image:
             if event.buttons() & Qt.LeftButton:
                 current_pos = event.position(); delta = current_pos - self.move_start_pos
                 self.move_offset = delta
                 self.update()
             return
-        if (event.buttons() & Qt.LeftButton) and self.drawing:
-            view_pos = event.position()
-            logical_pos = self._map_view_point_to_logical_point(view_pos)
+
+        if (event.buttons() & Qt.LeftButton) and self.drawing: # Freehand drawing move
+            # Ensure line preview is not active if we are freehand dragging
+            if self.straight_line_preview_active:
+                self._reset_straight_line_mode()
+
+            logical_pos = self._map_view_point_to_logical_point(event.position())
             if not self.stroke_points or (logical_pos - self.stroke_points[-1]).manhattanLength() >= 1.0:
                 self.stroke_points.append(logical_pos)
-                self._rebuild_current_path_from_stroke_points(finalize=False); self.update()
+                self._rebuild_current_path_from_stroke_points(finalize=False)
+                # self.update() is called by _rebuild_...
+            return
+        
+        # If no buttons are pressed but Shift is, and we have a line start point, update preview
+        # This is now handled by the first block in this method (is_shift_pressed and self.last_stroke_end_point)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
+        
+        logical_pos_on_release = self._map_view_point_to_logical_point(event.position())
+
+        if event.button() == Qt.LeftButton:
+            if self.straight_line_preview_active:
+                # This means a line was being previewed (Shift was held, or was held during drag).
+                # The line is drawn on Press, so release for Shift+Drag does nothing extra to draw,
+                # but it should finalize the last_stroke_end_point.
+                # The actual drawing happens in mousePress on the *second* Shift+Click.
+                # If it was a Shift+ClickDragRelease, the line should be drawn.
+                # This state is tricky. `straight_line_preview_active` is set on Shift+Hover
+                # or Shift+Drag. If it was a pure Shift+Click (tap), this release finalizes that point.
+                
+                # Let's simplify: If straight_line_preview_active is true, it means Shift was involved.
+                # The line drawing logic is primarily in mousePress.
+                # This release should mainly update last_stroke_end_point if a line was drawn.
+                # And reset the preview state.
+                if self.last_stroke_end_point and (self.last_stroke_end_point - logical_pos_on_release).manhattanLength() >= 1.0:
+                    # This implies a drag occurred while previewing a line.
+                    # The line was actually drawn on the *initial* Shift+Press that started the drag,
+                    # or on the second Shift+Press for tap-tap.
+                    # This release effectively finalizes the *end point* of that drag if it happened.
+                    # However, the drawing command was on press.
+                    # Here, we just update the 'last_stroke_end_point' for the next potential line.
+                    self.last_stroke_end_point = logical_pos_on_release
+                
+                self._reset_straight_line_mode() # Always reset preview on release
+                self.update()
+                return
+
+            elif self.drawing: # Freehand drawing release
+                if self.stroke_points:
+                    if len(self.stroke_points) == 1 and self.stroke_points[0] == logical_pos_on_release: 
+                        self.stroke_points.append(logical_pos_on_release) 
+                    elif not self.stroke_points or (logical_pos_on_release - self.stroke_points[-1]).manhattanLength() >= 0.1:
+                        self.stroke_points.append(logical_pos_on_release)
+                    
+                    self._rebuild_current_path_from_stroke_points(finalize=True)
+                    if not self.current_path.isEmpty():
+                        image_painter = QPainter(self.image)
+                        self._draw_path_on_painter(image_painter, self.current_path)
+                        image_painter.end()
+                        self._save_state_to_undo_stack()
+                        if self.current_glyph_character: 
+                            self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                        
+                        if self.stroke_points:
+                             self.last_stroke_end_point = self.stroke_points[-1]
+                
+                self.drawing = False; self.stroke_points = []; self.current_path = QPainterPath()
+                self._reset_straight_line_mode() 
+                self.update()
+                return
+
         if self.move_mode and self.moving_image:
             if event.button() == Qt.LeftButton:
                 self._apply_image_move(self.move_offset)
@@ -1346,21 +2034,31 @@ class Canvas(QWidget):
                 if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
                 self.update()
             return
-        if event.button() == Qt.LeftButton and self.drawing:
-            if self.stroke_points:
-                view_pos = event.position()
-                final_logical_pos = self._map_view_point_to_logical_point(view_pos)
-                if len(self.stroke_points) == 1 and self.stroke_points[0] == final_logical_pos: pass
-                elif not self.stroke_points or (final_logical_pos - self.stroke_points[-1]).manhattanLength() >= 0.1:
-                    self.stroke_points.append(final_logical_pos)
-                self._rebuild_current_path_from_stroke_points(finalize=True)
-                if not self.current_path.isEmpty():
-                    image_painter = QPainter(self.image)
-                    self._draw_path_on_painter(image_painter, self.current_path)
-                    image_painter.end()
-                    self._save_state_to_undo_stack()
-                    if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
-            self.drawing = False; self.stroke_points = []; self.current_path = QPainterPath(); self.update()
+        
+    def keyPressEvent(self, event: QKeyEvent):
+        super().keyPressEvent(event)
+        if not self.current_glyph_character or self.drawing or self.move_mode:
+            return
+
+        if event.key() == Qt.Key_Shift and self.current_tool in ["brush", "eraser"]:
+            if self.last_stroke_end_point:
+                self.straight_line_preview_active = True
+                self._rebuild_straight_line_preview(self.mapFromGlobal(QCursor.pos()))
+            event.accept()
+        
+    def keyReleaseEvent(self, event: QKeyEvent):
+        super().keyReleaseEvent(event)
+        if not self.current_glyph_character:
+            return
+            
+        if event.key() == Qt.Key_Shift:
+            if self.straight_line_preview_active:
+                self._reset_straight_line_mode()
+            # If a Shift+Click tap set last_stroke_end_point, but no line was drawn
+            # and Shift is released, last_stroke_end_point remains for the next Shift+Click.
+            # No need to clear last_stroke_end_point here unless a line was actually previewed and cancelled.
+            event.accept()
+
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         mime_data = event.mimeData()
@@ -1394,11 +2092,16 @@ class Canvas(QWidget):
                 self.image = QPixmap.fromImage(final_image)
                 self._save_state_to_undo_stack()
                 if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                self.last_stroke_end_point = None 
+                self._reset_straight_line_mode()
                 self.update(); event.acceptProposedAction()
             except Exception as e:
                 QMessageBox.critical(self, "ドロップ処理エラー", f"画像の処理中にエラーが発生しました: {e}")
                 event.ignore()
         else: event.ignore()
+
+
+
 
 
 
@@ -1489,6 +2192,11 @@ class DrawingEditorWidget(QWidget):
         self.paste_button.setToolTip("クリップボードから画像をグリフにペースト (Ctrl+V)")
         self.export_button = QPushButton("書き出し")
         self.export_button.setToolTip("現在のグリフ画像をファイルに書き出し")
+
+        self.smooth_button = QPushButton("平滑化-角")
+        self.smooth_button.setToolTip("現在のグリフ画像に対して輪郭が滑らかな直線となるように平滑化します。")
+        self.smooth_button.clicked.connect(self._handle_smooth_button_clicked)
+
         self.copy_button.clicked.connect(self.copy_to_clipboard)
         self.paste_button.clicked.connect(self.paste_from_clipboard)
         self.export_button.clicked.connect(self.export_current_glyph_image)
@@ -1499,6 +2207,9 @@ class DrawingEditorWidget(QWidget):
         display_options_layout.addWidget(self.copy_button)
         display_options_layout.addWidget(self.paste_button)
         display_options_layout.addWidget(self.export_button)
+
+        display_options_layout.addWidget(self.smooth_button)
+
         display_options_layout.addSpacing(10) 
         display_options_layout.addStretch(1) 
         self.mirror_checkbox = QCheckBox("左右反転表示")
@@ -1933,6 +2644,70 @@ class DrawingEditorWidget(QWidget):
             elif character != '.notdef' and character in self.rotated_vrt2_chars: final_text += " vert-r"
         self.unicode_label.setText(final_text)
 
+
+# main.py の DrawingEditorWidget クラス内
+
+    def _handle_smooth_button_clicked(self):
+        """「平滑化-角」ボタンがクリックされたときの処理 (try...finally を使用)"""
+        try:
+            # グリフが選択されていない場合
+            if not self.canvas.current_glyph_character:
+                QMessageBox.warning(self, "グリフ未選択", "平滑化するグリフが選択されていません。")
+                return
+
+            # 1. 現在のグリフ画像を取得
+            current_pixmap = self.canvas.get_current_image()
+            
+            # 2. QPixmapをOpenCVのnumpy配列に変換
+            try:
+                cv_image = qpixmap_to_cv_np(current_pixmap)
+            except Exception as e:
+                QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
+                return
+                
+            # 3. ContourProcessorで平滑化処理を実行
+            try:
+                processor = ContourProcessor(cv_image)
+                smoothed_image_np = processor.run()
+
+                if smoothed_image_np is None:
+                    QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
+                    return
+
+            except Exception as e:
+                import traceback
+                QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
+                return
+                
+            # 4. 処理結果のnumpy配列をQPixmapに変換
+            smoothed_pixmap = cv_np_to_qpixmap(smoothed_image_np)
+
+            # 5. Canvasの表示を更新し、アンドゥスタックに保存
+            self.canvas.image = smoothed_pixmap
+            self.canvas._save_state_to_undo_stack()
+            self.canvas.update()
+
+            # 6. データベース保存のためにシグナルを発行
+            # 修正点: MainWindowが接続している self.canvas のシグナルを発行する
+            self.canvas.glyph_modified_signal.emit(
+                self.canvas.current_glyph_character,
+                self.canvas.image.copy(),
+                self.canvas.editing_vrt2_glyph
+            )
+            
+            # 7. ステータスバーにメッセージを表示
+            main_window = self.window()
+            if main_window and hasattr(main_window, 'statusBar'):
+                main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' を平滑化しました。", 3000)
+
+        finally:
+            # ★★★ このブロックは、tryブロックの処理がどのように終了しても必ず実行される ★★★
+            # これにより、ダイアログ表示後でも確実にフォーカスがキャンバスに戻る。
+            self.canvas.setFocus()
+
+
+
+
     def set_enabled_controls(self, enabled: bool):
         self.pen_button.setEnabled(enabled); self.eraser_button.setEnabled(enabled)
         self.move_button.setEnabled(enabled); self.slider.setEnabled(enabled)
@@ -1943,6 +2718,7 @@ class DrawingEditorWidget(QWidget):
         self.copy_button.setEnabled(enabled)
         self.paste_button.setEnabled(enabled)
         self.export_button.setEnabled(enabled)
+        self.smooth_button.setEnabled(enabled)
         self.mirror_checkbox.setEnabled(enabled)
         
         if not enabled: 
@@ -2215,8 +2991,6 @@ class GlyphTableModel(QAbstractTableModel):
 
             # If filter is on and item's visibility might have changed
             if self._show_written_only:
-                # Check if item *was not* in _filtered_indices but *now should be*
-                # This happens if has_initial_image was false, but now pixmap is loaded.
                 _, _, has_initial_image = self._glyph_metadata_all[original_idx_in_all]
                 was_visible_due_to_initial = has_initial_image 
                 
@@ -2257,8 +3031,6 @@ class GlyphTableModel(QAbstractTableModel):
     def _on_image_load_failed(self, char_key: str):
         if char_key in self._requested_to_load:
             self._requested_to_load.remove(char_key)
-        # Option: could store a "failed_to_load" marker in cache to prevent re-request spam
-        # For now, just removes from requested. If cell becomes visible again, it will re-request.
 
     def update_glyph_pixmap(self, char_key: str, pixmap: Optional[QPixmap]):
         # Called when a glyph is saved (potentially changing from None to Pixmap or vice versa)
@@ -2271,16 +3043,11 @@ class GlyphTableModel(QAbstractTableModel):
             self._pixmap_cache[char_key] = pixmap
 
         if self._show_written_only:
-            # If the filter is active, the "written" status might have changed,
-            # potentially altering the number of items in the filtered list.
-            # A full model reset is the safest way to handle this.
             self.beginResetModel()
             self._rebuild_filtered_indices() # This uses the now-updated _pixmap_cache
             self.endResetModel()
             return # Model reset takes care of UI updates.
-        
-        # If filter is not on, the item remains in the list; just its data changed.
-        # Find the cell and emit dataChanged for the specific item.
+
         try:
             original_idx_in_all = -1
             for i, (ck, _, _) in enumerate(self._glyph_metadata_all):
@@ -2290,10 +3057,6 @@ class GlyphTableModel(QAbstractTableModel):
             
             if original_idx_in_all == -1:
                 return # Character not found in metadata (should not happen if logic is correct)
-
-            # Since filter is off, _filtered_indices contains all indices from _glyph_metadata_all
-            # or at least, original_idx_in_all should map directly to its position if it exists.
-            # A more direct way if filter is off: flat_idx = original_idx_in_all
             if original_idx_in_all < len(self._filtered_indices): # Check if it's within current possibly filtered (though here assumed not)
                 flat_idx = self._filtered_indices.index(original_idx_in_all) # Find its position in the *filtered* list
                 row, col = divmod(flat_idx, self._column_count)
@@ -2301,9 +3064,6 @@ class GlyphTableModel(QAbstractTableModel):
                 if model_idx.isValid():
                     self.dataChanged.emit(model_idx, model_idx, [Qt.UserRole + 1])
         except ValueError:
-            # This might happen if original_idx_in_all is somehow not in _filtered_indices
-            # even when _show_written_only is false. This indicates a mismatch.
-            # However, if _show_written_only is false, _filtered_indices should map 1:1 to _glyph_metadata_all.
             pass
 
     def get_char_key_at_flat_index(self, flat_idx: int) -> Optional[str]:
@@ -2386,10 +3146,6 @@ class GlyphTableDelegate(QStyledItemDelegate):
 
         rect = option.rect
         palette = option.palette
-        
-        # Base background for the entire cell (respects view's alternating row colors if set)
-        # QStyledItemDelegate.paint(self, painter, option, index) # This would draw default item bg + text
-        # For full custom, fill it ourselves:
         painter.fillRect(rect, option.palette.color(QPalette.ColorRole.Base))
 
 
@@ -3737,6 +4493,7 @@ class MainWindow(QMainWindow):
 
 
 
+# In class MainWindow:
     @Slot(int, dict, str, int)
     def _handle_kv_related_kanji_result(self, process_id: int, results_dict: dict, font_family_from_worker: str, font_px_size: int):
         with QMutexLocker(self._worker_management_mutex):
@@ -3896,6 +4653,18 @@ class MainWindow(QMainWindow):
             tab_layout.setRowStretch(row + 1, 1); tab_layout.setColumnStretch(MAX_COLS, 1) 
             scroll_area = QScrollArea(); scroll_area.setWidgetResizable(True); scroll_area.setWidget(tab_content_widget)
             scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded); scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            
+            # ▼▼▼【ここからが追加部分】▼▼▼
+            def refocus_editor():
+                """エディタのキャンバスにフォーカスを戻すためのヘルパー関数"""
+                if self.drawing_editor_widget.canvas.current_glyph_character:
+                    self.drawing_editor_widget.canvas.setFocus()
+
+            # スクロールバーのいずれかのアクション（スライダーのプレス、矢印クリック等）でフォーカスを戻す
+            scroll_area.verticalScrollBar().actionTriggered.connect(refocus_editor)
+            scroll_area.horizontalScrollBar().actionTriggered.connect(refocus_editor)
+            # ▲▲▲【ここまでが追加部分】▲▲▲
+
             tab_idx = self.kanji_viewer_related_tabs.addTab(scroll_area, radical)
             if radical == current_tab_text_before_clear: new_selected_index_to_restore = tab_idx
 
@@ -4222,10 +4991,10 @@ class MainWindow(QMainWindow):
         else: 
             adv_width = DEFAULT_ADVANCE_WIDTH 
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
-            self.glyph_grid_widget.set_active_glyph(None)
+            self.glyph_grid_widget.set_active_glyph(None) 
             self.drawing_editor_widget.update_unicode_display(None)
             self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
-            self.drawing_editor_widget.canvas.setFocus()
+            self.drawing_editor_widget.canvas.setFocus() 
         
         self._update_bookmark_button_state()
         # _update_history_navigation_buttons is handled by _add_to_edit_history or _clear_edit_history
