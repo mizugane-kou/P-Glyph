@@ -839,18 +839,23 @@ class WorkerBaseSignals(QObject):
 class SaveGlyphWorkerSignals(WorkerBaseSignals):
     result = Signal(str, QPixmap, bool)
 
+
+
 class SaveGlyphWorker(QRunnable):
-    def __init__(self, db_path: str, character: str, pixmap: QPixmap, is_vrt2_glyph: bool = False):
+    def __init__(self, db_path: str, character: str, pixmap: QPixmap, is_vrt2_glyph: bool, mutex: QMutex): # <--- 修正
         super().__init__()
         self.db_path = db_path
         self.character = character
         self.pixmap = pixmap.copy()
         self.is_vrt2_glyph = is_vrt2_glyph
+        self.mutex = mutex  # <--- 追加
         self.signals = SaveGlyphWorkerSignals()
 
     @Slot()
     def run(self):
         try:
+            locker = QMutexLocker(self.mutex)  # <--- 追加
+
             byte_array = QByteArray()
             buffer = QBuffer(byte_array)
             buffer.open(QIODevice.WriteOnly)
@@ -890,17 +895,21 @@ class SaveGlyphWorker(QRunnable):
         finally:
             self.signals.finished.emit()
 
+
 class SaveGuiStateWorker(QRunnable):
-    def __init__(self, db_path: str, key: str, value: str):
+    def __init__(self, db_path: str, key: str, value: str, mutex: QMutex): # <--- 修正
         super().__init__()
         self.db_path = db_path
         self.key = key
         self.value = str(value) # Ensure value is string
+        self.mutex = mutex  # <--- 追加
         self.signals = WorkerBaseSignals()
 
     @Slot()
     def run(self):
         try:
+            locker = QMutexLocker(self.mutex) # <--- 追加
+
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save GUI setting '{self.key}': DB path not set.")
                 return
@@ -916,16 +925,19 @@ class SaveGuiStateWorker(QRunnable):
             self.signals.finished.emit()
 
 class SaveAdvanceWidthWorker(QRunnable):
-    def __init__(self, db_path: str, character: str, advance_width: int):
+    def __init__(self, db_path: str, character: str, advance_width: int, mutex: QMutex): # <--- 修正
         super().__init__()
         self.db_path = db_path
         self.character = character
         self.advance_width = advance_width
+        self.mutex = mutex  # <--- 追加
         self.signals = WorkerBaseSignals()
 
     @Slot()
     def run(self):
         try:
+            locker = QMutexLocker(self.mutex) # <--- 追加
+
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save advance width for '{self.character}': DB path not set.")
                 return
@@ -943,18 +955,23 @@ class SaveAdvanceWidthWorker(QRunnable):
 class SaveReferenceImageWorkerSignals(WorkerBaseSignals):
     result = Signal(str, QPixmap, bool) # char, pixmap_or_None, is_vrt2
 
+
+
 class SaveReferenceImageWorker(QRunnable):
-    def __init__(self, db_path: str, character: str, pixmap: Optional[QPixmap], is_vrt2_glyph: bool = False):
+    def __init__(self, db_path: str, character: str, pixmap: Optional[QPixmap], is_vrt2_glyph: bool, mutex: QMutex): # <--- 修正
         super().__init__()
         self.db_path = db_path
         self.character = character
         self.pixmap = pixmap.copy() if pixmap else None # Store copy or None
         self.is_vrt2_glyph = is_vrt2_glyph
+        self.mutex = mutex  # <--- 追加
         self.signals = SaveReferenceImageWorkerSignals()
 
     @Slot()
     def run(self):
         try:
+            locker = QMutexLocker(self.mutex) # <--- 追加
+
             image_data: Optional[bytes] = None
             if self.pixmap:
                 byte_array = QByteArray()
@@ -1939,7 +1956,7 @@ class Canvas(QWidget):
                 # Shift is held, and we have a starting point for a line. Preview it.
                 self.drawing = False # Ensure freehand mode is off
                 self.straight_line_preview_active = True
-                self._rebuild_straight_line_preview(event.position().toPoint())   # Use view coordinates for mapping
+                self._rebuild_straight_line_preview(event.position().toPoint()) # <--- 修正
                 return # Handled by straight line preview
             elif self.straight_line_preview_active and not is_shift_pressed:
                 # Shift was released while a line preview was active. Cancel preview.
@@ -1964,6 +1981,7 @@ class Canvas(QWidget):
                 self._rebuild_current_path_from_stroke_points(finalize=False)
                 # self.update() is called by _rebuild_...
             return
+        
         
         # If no buttons are pressed but Shift is, and we have a line start point, update preview
         # This is now handled by the first block in this method (is_shift_pressed and self.last_stroke_end_point)
@@ -4040,6 +4058,9 @@ class MainWindow(QMainWindow):
     KV_MODE_WRITTEN_GLYPHS = 1
     KV_MODE_HIDDEN = 2
 
+
+# MainWindowクラス内の__init__メソッドを以下に置き換えてください
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("P-Glyph")
@@ -4047,6 +4068,7 @@ class MainWindow(QMainWindow):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
 
         self.db_manager = DatabaseManager() 
+        self.db_mutex = QMutex()  # <--- この行を追加
         self.current_project_path: Optional[str] = None
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(QThread.idealThreadCount())
@@ -5098,7 +5120,7 @@ class MainWindow(QMainWindow):
     @Slot(str, QPixmap, bool)
     def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool): 
         if not self.current_project_path or self._project_loading_in_progress: return
-        worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2)
+        worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex) # <--- 修正
         worker.signals.result.connect(self.on_glyph_save_success)
         worker.signals.error.connect(self.on_glyph_save_error)
         self.thread_pool.start(worker)
@@ -5121,7 +5143,7 @@ class MainWindow(QMainWindow):
     @Slot(str, QPixmap, bool) 
     def save_reference_image_async(self, character: str, pixmap: QPixmap, is_vrt2: bool): 
         if self.current_project_path and character and not self._project_loading_in_progress:
-            worker = SaveReferenceImageWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2)
+            worker = SaveReferenceImageWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex) # <--- 修正
             worker.signals.result.connect(self.on_reference_image_save_success)
             worker.signals.error.connect(self.on_reference_image_save_error)
             self.thread_pool.start(worker)
@@ -5129,7 +5151,7 @@ class MainWindow(QMainWindow):
     @Slot(str, bool) 
     def handle_delete_reference_image_async(self, character: str, is_vrt2: bool): 
         if self.current_project_path and character and not self._project_loading_in_progress:
-            worker = SaveReferenceImageWorker(self.current_project_path, character, None, is_vrt2_glyph=is_vrt2) 
+            worker = SaveReferenceImageWorker(self.current_project_path, character, None, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex) # <--- 修正
             worker.signals.result.connect(self.on_reference_image_save_success)
             worker.signals.error.connect(self.on_reference_image_save_error)
             self.thread_pool.start(worker)
@@ -5151,10 +5173,11 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "下書き画像保存エラー", f"下書き画像の保存中にエラーが発生しました:\n{error_message}")
         self.statusBar().showMessage(f"下書き画像保存エラー: {error_message[:100]}...", 5000)
 
+
     @Slot(str, str)
     def save_gui_setting_async(self, key: str, value: str): 
         if self.current_project_path and not self._project_loading_in_progress:
-            worker = SaveGuiStateWorker(self.current_project_path, key, value)
+            worker = SaveGuiStateWorker(self.current_project_path, key, value, self.db_mutex) # <--- 修正
             worker.signals.error.connect(self.on_gui_save_error) 
             self.thread_pool.start(worker)
     
@@ -5165,7 +5188,7 @@ class MainWindow(QMainWindow):
     @Slot(str, int)
     def save_glyph_advance_width_async(self, character: str, advance_width: int): 
         if self.current_project_path and character and not self._project_loading_in_progress:
-            worker = SaveAdvanceWidthWorker(self.current_project_path, character, advance_width)
+            worker = SaveAdvanceWidthWorker(self.current_project_path, character, advance_width, self.db_mutex) # <--- 修正
             worker.signals.error.connect(self.on_gui_save_error) 
             self.thread_pool.start(worker)
 
@@ -5258,6 +5281,7 @@ class MainWindow(QMainWindow):
         current_char = self.drawing_editor_widget.canvas.current_glyph_character
         if current_char: self.load_glyph_for_editing(current_char, is_vrt2_edit_mode=is_editing_vrt2)
 
+
     @Slot()
     def handle_transfer_to_vrt2(self): 
         current_char = self.drawing_editor_widget.canvas.current_glyph_character
@@ -5272,7 +5296,7 @@ class MainWindow(QMainWindow):
             standard_pixmap = QPixmap(self.drawing_editor_widget.canvas.image_size); standard_pixmap.fill(QColor(Qt.white))
         try:
             pixmap_for_worker = standard_pixmap.copy() 
-            vrt2_save_worker = SaveGlyphWorker(self.current_project_path, current_char, pixmap_for_worker, is_vrt2_glyph=True)
+            vrt2_save_worker = SaveGlyphWorker(self.current_project_path, current_char, pixmap_for_worker, is_vrt2_glyph=True, mutex=self.db_mutex) # <--- 修正
             vrt2_save_worker.signals.result.connect(self._handle_transfer_to_vrt2_result)
             vrt2_save_worker.signals.error.connect(self._handle_transfer_to_vrt2_error)
             vrt2_save_worker.signals.finished.connect(self._reenable_vrt2_buttons_after_transfer) 
@@ -5307,6 +5331,7 @@ class MainWindow(QMainWindow):
         if not (current_status_msg.endswith("転送成功。") or "転送中にエラーが発生しました" in current_status_msg or "データ転送開始時にエラーが発生しました" in current_status_msg):
             self.statusBar().showMessage(f"'{char_display_name}' の縦書きグリフ転送処理完了。", 3000)
 
+
     @Slot(bool) 
     def handle_glyph_to_reference_and_reset(self, is_vrt2_target: bool): 
         if not self.current_project_path or self._project_loading_in_progress:
@@ -5318,17 +5343,17 @@ class MainWindow(QMainWindow):
         current_glyph_pixmap = canvas.get_current_image()
         if current_glyph_pixmap.isNull(): QMessageBox.information(self, "情報", "グリフに描画内容がありません。"); return
         self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(False); QApplication.processEvents()
-        ref_worker = SaveReferenceImageWorker(self.current_project_path, current_char, current_glyph_pixmap.copy(), is_vrt2_glyph=is_vrt2_target)
+        ref_worker = SaveReferenceImageWorker(self.current_project_path, current_char, current_glyph_pixmap.copy(), is_vrt2_glyph=is_vrt2_target, mutex=self.db_mutex) # <--- 修正
         ref_worker.signals.result.connect(self._on_glyph_to_ref_transfer_ref_save_success)
         ref_worker.signals.error.connect(lambda err: self._on_glyph_to_ref_transfer_error("下書き保存", err))
         ref_worker.signals.finished.connect(self._check_glyph_to_ref_reset_completion); self.thread_pool.start(ref_worker)
         blank_pixmap = QPixmap(canvas.image_size); blank_pixmap.fill(QColor(Qt.white))
         canvas.image = blank_pixmap.copy(); canvas._save_state_to_undo_stack(); canvas.update() 
-        glyph_worker = SaveGlyphWorker(self.current_project_path, current_char, blank_pixmap.copy(), is_vrt2_glyph=is_vrt2_target)
+        glyph_worker = SaveGlyphWorker(self.current_project_path, current_char, blank_pixmap.copy(), is_vrt2_glyph=is_vrt2_target, mutex=self.db_mutex) # <--- 修正
         glyph_worker.signals.result.connect(self._on_glyph_to_ref_transfer_glyph_reset_success)
         glyph_worker.signals.error.connect(lambda err: self._on_glyph_to_ref_transfer_error("グリフ白紙化", err))
         glyph_worker.signals.finished.connect(self._check_glyph_to_ref_reset_completion); self.thread_pool.start(glyph_worker)
-        self._glyph_to_ref_reset_op_count = 2 
+        self._glyph_to_ref_reset_op_count = 2
 
     _glyph_to_ref_reset_op_count = 0 
 
