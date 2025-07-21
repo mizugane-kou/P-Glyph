@@ -21,7 +21,7 @@ from fontTools.pens.pointPen import SegmentToPointPen
 from fontTools.pens.transformPen import TransformPointPen
 from fontTools.misc.transform import Transform
 import ufoLib2
-
+import multiprocessing
 
 
 
@@ -110,7 +110,7 @@ class FontBuildDBHelper:
         return row[0]['advance_width'] if row and row[0]['advance_width'] is not None else DEFAULT_ADVANCE_WIDTH
 
 # --- 画像からSVGへの変換ロジック (test1.pyベース) ---
-def smooth_contour_for_svg(contour, window_length=9, polyorder=3):
+def smooth_contour_for_svg(contour, window_length=6, polyorder=3):
     if len(contour) < window_length:
         return contour
     x_coords = savgol_filter(contour[:, 1], window_length, polyorder)
@@ -150,7 +150,7 @@ def image_to_smooth_svg(image_pil: Image.Image, svg_path_str: str, image_width: 
         if len(contour) < 5: 
             continue
         smoothed = smooth_contour_for_svg(contour, window_length=13, polyorder=3) 
-        simplified = measure.approximate_polygon(smoothed, tolerance=0.7) 
+        simplified = measure.approximate_polygon(smoothed, tolerance=0.5) 
         if len(simplified) < 3: 
             continue
         
@@ -233,6 +233,28 @@ def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Pa
             print(f"    エラー: {img_name_nr} (nrot) の保存に失敗 - {e}")
     print(f"  {len(nr_vrt2_glyphs)}個の非回転vrt2グリフ画像をエクスポートしました。")
 
+
+def process_single_image_to_svg(png_path: Path):
+    """単一のPNGファイルをSVGに変換するワーカー関数"""
+    svg_output_dir = png_path.parent.parent / SVG_SUBDIR_NAME # 親の親のsvgサブディレクトリ
+    svg_name = png_path.stem + ".svg"
+    svg_path = svg_output_dir / svg_name
+    
+    # メインプロセスに処理状況を出力させたい場合は、printの代わりに
+    # multiprocessing.Queue を使うか、単純にファイル名を返すようにする
+    # print(f"    変換中: {png_path.name} -> {svg_name}") # 並列化中はprintが混ざる可能性
+    
+    try:
+        img_pil = Image.open(png_path)
+        # 注意: canvas_width/heightは固定値で良いか確認
+        image_to_smooth_svg(img_pil, str(svg_path), 500, 500)
+        return (str(png_path), True, None)
+    except Exception as e:
+        import traceback
+        error_info = f"エラー: {png_path.name} のSVG変換に失敗 - {e}\n{traceback.format_exc()}"
+        return (str(png_path), False, error_info)
+
+
 def step2_convert_images_to_svg(img_source_dir: Path, svg_output_dir: Path):
     print("\nステップ2: 画像をSVGに変換中...")
     if svg_output_dir.exists():
@@ -243,21 +265,23 @@ def step2_convert_images_to_svg(img_source_dir: Path, svg_output_dir: Path):
     if not png_files:
         print("  変換対象のPNG画像が見つかりません。")
         return
-        
-    print(f"  {len(png_files)}個のPNG画像を処理します。")
-    for png_path in png_files:
-        svg_name = png_path.stem + ".svg" # Handles "_notdef.png" -> "_notdef.svg"
-        svg_path = svg_output_dir / svg_name
-        print(f"    変換中: {png_path.name} -> {svg_name}")
-        try:
-            img_pil = Image.open(png_path)
-            canvas_width, canvas_height = 500, 500 
-            image_to_smooth_svg(img_pil, str(svg_path), canvas_width, canvas_height)
-        except Exception as e:
-            import traceback
-            print(f"      エラー: {png_path.name} のSVG変換に失敗 - {e}")
-            print(traceback.format_exc())
-    print(f"  SVG変換処理完了。")
+
+    print(f"  {len(png_files)}個のPNG画像を並列処理します。")
+
+    # 利用可能なCPUコア数でプロセスプールを作成 (Noneで自動設定)
+    with multiprocessing.Pool(processes=None) as pool:
+        results = pool.map(process_single_image_to_svg, png_files)
+
+    # 結果の確認
+    success_count = 0
+    for path, success, error in results:
+        if success:
+            success_count += 1
+        else:
+            # エラーがあったファイルについて報告
+            print(f"      {error}")
+
+    print(f"  {success_count}/{len(png_files)} 個のSVG変換処理完了。")
 
 
 # --- UFO/OTFビルドロジック (test5.pyベース) ---
