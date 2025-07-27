@@ -8,7 +8,7 @@ if not exist venv (
 REM 仮想環境を有効化してpipアップグレード、ライブラリインストール
 call venv\Scripts\activate
 pip install --upgrade pip
-pip install PySide6 Pillow numpy scikit-image scipy svgwrite fonttools ufolib2 fontmake
+pip install PySide6 Pillow numpy scikit-image scipy svgwrite fonttools ufolib2 fontmake opencv-python
 
 
 echo --------------------------------------
