@@ -146,27 +146,16 @@ def cv_np_to_qpixmap(cv_img: np.ndarray) -> QPixmap:
 
 
 # --- 平滑化-角 調整可能なパラメータ  ---
-# 水平・垂直とみなす角度の許容範囲（度）。この範囲内であれば、直線は水平または垂直にスナップされる。
-HV_TOLERANCE = 6.0
-# セグメントを同一グループとして結合するための角度の許容範囲（度）。
-GROUPING_ANGLE_TOLERANCE = 12
-# ノイズとみなすセグメントの最大長さ（ピクセル）。これより短いセグメントはノイズとして結合対象になる。
-NOISE_LENGTH_THRESHOLD = 15.0
-# 直線を結合する際に、共線とみなす角度の許容範囲（度）。対角線も含む。
-DIAGONAL_ANGLE_TOLERANCE = 15.0
-# 特徴（線）の細さを判断する閾値（ピクセル）。KDTreeを用いて計算される局所的な厚みがこの値より小さい場合、細い特徴とみなされる。
-THIN_FEATURE_THRESHOLD = 10.0
-# 短い水平・垂直線を対角線にマージするための最大長さ（ピクセル）。
-# この値より短いH/V線で、両隣が対角線の場合にマージされる可能性がある。
-SHORT_HV_MERGE_THRESHOLD = 25.0
-# 斜め線を結合する際の角度の許容範囲（度）。この値が小さいほど厳密になる。
-DIAGONAL_MERGE_ANGLE_TOLERANCE = 20.0
-# 間の短い水平・垂直線を斜め線にマージする際の、斜め線の角度の許容範囲（度）。
-# マージされるH/V線の両隣の斜め線がこの角度範囲内にある必要がある。
-HV_TO_DIAGONAL_MERGE_ANGLE_TOLERANCE = 15.0
-# 間の短い水平・垂直線を斜め線にマージする際に、H/V線とみなす長さの閾値。
-# この値より短いH/V線がマージ対象となる。
-HV_TO_DIAGONAL_MERGE_LENGTH_THRESHOLD = 25.0
+# ユーザーのフィードバックに基づき、非常に厳密な直線性を要求する値に設定
+LINEARITY_THICKNESS_THRESHOLD = 2.0 
+# 太いグループを分割する際の角度変化の閾値は維持
+FAT_GROUP_SPLIT_ANGLE_THRESHOLD = 20.0
+
+SKIMAGE_CONTOUR_LEVEL = 90.0   # 輪郭を検出する輝度レベル
+HV_TOLERANCE = 6.0             # 水平・垂直とみなす角度の許容範囲（度）
+GROUPING_ANGLE_TOLERANCE = 15  # セグメントを同一グループとして結合するための角度の許容範囲（度）
+NOISE_LENGTH_THRESHOLD = 15.0  # ノイズとみなす短いグループの最大長（ピクセル）
+THIN_FEATURE_THRESHOLD = 10.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
 
 # main.py の既存の定数
 IMG_WIDTH = 500
@@ -175,8 +164,10 @@ IMG_HEIGHT = 500
 
 
 
+from skimage.measure import find_contours
+
 class ContourProcessor:
-    """輪郭処理のロジックをカプセル化するクラス（hosei_debug2.pyベース）"""
+    """輪郭処理のロジックをカプセル化するクラス（hosei_debug3.pyベース）"""
 
     def __init__(self, image_np: np.ndarray):
         """画像をNumpy配列として受け取り、前処理を行う"""
@@ -191,7 +182,6 @@ class ContourProcessor:
         # 背景色判定と反転処理
         # 左上のピクセルの平均輝度が128未満なら背景が暗いとみなし、色を反転する
         if np.mean(image[0, 0]) < 128:
-            print("背景が暗いと判断し、色を反転します。")
             image = cv2.bitwise_not(image)
         
         # main.pyの定数サイズにリサイズ
@@ -200,7 +190,7 @@ class ContourProcessor:
 
     def run(self) -> Optional[np.ndarray]:
         """全ての処理を実行し、処理後の画像をNumpy配列で返す"""
-        contours, hierarchy = self._find_contours()
+        contours = self._find_contours()
         if not contours:
             return None
 
@@ -208,20 +198,19 @@ class ContourProcessor:
         if not all_groups:
             return None
 
-        # hosei_debug2.pyからの処理フロー
+        # hosei_debug3.pyからの単純化された処理パイプライン
         merged_groups = self._merge_noisy_groups(all_groups, all_contour_points)
-        collinear_merged_groups = self._merge_collinear_groups(merged_groups)
-        snapped_groups = self._recalculate_and_snap_groups(collinear_merged_groups)
-        hv_merged_groups = self._merge_consecutive_hv_groups(snapped_groups)
-        diag_merged_groups = self._merge_consecutive_diagonal_groups(hv_merged_groups)
-        short_hv_merged_groups = self._merge_short_hv_into_diagonals(diag_merged_groups)
-        remerged_diag_groups = self._merge_consecutive_diagonal_groups(short_hv_merged_groups)
+        thickness_merged_groups = self._merge_groups_by_thickness(merged_groups)
+        split_groups = self._split_fat_groups(thickness_merged_groups)
         
-        cleanup_pass_2_hv = self._merge_short_hv_into_diagonals(remerged_diag_groups)
-        cleanup_pass_2_diag = self._merge_consecutive_diagonal_groups(cleanup_pass_2_hv)
+        # 新しい整形パイプライン
+        snapped_groups = self._recalculate_and_snap_groups(split_groups)
+        final_merged_groups = self._merge_consecutive_hv_groups(snapped_groups)
         
-        corrected_contours = self._correct_contours(cleanup_pass_2_diag)
-        final_contours = self._finalize_contour_alignment(corrected_contours)
+        # 最終的な輪郭生成
+        corrected_contours = self._correct_contours(final_merged_groups)
+        aligned_contours = self._finalize_contour_alignment(corrected_contours)
+        final_contours = self._apply_final_shift(aligned_contours)
         
         # 最終的に塗りつぶした画像を返す
         final_filled_image = self._draw_filled_contour(final_contours)
@@ -229,124 +218,247 @@ class ContourProcessor:
         return final_filled_image
 
     def _find_contours(self):
+        """輪郭を検出する (skimageを使用)"""
         gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
-        # hosei_debug2.pyの実装に合わせて輪郭検出方法を変更
-        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_TC89_L1)
-        return contours, hierarchy
+        gray_inverted = cv2.bitwise_not(gray)
+        contours_sk = find_contours(gray_inverted, level=SKIMAGE_CONTOUR_LEVEL)
+        
+        contours_cv = []
+        for contour in contours_sk:
+            contour_xy = contour[:, [1, 0]]
+            contour_cv_format = contour_xy.astype(np.int32).reshape(-1, 1, 2)
+            contours_cv.append(contour_cv_format)
+            
+        return contours_cv
+
+    def _apply_final_shift(self, contours):
+        """補正済みの最終輪郭に対して、ピクセルの左上角への描画を補正する最終シフトを適用"""
+        shifted_contours = []
+        is_in_top_sector = lambda angle: -45 <= angle <= 45
+        is_in_left_sector = lambda angle: -135 <= angle < -45
+
+        for contour in contours:
+            points = contour.squeeze(axis=1)
+            num_points = len(points)
+            if num_points < 2:
+                shifted_contours.append(contour)
+                continue
+
+            edge_shifts = []
+            for i in range(num_points):
+                p1, p2 = points[i], points[(i + 1) % num_points]
+                angle = self._calculate_angle(p1, p2)
+                shift = np.array([0, 0])
+                if is_in_top_sector(angle):
+                    shift = np.array([0, 1])
+                elif is_in_left_sector(angle):
+                    shift = np.array([1, 0])
+                edge_shifts.append(shift)
+
+            new_points = []
+            for i in range(num_points):
+                prev_edge_idx = (i - 1 + num_points) % num_points
+                p_prev_start, p_prev_end = points[prev_edge_idx], points[i]
+                prev_shift = edge_shifts[prev_edge_idx]
+                line1 = (p_prev_start + prev_shift, p_prev_end + prev_shift)
+                
+                curr_edge_idx = i
+                p_curr_start, p_curr_end = points[curr_edge_idx], points[(i + 1) % num_points]
+                curr_shift = edge_shifts[curr_edge_idx]
+                line2 = (p_curr_start + curr_shift, p_curr_end + curr_shift)
+                
+                intersection = self._line_intersection(line1, line2)
+                if intersection is not None:
+                    new_points.append(intersection)
+                else:
+                    new_points.append(tuple((p_curr_start + curr_shift).astype(int)))
+
+            shifted_contours.append(np.array(new_points, dtype=np.int32).reshape(-1, 1, 2))
+        return shifted_contours
 
     def _create_and_group_segments(self, contours):
-        all_groups = []
-        all_contour_points = []
+        """輪郭をセグメントに分割し、角度に基づいてグループ化する"""
+        all_groups, all_contour_points = [], []
         for contour in contours:
             if len(contour) < 2: continue
             contour_points = contour.squeeze(axis=1)
             all_contour_points.append(contour_points)
             segments = []
             point_list = contour_points.tolist()
-            point_list.append(point_list[0])
+            point_list.append(point_list[0]) # 閉じた輪郭にする
             points = np.array(point_list)
             for i in range(len(points) - 1):
                 p1, p2 = points[i], points[i+1]
                 if np.array_equal(p1, p2): continue
-                original_angle = self._calculate_angle(p1, p2)
-                length = np.linalg.norm(p2 - p1)
+                original_angle, length = self._calculate_angle(p1, p2), np.linalg.norm(p2 - p1)
                 segments.append({'p1': p1, 'p2': p2, 'original_angle': original_angle, 'len': length})
+            
             if not segments: continue
+            
             groups = []
-            current_group = [segments[0]]
-            for i in range(1, len(segments)):
-                if abs(self._angle_diff(segments[i]['original_angle'], current_group[-1]['original_angle'])) < GROUPING_ANGLE_TOLERANCE:
-                    current_group.append(segments[i])
-                else:
-                    groups.append(current_group)
-                    current_group = [segments[i]]
-            groups.append(current_group)
+            if segments:
+                current_group = [segments[0]]
+                for i in range(1, len(segments)):
+                    if abs(self._angle_diff(segments[i]['original_angle'], current_group[-1]['original_angle'])) < GROUPING_ANGLE_TOLERANCE:
+                        current_group.append(segments[i])
+                    else:
+                        groups.append(current_group)
+                        current_group = [segments[i]]
+                groups.append(current_group)
+
             if len(groups) > 1 and abs(self._angle_diff(groups[0][0]['original_angle'], groups[-1][0]['original_angle'])) < GROUPING_ANGLE_TOLERANCE:
                 groups[0].extend(groups.pop(-1))
+
             for group in groups: self._recalculate_single_group_angle(group, snap=False)
             all_groups.append(groups)
         return all_groups, all_contour_points
 
+    def _get_group_thickness(self, group):
+        """グループの厚みを最小外接矩形の短辺として計算する"""
+        if not group: return 0
+        points = np.array([s['p1'] for s in group] + [group[-1]['p2']], dtype=np.float32)
+        if len(points) < 3: return 0
+        rect = cv2.minAreaRect(points)
+        return min(rect[1])
+
+    def _merge_groups_by_thickness(self, all_groups):
+        """非常に直線的な（厚みが閾値以下の）隣接グループを統合する"""
+        merged_all_groups = []
+        for groups in all_groups:
+            if len(groups) < 2:
+                merged_all_groups.append(groups)
+                continue
+            
+            merged_in_pass = True
+            while merged_in_pass:
+                merged_in_pass = False
+                num_groups = len(groups)
+                if num_groups < 2: break
+                i = 0
+                while i < num_groups:
+                    current_group = groups[i]
+                    next_idx = (i + 1) % num_groups
+                    next_group = groups[next_idx]
+                    
+                    combined_points = np.array(
+                        [s['p1'] for s in current_group] + [current_group[-1]['p2']] +
+                        [s['p1'] for s in next_group] + [next_group[-1]['p2']], dtype=np.float32)
+                    
+                    if len(combined_points) < 3:
+                        i += 1
+                        continue
+
+                    combined_thickness = min(cv2.minAreaRect(combined_points)[1])
+                    
+                    if combined_thickness < LINEARITY_THICKNESS_THRESHOLD:
+                        current_group.extend(groups.pop(next_idx))
+                        self._recalculate_single_group_angle(current_group, snap=False)
+                        merged_in_pass = True
+                        num_groups = len(groups)
+                        i = -1 # Restart loop
+                    i += 1
+            merged_all_groups.append(groups)
+        return merged_all_groups
+
+    def _split_fat_groups(self, all_groups):
+        """厚みが閾値を超えるグループを、最も角度が変化する点で分割する"""
+        new_all_groups = []
+        for groups in all_groups:
+            if not groups:
+                new_all_groups.append(groups)
+                continue
+                
+            final_groups = []
+            group_queue = list(groups)
+            while group_queue:
+                group = group_queue.pop(0)
+                if len(group) <= 1:
+                    final_groups.append(group)
+                    continue
+                
+                if self._get_group_thickness(group) > LINEARITY_THICKNESS_THRESHOLD:
+                    max_angle_diff, split_index = 0, -1
+                    for i in range(len(group) - 1):
+                        diff = self._angle_diff(group[i]['original_angle'], group[i+1]['original_angle'])
+                        if diff > max_angle_diff:
+                            max_angle_diff, split_index = diff, i + 1
+                            
+                    if split_index != -1 and max_angle_diff > FAT_GROUP_SPLIT_ANGLE_THRESHOLD:
+                        group1 = group[:split_index]
+                        group2 = group[split_index:]
+                        if group1: group_queue.append(group1)
+                        if group2: group_queue.append(group2)
+                    else:
+                        final_groups.append(group)
+                else:
+                    final_groups.append(group)
+
+            for group in final_groups: self._recalculate_single_group_angle(group, snap=False)
+            new_all_groups.append(final_groups)
+        return new_all_groups
+
     def _get_local_thickness(self, group, kdtree):
+        """グループの中点から最も近い輪郭点までの距離（局所的な太さ）を計算"""
         if not group: return float('inf')
         group_points = np.array([s['p1'] for s in group])
         if len(group_points) == 0: return float('inf')
         midpoint = np.mean(group_points, axis=0)
         distance, _ = kdtree.query(midpoint)
         return distance
-    
+
     def _merge_noisy_groups(self, all_groups, all_contour_points):
+        """短いグループ（ノイズ）を隣接するグループに統合する"""
         merged_all_groups = []
         for i, groups in enumerate(all_groups):
-            contour_points = all_contour_points[i]
-            if len(groups) <= 2 or len(contour_points) == 0:
+            if not groups:
                 merged_all_groups.append(groups)
                 continue
-            kdtree = cKDTree(contour_points)
-            while True:
+            contour_points = all_contour_points[i]
+            if len(groups) <= 2:
+                merged_all_groups.append(groups)
+                continue
+            
+            kdtree = cKDTree(contour_points) if len(contour_points) > 0 else None
+            
+            merged_in_pass = True
+            while merged_in_pass:
                 merged_in_pass = False
+                if len(groups) <= 1: break
+                
                 sorted_indices = sorted(range(len(groups)), key=lambda k: sum(s['len'] for s in groups[k]))
+                
                 for group_idx in sorted_indices:
                     if len(groups) <= 2: break
                     group_to_check = groups[group_idx]
                     group_len = sum(s['len'] for s in group_to_check)
+                    
                     if group_len >= NOISE_LENGTH_THRESHOLD: continue
-                    thickness = self._get_local_thickness(group_to_check, kdtree)
-                    if thickness < THIN_FEATURE_THRESHOLD: continue
+                    if kdtree and self._get_local_thickness(group_to_check, kdtree) < THIN_FEATURE_THRESHOLD: continue
+                    
                     num_groups = len(groups)
                     prev_idx = (group_idx - 1 + num_groups) % num_groups
                     next_idx = (group_idx + 1) % num_groups
+                    
                     prev_group = groups[prev_idx]
                     next_group = groups[next_idx]
-                    if self._angle_diff(prev_group[0]['angle'], next_group[0]['angle']) < DIAGONAL_ANGLE_TOLERANCE:
-                        group_to_merge_obj = groups[group_idx]
-                        if sum(s['len'] for s in prev_group) > sum(s['len'] for s in next_group):
-                            target_group = prev_group
-                        else:
-                            target_group = next_group
-                        target_group.extend(group_to_merge_obj)
-                        groups.remove(group_to_merge_obj)
-                        self._recalculate_single_group_angle(target_group, snap=False)
+                    
+                    # 角度差が小さい（ほぼ平行な）グループに挟まれているノイズをマージする
+                    if self._angle_diff(prev_group[0]['angle'], next_group[0]['angle']) < 15.0: # 許容角度
+                        group_to_merge_obj = groups.pop(group_idx)
+                        
+                        # より長い方のグループにマージする
+                        target_group_idx = (group_idx - 1 + len(groups)) % len(groups) if sum(s['len'] for s in prev_group) > sum(s['len'] for s in next_group) else group_idx % len(groups)
+                        
+                        groups[target_group_idx].extend(group_to_merge_obj)
+                        self._recalculate_single_group_angle(groups[target_group_idx], snap=False)
                         merged_in_pass = True
-                        break
+                        break 
                 if not merged_in_pass: break
-            merged_all_groups.append(groups)
-        return merged_all_groups
-    
-    def _merge_collinear_groups(self, all_groups):
-        merged_all_groups = []
-        for groups in all_groups:
-            if len(groups) < 2:
-                merged_all_groups.append(groups)
-                continue
-            merged_in_pass = True
-            while merged_in_pass:
-                merged_in_pass = False
-                i = 0
-                while i < len(groups):
-                    num_groups = len(groups)
-                    if num_groups < 2: break
-                    current_group = groups[i]
-                    next_idx = (i + 1) % num_groups
-                    next_group = groups[next_idx]
-                    angle1 = current_group[0]['angle']
-                    angle2 = next_group[0]['angle']
-                    if self._angle_diff(angle1, angle2) < DIAGONAL_ANGLE_TOLERANCE:
-                        target_group = current_group
-                        group_to_merge_obj = next_group
-                        target_group.extend(group_to_merge_obj)
-                        groups.pop(next_idx)
-                        if next_idx < i: i -= 1
-                        self._recalculate_single_group_angle(target_group, snap=False)
-                        merged_in_pass = True
-                        i = 0
-                        continue
-                    i += 1
             merged_all_groups.append(groups)
         return merged_all_groups
 
     def _recalculate_and_snap_groups(self, all_groups):
+        """全グループの角度を再計算し、水平・垂直にスナップする"""
         snapped_all_groups = []
         for groups in all_groups:
             new_groups = []
@@ -356,180 +468,146 @@ class ContourProcessor:
                 new_groups.append(group)
             snapped_all_groups.append(new_groups)
         return snapped_all_groups
-        
+
     def _merge_consecutive_hv_groups(self, all_groups):
+        """連続する同じ角度の水平・垂直グループを統合する"""
         final_all_groups = []
         for groups in all_groups:
             if len(groups) < 2:
                 final_all_groups.append(groups)
                 continue
-            merged_groups = [groups[0]]
-            for i in range(1, len(groups)):
-                current_group, last_merged_group = groups[i], merged_groups[-1]
-                if current_group[0]['angle'] in [0.0, 90.0] and current_group[0]['angle'] == last_merged_group[0]['angle']:
-                    last_merged_group.extend(current_group)
-                else: merged_groups.append(current_group)
-            if len(merged_groups) > 1 and merged_groups[-1][0]['angle'] in [0.0, 90.0] and merged_groups[-1][0]['angle'] == merged_groups[0][0]['angle']:
-                merged_groups[0].extend(merged_groups.pop(-1))
-            final_all_groups.append(merged_groups)
-        return final_all_groups
-
-    def _merge_consecutive_diagonal_groups(self, all_groups):
-        final_all_groups = []
-        for groups in all_groups:
-            if len(groups) < 2:
-                final_all_groups.append(groups); continue
             merged_groups = []
-            if not groups:
-                final_all_groups.append(merged_groups); continue
-            merged_groups.append(groups[0])
-            for i in range(1, len(groups)):
-                current_group = groups[i]
-                last_merged_group = merged_groups[-1]
-                is_last_diag = last_merged_group and last_merged_group[0]['angle'] not in [0.0, 90.0]
-                is_current_diag = current_group and current_group[0]['angle'] not in [0.0, 90.0]
-                if is_last_diag and is_current_diag and abs(self._angle_diff(last_merged_group[0]['angle'], current_group[0]['angle'])) < DIAGONAL_MERGE_ANGLE_TOLERANCE:
-                    last_merged_group.extend(current_group)
-                    self._recalculate_single_group_angle(last_merged_group, snap=False)
-                else:
-                    merged_groups.append(current_group)
-            if len(merged_groups) > 1:
-                first_group = merged_groups[0]
-                last_group = merged_groups[-1]
-                is_first_diag = first_group and first_group[0]['angle'] not in [0.0, 90.0]
-                is_last_diag = last_group and last_group[0]['angle'] not in [0.0, 90.0]
-                if first_group is not last_group and is_first_diag and is_last_diag and abs(self._angle_diff(first_group[0]['angle'], last_group[0]['angle'])) < DIAGONAL_MERGE_ANGLE_TOLERANCE:
-                    first_group.extend(merged_groups.pop(-1))
-                    self._recalculate_single_group_angle(first_group, snap=False)
+            if groups:
+                merged_groups.append(groups[0])
+                for i in range(1, len(groups)):
+                    current_group, last_merged_group = groups[i], merged_groups[-1]
+                    is_current_hv = current_group[0]['angle'] in [0.0, 90.0]
+                    is_last_hv = last_merged_group[0]['angle'] in [0.0, 90.0]
+                    
+                    if is_current_hv and is_last_hv and current_group[0]['angle'] == last_merged_group[0]['angle']:
+                        last_merged_group.extend(current_group)
+                    else:
+                        merged_groups.append(current_group)
+                
+                # 輪郭の始点と終点が繋がっている場合のマージ処理
+                if len(merged_groups) > 1 and merged_groups[0] is not merged_groups[-1]:
+                    first_group = merged_groups[0]
+                    last_group = merged_groups[-1]
+                    is_first_hv = first_group[0]['angle'] in [0.0, 90.0]
+                    is_last_hv = last_group[0]['angle'] in [0.0, 90.0]
+                    if is_first_hv and is_last_hv and first_group[0]['angle'] == last_group[0]['angle']:
+                        first_group.extend(merged_groups.pop(-1))
+
             final_all_groups.append(merged_groups)
         return final_all_groups
-
-    def _merge_short_hv_into_diagonals(self, all_groups):
-        corrected_all_groups = []
-        for groups in all_groups:
-            if len(groups) < 3:
-                corrected_all_groups.append(groups); continue
-            merged_in_pass = True
-            while merged_in_pass:
-                merged_in_pass = False
-                num_groups = len(groups)
-                if num_groups < 3: break
-                # Use a while loop for safe index handling after pop
-                i = 0
-                while i < len(groups):
-                    num_groups = len(groups) # Recalculate size in each iteration
-                    current_idx = i
-                    prev_idx = (i - 1 + num_groups) % num_groups
-                    next_idx = (i + 1) % num_groups
-                    current_group, prev_group, next_group = groups[current_idx], groups[prev_idx], groups[next_idx]
-                    is_hv = current_group[0]['angle'] in [0.0, 90.0]
-                    is_short = sum(s['len'] for s in current_group) < HV_TO_DIAGONAL_MERGE_LENGTH_THRESHOLD
-                    if not (is_hv and is_short):
-                        i += 1
-                        continue
-                    is_prev_diag = prev_group[0]['angle'] not in [0.0, 90.0]
-                    is_next_diag = next_group[0]['angle'] not in [0.0, 90.0]
-                    if not (is_prev_diag and is_next_diag):
-                        i += 1
-                        continue
-                    if self._angle_diff(prev_group[0]['angle'], next_group[0]['angle']) < HV_TO_DIAGONAL_MERGE_ANGLE_TOLERANCE:
-                        prev_group.extend(current_group)
-                        prev_group.extend(next_group)
-                        self._recalculate_single_group_angle(prev_group, snap=False)
-                        
-                        # Determine which indices to pop based on their order
-                        if current_idx > next_idx:
-                            groups.pop(current_idx)
-                            groups.pop(next_idx)
-                        else:
-                            groups.pop(next_idx)
-                            groups.pop(current_idx)
-                        
-                        merged_in_pass = True
-                        break # Break from inner loop to restart scanning from the beginning
-                    else:
-                        i += 1 # Move to next group if no merge happened
-                if not merged_in_pass:
-                    break # Exit while loop if no merges in a full pass
-            corrected_all_groups.append(groups)
-        return corrected_all_groups
 
     def _correct_contours(self, all_groups):
+        """グループから代表的な直線を求め、その交点から新しい輪郭点を生成する"""
         corrected_contours = []
         for groups in all_groups:
             if len(groups) < 2: continue
             lines = []
             for group in groups:
+                if not group: continue
                 representative_angle_rad = np.deg2rad(group[0]['angle'])
                 points = np.array([s['p1'] for s in group] + [group[-1]['p2']])
                 centroid = np.mean(points, axis=0)
                 direction = np.array([np.cos(representative_angle_rad), np.sin(representative_angle_rad)])
-                p1, p2 = centroid - direction * 10000, centroid + direction * 10000
+                # 十分に長い直線を生成
+                p1 = centroid - direction * 10000
+                p2 = centroid + direction * 10000
                 lines.append((p1, p2))
-
+            
             num_lines = len(lines)
-            if num_lines == 0: continue
+            if num_lines < 2: continue
+            
             new_points = []
             for i in range(num_lines):
-                group1 = groups[i]
-                group2 = groups[(i + 1) % num_lines]
                 line1 = lines[i]
                 line2 = lines[(i + 1) % num_lines]
                 intersection_point = self._line_intersection(line1, line2)
+                
                 if intersection_point is None:
-                    p1_end = group1[-1]['p2']
-                    p2_start = group2[0]['p1']
+                    # 交点が見つからない場合（平行線など）、元の点の平均を使う
+                    p1_end = groups[i][-1]['p2']
+                    p2_start = groups[(i + 1) % num_lines][0]['p1']
                     intersection_point = tuple(np.mean([p1_end, p2_start], axis=0).astype(int))
+                
                 new_points.append([intersection_point])
+                
             if new_points:
                 corrected_contours.append(np.array(new_points, dtype=np.int32))
         return corrected_contours
 
     def _finalize_contour_alignment(self, contours):
+        """最終的な輪郭の水平・垂直な辺を、最も長い辺に揃える"""
         finalized_contours = []
         ALIGN_TOLERANCE = 2.5
+
         for contour in contours:
             num_points = len(contour)
             if num_points < 2:
-                finalized_contours.append(contour); continue
+                finalized_contours.append(contour)
+                continue
+            
             points = contour.copy().squeeze(axis=1)
             new_points = points.copy()
-            edge_types = []
+            
+            edges = []
             for i in range(num_points):
-                p1 = points[i]
-                p2 = points[(i + 1) % num_points]
+                p1, p2 = points[i], points[(i + 1) % num_points]
                 angle = self._calculate_angle(p1, p2)
                 abs_angle = abs((angle + 180) % 360 - 180)
+                length = np.linalg.norm(p2 - p1)
+                
+                edge_type = -1 # -1:斜め, 0:水平, 1:垂直
                 if abs_angle <= ALIGN_TOLERANCE or abs_angle >= (180 - ALIGN_TOLERANCE):
-                    edge_types.append(0) # Horizontal
+                    edge_type = 0 # Horizontal
                 elif abs(abs_angle - 90) <= ALIGN_TOLERANCE:
-                    edge_types.append(1) # Vertical
-                else:
-                    edge_types.append(-1) # Diagonal
-            for edge_type_to_process in [0, 1]:
-                i = 0
-                while i < num_points:
-                    if edge_types[i] == edge_type_to_process:
-                        j = i
-                        while edge_types[j % num_points] == edge_type_to_process:
-                            j += 1
-                        sequence_indices = [(k % num_points) for k in range(i, j + 1)]
-                        unique_indices = sorted(list(set(sequence_indices)))
-                        if edge_type_to_process == 0:
-                            coords = [new_points[k][1] for k in unique_indices]
-                            avg_coord = int(round(np.mean(coords)))
-                            for k in unique_indices: new_points[k][1] = avg_coord
-                        else:
-                            coords = [new_points[k][0] for k in unique_indices]
-                            avg_coord = int(round(np.mean(coords)))
-                            for k in unique_indices: new_points[k][0] = avg_coord
-                        i = j
-                    else:
-                        i += 1
+                    edge_type = 1 # Vertical
+                edges.append({'type': edge_type, 'len': length, 'p1_idx': i, 'p2_idx': (i + 1) % num_points})
+
+            for edge_type_to_process in [0, 1]: # 水平、垂直の順に処理
+                processed_points = [False] * num_points
+                for i in range(num_points):
+                    if not processed_points[i] and edges[i]['type'] == edge_type_to_process:
+                        current_sequence_edges, q, visited_edges = [], [i], {i}
+                        while q:
+                            edge_idx = q.pop(0)
+                            current_sequence_edges.append(edges[edge_idx])
+                            for point_idx in [edges[edge_idx]['p1_idx'], edges[edge_idx]['p2_idx']]:
+                                prev_edge_idx = (point_idx - 1 + num_points) % num_points
+                                next_edge_idx = point_idx
+                                for neighbor_edge_idx in [prev_edge_idx, next_edge_idx]:
+                                    if neighbor_edge_idx not in visited_edges and edges[neighbor_edge_idx]['type'] == edge_type_to_process:
+                                        q.append(neighbor_edge_idx)
+                                        visited_edges.add(neighbor_edge_idx)
+
+                        if not current_sequence_edges: continue
+                        
+                        longest_edge = max(current_sequence_edges, key=lambda e: e['len'])
+                        p1_coords, p2_coords = new_points[longest_edge['p1_idx']], new_points[longest_edge['p2_idx']]
+                        
+                        if edge_type_to_process == 0: # Horizontal
+                            canonical_coord = int(round((p1_coords[1] + p2_coords[1]) / 2.0))
+                        else: # Vertical
+                            canonical_coord = int(round((p1_coords[0] + p2_coords[0]) / 2.0))
+                            
+                        sequence_point_indices = set()
+                        for edge in current_sequence_edges:
+                            sequence_point_indices.add(edge['p1_idx'])
+                            sequence_point_indices.add(edge['p2_idx'])
+
+                        for idx in sequence_point_indices:
+                            if edge_type_to_process == 0: new_points[idx][1] = canonical_coord
+                            else: new_points[idx][0] = canonical_coord
+                            processed_points[idx] = True
+            
             finalized_contours.append(new_points.reshape(-1, 1, 2))
         return finalized_contours
 
     def _recalculate_single_group_angle(self, group, snap=True):
+        """グループの角度を長さで重み付けした平均で再計算し、オプションでスナップする"""
         if not group: return
         total_len = sum(s['len'] for s in group)
         if total_len == 0:
@@ -544,7 +622,8 @@ class ContourProcessor:
 
     @staticmethod
     def _calculate_angle(p1, p2): 
-        dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        if dx == 0 and dy == 0: return 0.0
         return np.rad2deg(np.arctan2(dy, dx))
 
     @staticmethod
@@ -558,18 +637,23 @@ class ContourProcessor:
     @staticmethod
     def _angle_diff(a1, a2):
         diff = abs(a1 - a2)
-        while diff > 180: diff = 360 - diff
-        return diff
+        return min(diff, 360 - diff)
 
     @staticmethod
     def _line_intersection(line1, line2):
-        p1, p2 = line1; p3, p4 = line2
-        x1, y1 = p1; x2, y2 = p2; x3, y3 = p3; x4, y4 = p4
+        p1, p2 = line1
+        p3, p4 = line2
+        x1, y1 = p1
+        x2, y2 = p2
+        x3, y3 = p3
+        x4, y4 = p4
         den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(den) < 1e-6: return None
+        if abs(den) < 1e-6:
+            return None
         t_num = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)
         t = t_num / den
-        intersect_x = x1 + t * (x2 - x1); intersect_y = y1 + t * (y2 - y1)
+        intersect_x = x1 + t * (x2 - x1)
+        intersect_y = y1 + t * (y2 - y1)
         return (int(round(intersect_x)), int(round(intersect_y)))
 
     def _draw_filled_contour(self, contours) -> np.ndarray:
@@ -581,62 +665,6 @@ class ContourProcessor:
 
 
 
-    def _handle_smooth_button_clicked(self):
-        """「平滑化-角」ボタンがクリックされたときの処理 (try...finally を使用)"""
-        try:
-            # グリフが選択されていない場合
-            if not self.canvas.current_glyph_character:
-                QMessageBox.warning(self, "グリフ未選択", "平滑化するグリフが選択されていません。")
-                return
-
-            # 1. 現在のグリフ画像を取得
-            current_pixmap = self.canvas.get_current_image()
-            
-            # 2. QPixmapをOpenCVのnumpy配列に変換
-            try:
-                cv_image = qpixmap_to_cv_np(current_pixmap)
-            except Exception as e:
-                QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
-                return
-                
-            # 3. ContourProcessorで平滑化処理を実行
-            try:
-                processor = ContourProcessor(cv_image)
-                smoothed_image_np = processor.run()
-
-                if smoothed_image_np is None:
-                    QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
-                    return
-
-            except Exception as e:
-                import traceback
-                QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
-                return
-                
-            # 4. 処理結果のnumpy配列をQPixmapに変換
-            smoothed_pixmap = cv_np_to_qpixmap(smoothed_image_np)
-
-            # 5. Canvasの表示を更新し、アンドゥスタックに保存
-            self.canvas.image = smoothed_pixmap
-            self.canvas._save_state_to_undo_stack()
-            self.canvas.update()
-
-            # 6. データベース保存のためにシグナルを発行
-            self.canvas.glyph_modified_signal.emit(
-                self.canvas.current_glyph_character,
-                self.canvas.image.copy(),
-                self.canvas.editing_vrt2_glyph
-            )
-            
-            # 7. ステータスバーにメッセージを表示
-            main_window = self.window()
-            if main_window and hasattr(main_window, 'statusBar'):
-                main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' を平滑化しました。", 3000)
-
-        finally:
-            # このブロックは、tryブロックの処理がどのように終了しても必ず実行される
-            # これにより、ダイアログ表示後でも確実にフォーカスがキャンバスに戻る
-            self.canvas.setFocus()
 
 
 
