@@ -151,11 +151,11 @@ LINEARITY_THICKNESS_THRESHOLD = 2.0
 # 太いグループを分割する際の角度変化の閾値は維持
 FAT_GROUP_SPLIT_ANGLE_THRESHOLD = 20.0
 
-SKIMAGE_CONTOUR_LEVEL = 90.0   # 輪郭を検出する輝度レベル
+SKIMAGE_CONTOUR_LEVEL = 128.0   # 輪郭を検出する輝度レベル
 HV_TOLERANCE = 6.0             # 水平・垂直とみなす角度の許容範囲（度）
 GROUPING_ANGLE_TOLERANCE = 15  # セグメントを同一グループとして結合するための角度の許容範囲（度）
-NOISE_LENGTH_THRESHOLD = 15.0  # ノイズとみなす短いグループの最大長（ピクセル）
-THIN_FEATURE_THRESHOLD = 10.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
+NOISE_LENGTH_THRESHOLD = 12.0  # ノイズとみなす短いグループの最大長（ピクセル）
+THIN_FEATURE_THRESHOLD = 7.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
 
 # main.py の既存の定数
 IMG_WIDTH = 500
@@ -2691,15 +2691,24 @@ class DrawingEditorWidget(QWidget):
         self.unicode_label.setText(final_text)
 
 
-# main.py の DrawingEditorWidget クラス内
+
+# DrawingEditorWidgetクラス内の_handle_smooth_button_clickedメソッドをこのコードに置き換えてください
 
     def _handle_smooth_button_clicked(self):
-        """「平滑化-角」ボタンがクリックされたときの処理 (try...finally を使用)"""
+        """「平滑化-角」ボタンがクリックされたときの処理"""
+        main_window = self.window()
+        if not isinstance(main_window, MainWindow):
+            return
+
         try:
             # グリフが選択されていない場合
             if not self.canvas.current_glyph_character:
                 QMessageBox.warning(self, "グリフ未選択", "平滑化するグリフが選択されていません。")
                 return
+
+            # 【修正点】MainWindowのフラグを立て、グリッド操作を一時的に無効化
+            main_window._is_smoothing_in_progress = True
+            main_window.glyph_grid_widget.setEnabled(False)
 
             # 1. 現在のグリフ画像を取得
             current_pixmap = self.canvas.get_current_image()
@@ -2709,6 +2718,8 @@ class DrawingEditorWidget(QWidget):
                 cv_image = qpixmap_to_cv_np(current_pixmap)
             except Exception as e:
                 QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
+                main_window._is_smoothing_in_progress = False # エラー時はフラグを戻す
+                main_window.glyph_grid_widget.setEnabled(True)
                 return
                 
             # 3. ContourProcessorで平滑化処理を実行
@@ -2718,11 +2729,15 @@ class DrawingEditorWidget(QWidget):
 
                 if smoothed_image_np is None:
                     QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
+                    main_window._is_smoothing_in_progress = False # スキップ時もフラグを戻す
+                    main_window.glyph_grid_widget.setEnabled(True)
                     return
 
             except Exception as e:
                 import traceback
                 QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
+                main_window._is_smoothing_in_progress = False # エラー時はフラグを戻す
+                main_window.glyph_grid_widget.setEnabled(True)
                 return
                 
             # 4. 処理結果のnumpy配列をQPixmapに変換
@@ -2733,8 +2748,7 @@ class DrawingEditorWidget(QWidget):
             self.canvas._save_state_to_undo_stack()
             self.canvas.update()
 
-            # 6. データベース保存のためにシグナルを発行
-            # 修正点: MainWindowが接続している self.canvas のシグナルを発行する
+            # 6. データベース保存のためにシグナルを発行 (これにより非同期保存が開始される)
             self.canvas.glyph_modified_signal.emit(
                 self.canvas.current_glyph_character,
                 self.canvas.image.copy(),
@@ -2742,15 +2756,11 @@ class DrawingEditorWidget(QWidget):
             )
             
             # 7. ステータスバーにメッセージを表示
-            main_window = self.window()
             if main_window and hasattr(main_window, 'statusBar'):
                 main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' を平滑化しました。", 3000)
 
         finally:
-            # ★★★ このブロックは、tryブロックの処理がどのように終了しても必ず実行される ★★★
-            # これにより、ダイアログ表示後でも確実にフォーカスがキャンバスに戻る。
             self.canvas.setFocus()
-
 
 
 
@@ -3801,7 +3811,16 @@ class GlyphGridWidget(QWidget):
         return nav_list
 
 
+
+
+
     def keyPressEvent(self, event: QKeyEvent):
+        # 【修正点】MainWindowで平滑化処理中の場合はキー操作を無視する
+        main_window = self.window()
+        if isinstance(main_window, MainWindow) and main_window._is_smoothing_in_progress:
+            event.accept()
+            return
+
         view = self.current_active_view
         model = view.model()
         if not isinstance(model, GlyphTableModel):
@@ -4101,12 +4120,12 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(QThread.idealThreadCount())
 
-        # --- NEW Attributes for edit history ---
-        self.edit_history: List[Tuple[str, bool]] = [] # Stores (char_key, is_vrt2)
+        self._is_smoothing_in_progress = False
+
+
+        self.edit_history: List[Tuple[str, bool]] = [] 
         self.current_history_index: int = -1
-        self._is_navigating_history: bool = False # Flag to prevent re-adding during navigation
-        # MAX_EDIT_HISTORY_SIZE is defined in constants
-        # --- END NEW Attributes ---
+        self._is_navigating_history: bool = False 
 
         self.non_rotated_vrt2_chars: set[str] = set()
         self.project_glyph_chars_cache: Set[str] = set() 
@@ -5145,13 +5164,21 @@ class MainWindow(QMainWindow):
         self.drawing_editor_widget.canvas.setFocus() 
 
 
+
     @Slot(str, QPixmap, bool)
     def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool): 
         if not self.current_project_path or self._project_loading_in_progress: return
-        worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex) # <--- 修正
+        
+        worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex)
         worker.signals.result.connect(self.on_glyph_save_success)
         worker.signals.error.connect(self.on_glyph_save_error)
+
+        # 【修正点】平滑化処理の場合、完了時にフラグをリセットするスロットを接続
+        if self._is_smoothing_in_progress:
+            worker.signals.finished.connect(self._on_smoothing_finished)
+
         self.thread_pool.start(worker)
+        
         if hasattr(self.drawing_editor_widget, 'glyph_to_ref_reset_button'):
             has_content = pixmap and not pixmap.isNull() 
             can_enable_button = self.drawing_editor_widget.pen_button.isEnabled() and has_content
@@ -5167,6 +5194,16 @@ class MainWindow(QMainWindow):
     def on_glyph_save_error(self, error_message: str): 
         QMessageBox.warning(self, "保存エラー", f"グリフの保存中にエラーが発生しました:\n{error_message}")
         self.statusBar().showMessage(f"グリフ保存エラー: {error_message[:100]}...", 5000)
+
+
+    @Slot()
+    def _on_smoothing_finished(self):
+        """平滑化に伴う非同期処理が完了したときに呼ばれるスロット"""
+        self._is_smoothing_in_progress = False
+        # 処理が終わったので、グリッドウィジェットを再度有効にする
+        self.glyph_grid_widget.setEnabled(True)
+        if self.drawing_editor_widget.canvas.current_glyph_character:
+            self.drawing_editor_widget.canvas.setFocus()
 
     @Slot(str, QPixmap, bool) 
     def save_reference_image_async(self, character: str, pixmap: QPixmap, is_vrt2: bool): 
