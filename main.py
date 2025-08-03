@@ -36,7 +36,8 @@ from PySide6.QtCore import (
     Qt, QPoint, QPointF, Signal, QRectF, QSize, QBuffer,
     QIODevice, QByteArray, QRunnable, QThreadPool, Slot, QObject, QProcess, QTimer, 
     QRect, QMutex, QMutexLocker, QEvent, QThread,
-    QAbstractTableModel, QModelIndex, QItemSelectionModel
+    QAbstractTableModel, QModelIndex, QItemSelectionModel,
+    QCoreApplication
 )
 
 
@@ -154,8 +155,8 @@ FAT_GROUP_SPLIT_ANGLE_THRESHOLD = 20.0
 SKIMAGE_CONTOUR_LEVEL = 128.0   # 輪郭を検出する輝度レベル
 HV_TOLERANCE = 6.0             # 水平・垂直とみなす角度の許容範囲（度）
 GROUPING_ANGLE_TOLERANCE = 15  # セグメントを同一グループとして結合するための角度の許容範囲（度）
-NOISE_LENGTH_THRESHOLD = 12.0  # ノイズとみなす短いグループの最大長（ピクセル）
-THIN_FEATURE_THRESHOLD = 7.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
+NOISE_LENGTH_THRESHOLD = 10.0  # ノイズとみなす短いグループの最大長（ピクセル）
+THIN_FEATURE_THRESHOLD = 5.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
 
 # main.py の既存の定数
 IMG_WIDTH = 500
@@ -5084,8 +5085,13 @@ class MainWindow(QMainWindow):
     def _save_current_advance_width_sync(self, character: str, advance_width: int): 
         if not self.current_project_path or not character: return
         try:
+            # === 修正点 ===
+            # メインスレッドからの書き込みも、共有Mutexでロックします。
+            locker = QMutexLocker(self.db_mutex)
             self.db_manager.save_glyph_advance_width(character, advance_width)
-        except Exception as e: pass
+        except Exception as e:
+            # エラーが発生した場合でも、プログラムは続行します。
+            print(f"Error in _save_current_advance_width_sync: {e}")
 
 
 
@@ -5269,9 +5275,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         try:
+            # === 修正点 ===
+            # DB構造の変更を伴うため、Mutexで保護します。
+            locker = QMutexLocker(self.db_mutex)
             self.db_manager.update_project_character_set(processed_chars) 
+            
+            # DB更新後にUIと非同期ワーカーを開始します。
             self._set_project_loading_state(True) 
-            self._clear_edit_history() # MODIFIED: Clear history
+            self._clear_edit_history()
             self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
@@ -5282,7 +5293,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "文字セット更新", "プロジェクトの文字セットが更新されました。データ再読み込み中です。")
         except Exception as e: 
             QMessageBox.critical(self, "文字セット更新エラー", f"文字セットの更新に失敗しました: {e}")
-            self._set_project_loading_state(False) 
+            self._set_project_loading_state(False)
 
     @Slot(str)
     def update_rotated_vrt2_set(self, new_char_string: str): 
@@ -5290,9 +5301,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         try:
+            # === 修正点 ===
+            locker = QMutexLocker(self.db_mutex)
             self.db_manager.update_rotated_vrt2_character_set(processed_chars)
+
             self._set_project_loading_state(True)
-            self._clear_edit_history() # MODIFIED: Clear history
+            self._clear_edit_history()
             self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
@@ -5311,14 +5325,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         new_nr_vrt2_set = set(processed_chars)
-        r_vrt2_set_from_db = set(self.db_manager.get_rotated_vrt2_character_set())
-        conflicts_resolved_r_vrt2 = list(r_vrt2_set_from_db - new_nr_vrt2_set) 
+        
         try:
+            # === 修正点 ===
+            # 複数のDB更新をアトミックに行うため、Mutexで保護します。
+            locker = QMutexLocker(self.db_mutex)
+            r_vrt2_set_from_db = set(self.db_manager.get_rotated_vrt2_character_set())
+            conflicts_resolved_r_vrt2 = list(r_vrt2_set_from_db - new_nr_vrt2_set)
+            
             self.db_manager.update_non_rotated_vrt2_character_set(list(new_nr_vrt2_set))
             if len(conflicts_resolved_r_vrt2) != len(r_vrt2_set_from_db): 
                 self.db_manager.update_rotated_vrt2_character_set(conflicts_resolved_r_vrt2)
+
             self._set_project_loading_state(True)
-            self._clear_edit_history() # MODIFIED: Clear history
+            self._clear_edit_history()
             self.glyph_grid_widget.clear_grid_and_models() 
             worker = LoadProjectWorker(self.current_project_path)
             worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
@@ -5648,6 +5668,11 @@ class MainWindow(QMainWindow):
             self.project_glyph_chars_cache = {char_data[0] for char_data in all_glyphs_data_raw}
             if not self.project_glyph_chars_cache and target_chars_list: 
                 QMessageBox.warning(self, "エラー", "プロジェクトにグリフが読み込まれていないか空です。"); return
+
+        # === 修正点 ===
+        # バッチ処理中に他のDBアクセスをブロックするため、Mutexで保護します。
+        locker = QMutexLocker(self.db_mutex)
+        
         updated_count = 0; skipped_count = 0
         current_char_in_editor = self.drawing_editor_widget.canvas.current_glyph_character
         conn = self.db_manager._get_connection(); cursor = conn.cursor()
@@ -5660,6 +5685,10 @@ class MainWindow(QMainWindow):
             conn.commit()
         except Exception as e: conn.rollback(); QMessageBox.critical(self, "一括更新エラー", f"データベース更新中にエラーが発生しました: {e}"); return
         finally: conn.close()
+
+        # ロックが解除された後にUIを更新
+        QCoreApplication.processEvents() 
+
         summary_message = f"{updated_count} 文字の送り幅を {new_adv_width} に更新しました。"
         if skipped_count > 0: summary_message += f"\n{skipped_count} 文字はプロジェクトに含まれていないためスキップされました。"
         QMessageBox.information(self, "一括更新完了", summary_message)
@@ -5667,7 +5696,7 @@ class MainWindow(QMainWindow):
            current_char_in_editor in target_chars_list and current_char_in_editor in self.project_glyph_chars_cache: 
             self.drawing_editor_widget.canvas.current_glyph_advance_width = new_adv_width
             self.drawing_editor_widget._update_adv_width_ui_no_signal(new_adv_width) 
-            self.drawing_editor_widget.canvas.update() 
+            self.drawing_editor_widget.canvas.update()
 
     def batch_import_glyphs(self): self._process_batch_image_import(import_type="glyph") 
     def batch_import_reference_images(self): self._process_batch_image_import(import_type="reference") 
