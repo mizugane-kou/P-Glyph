@@ -1,4 +1,5 @@
 
+
 import sys
 import os
 import sqlite3
@@ -119,6 +120,12 @@ DELEGATE_ITEM_MARGIN = 2
 DELEGATE_PLACEHOLDER_COLOR = QColor(220, 220, 220)
 DELEGATE_CELL_BASE_WIDTH = 80 # Approximate base width for item
 DELEGATE_GRID_COLUMNS = 5 # Number of columns in the table view grid
+
+# PUA (Private Use Area) Constants
+PUA_START_CODEPOINT = 0xE000
+PUA_END_CODEPOINT = 0xF8FF
+PUA_MAX_COUNT = PUA_END_CODEPOINT - PUA_START_CODEPOINT + 1
+
 
 def qpixmap_to_cv_np(pixmap: QPixmap) -> np.ndarray:
     """QPixmapをOpenCVのnumpy配列(BGR)に変換する"""
@@ -871,19 +878,20 @@ class SaveGlyphWorkerSignals(WorkerBaseSignals):
 
 
 class SaveGlyphWorker(QRunnable):
-    def __init__(self, db_path: str, character: str, pixmap: QPixmap, is_vrt2_glyph: bool, mutex: QMutex): # <--- 修正
+    def __init__(self, db_path: str, character: str, pixmap: QPixmap, is_vrt2_glyph: bool, is_pua_glyph: bool, mutex: QMutex):
         super().__init__()
         self.db_path = db_path
         self.character = character
         self.pixmap = pixmap.copy()
         self.is_vrt2_glyph = is_vrt2_glyph
-        self.mutex = mutex  # <--- 追加
+        self.is_pua_glyph = is_pua_glyph
+        self.mutex = mutex
         self.signals = SaveGlyphWorkerSignals()
 
     @Slot()
     def run(self):
         try:
-            locker = QMutexLocker(self.mutex)  # <--- 追加
+            locker = QMutexLocker(self.mutex)
 
             byte_array = QByteArray()
             buffer = QBuffer(byte_array)
@@ -892,57 +900,65 @@ class SaveGlyphWorker(QRunnable):
             qimage.save(buffer, "PNG")
             image_data = byte_array.data()
 
-            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
             cursor = conn.cursor()
 
-            if self.is_vrt2_glyph:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO vrt2_glyphs (character, image_data, last_modified)
+            if self.is_pua_glyph:
+                table = "pua_glyphs"
+                cursor.execute(f"""
+                    UPDATE {table}
+                    SET image_data = ?, last_modified = CURRENT_TIMESTAMP
+                    WHERE character = ?
+                """, (image_data, self.character))
+            elif self.is_vrt2_glyph:
+                table = "vrt2_glyphs"
+                cursor.execute(f"""
+                    INSERT OR REPLACE INTO {table} (character, image_data, last_modified)
                     VALUES (?, ?, CURRENT_TIMESTAMP)
                 """, (self.character, image_data))
             else:
-                cursor.execute("""
-                    UPDATE glyphs
+                table = "glyphs"
+                cursor.execute(f"""
+                    UPDATE {table}
                     SET image_data = ?, last_modified = CURRENT_TIMESTAMP
                     WHERE character = ?
                 """, (image_data, self.character))
 
-                if cursor.rowcount == 0:
-                    # Character might not exist if char set was modified and this is a delayed save.
-                    # Or if .notdef was somehow targeted for standard update without existing.
-                    # For now, we'll let it silently fail to insert if not found, to avoid creating
-                    # new glyph entries outside of the designated character set management.
-                    pass 
+            if cursor.rowcount == 0 and not self.is_vrt2_glyph:
+                 pass
 
             conn.commit()
             conn.close()
-            self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph)
+            self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph)
+
         except Exception as e:
             import traceback
-            err_type = "vrt2 glyph" if self.is_vrt2_glyph else "glyph"
+            if self.is_pua_glyph: err_type = "pua glyph"
+            elif self.is_vrt2_glyph: err_type = "vrt2 glyph"
+            else: err_type = "glyph"
             self.signals.error.emit(f"Error saving {err_type} '{self.character}': {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
 
 
 class SaveGuiStateWorker(QRunnable):
-    def __init__(self, db_path: str, key: str, value: str, mutex: QMutex): # <--- 修正
+    def __init__(self, db_path: str, key: str, value: str, mutex: QMutex):
         super().__init__()
         self.db_path = db_path
         self.key = key
         self.value = str(value) # Ensure value is string
-        self.mutex = mutex  # <--- 追加
+        self.mutex = mutex
         self.signals = WorkerBaseSignals()
 
     @Slot()
     def run(self):
         try:
-            locker = QMutexLocker(self.mutex) # <--- 追加
+            locker = QMutexLocker(self.mutex)
 
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save GUI setting '{self.key}': DB path not set.")
                 return
-            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
             cursor = conn.cursor()
             cursor.execute("INSERT OR REPLACE INTO project_settings (key, value) VALUES (?, ?)", (self.key, self.value))
             conn.commit()
@@ -954,25 +970,27 @@ class SaveGuiStateWorker(QRunnable):
             self.signals.finished.emit()
 
 class SaveAdvanceWidthWorker(QRunnable):
-    def __init__(self, db_path: str, character: str, advance_width: int, mutex: QMutex): # <--- 修正
+    def __init__(self, db_path: str, character: str, advance_width: int, is_pua_glyph: bool, mutex: QMutex):
         super().__init__()
         self.db_path = db_path
         self.character = character
         self.advance_width = advance_width
-        self.mutex = mutex  # <--- 追加
+        self.is_pua_glyph = is_pua_glyph
+        self.mutex = mutex
         self.signals = WorkerBaseSignals()
 
     @Slot()
     def run(self):
         try:
-            locker = QMutexLocker(self.mutex) # <--- 追加
+            locker = QMutexLocker(self.mutex)
 
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save advance width for '{self.character}': DB path not set.")
                 return
-            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
             cursor = conn.cursor()
-            cursor.execute("UPDATE glyphs SET advance_width = ? WHERE character = ?", (self.advance_width, self.character))
+            table = "pua_glyphs" if self.is_pua_glyph else "glyphs"
+            cursor.execute(f"UPDATE {table} SET advance_width = ? WHERE character = ?", (self.advance_width, self.character))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -987,19 +1005,20 @@ class SaveReferenceImageWorkerSignals(WorkerBaseSignals):
 
 
 class SaveReferenceImageWorker(QRunnable):
-    def __init__(self, db_path: str, character: str, pixmap: Optional[QPixmap], is_vrt2_glyph: bool, mutex: QMutex): # <--- 修正
+    def __init__(self, db_path: str, character: str, pixmap: Optional[QPixmap], is_vrt2_glyph: bool, is_pua_glyph: bool, mutex: QMutex):
         super().__init__()
         self.db_path = db_path
         self.character = character
-        self.pixmap = pixmap.copy() if pixmap else None # Store copy or None
+        self.pixmap = pixmap.copy() if pixmap else None
         self.is_vrt2_glyph = is_vrt2_glyph
-        self.mutex = mutex  # <--- 追加
+        self.is_pua_glyph = is_pua_glyph
+        self.mutex = mutex
         self.signals = SaveReferenceImageWorkerSignals()
 
     @Slot()
     def run(self):
         try:
-            locker = QMutexLocker(self.mutex) # <--- 追加
+            locker = QMutexLocker(self.mutex)
 
             image_data: Optional[bytes] = None
             if self.pixmap:
@@ -1010,31 +1029,30 @@ class SaveReferenceImageWorker(QRunnable):
                 qimage.save(buffer, "PNG")
                 image_data = byte_array.data()
             
-            conn = sqlite3.connect(self.db_path, timeout=5.0) # ADDED timeout
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
             cursor = conn.cursor()
 
-            if self.is_vrt2_glyph:
-                cursor.execute("""
-                    UPDATE vrt2_glyphs SET reference_image_data = ? WHERE character = ?
-                """, (image_data, self.character))
+            if self.is_pua_glyph:
+                table = "pua_glyphs"
+            elif self.is_vrt2_glyph:
+                table = "vrt2_glyphs"
             else:
-                cursor.execute("""
-                    UPDATE glyphs SET reference_image_data = ? WHERE character = ?
-                """, (image_data, self.character))
-
+                table = "glyphs"
+            
+            cursor.execute(f"UPDATE {table} SET reference_image_data = ? WHERE character = ?", (image_data, self.character))
+            
             if cursor.rowcount == 0:
-                table_name = "vrt2_glyphs" if self.is_vrt2_glyph else "glyphs"
-                # self.signals.error.emit(f"Error saving reference image for '{self.character}' in {table_name}: Character not found or no update occurred.")
-                # Silently allow if char not found, could be due to set changes.
                 conn.close()
                 return
 
             conn.commit()
             conn.close()
-            self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph) 
+            self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph) 
         except Exception as e:
             import traceback
-            err_type = "vrt2 reference" if self.is_vrt2_glyph else "reference"
+            if self.is_pua_glyph: err_type = "pua reference"
+            elif self.is_vrt2_glyph: err_type = "vrt2 reference"
+            else: err_type = "reference"
             self.signals.error.emit(f"Error saving {err_type} image for '{self.character}': {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
@@ -1042,15 +1060,11 @@ class SaveReferenceImageWorker(QRunnable):
 
 # --- Worker for loading project data (Modified for batch loading) ---
 class LoadProjectWorkerSignals(QObject):
-    basic_info_loaded = Signal(dict) 
-    # Batch of glyph data: (character, has_image_initially, initial_image_bytes_if_any)
-    # This signal structure is changed: MainWindow will now pass metadata lists to GlyphGridWidget's models.
-    # Instead, we can emit progress for "metadata loaded" vs "initial images loaded".
-    # Let's simplify: basic_info_loaded is enough. GlyphGridWidget models will load their own data.
-    # However, for initial population, MainWindow still needs the lists of characters.
-    # So, basic_info_loaded will now include:
+    basic_info_loaded = Signal(dict)
+    # basic_info_loaded will now include:
     #   'char_set_list_with_img_info': List[Tuple[str, bool]] (char, has_image) for standard
     #   'nr_vrt2_list_with_img_info': List[Tuple[str, bool]] (char, has_image) for VRT2
+    #   'pua_list_with_img_info': List[Tuple[str, bool]] (char, has_image) for PUA
     load_progress = Signal(int, str) 
     error = Signal(str)
     finished = Signal()
@@ -1063,25 +1077,43 @@ class LoadProjectWorker(QRunnable):
         self.db_path = db_path
         self.signals = LoadProjectWorkerSignals()
 
-    def _get_char_list_with_image_info(self, db_manager: "DatabaseManager", char_list: List[str], is_vrt2: bool) -> List[Tuple[str, bool]]:
+    def _get_char_list_with_image_info(self, db_manager: "DatabaseManager", char_list: List[str], is_vrt2: bool, is_pua: bool = False) -> List[Tuple[str, bool]]:
         """For a list of characters, checks DB if image_data exists."""
         results = []
         if not char_list: return results
         conn = db_manager._get_connection() 
         cursor = conn.cursor()
-        table = "vrt2_glyphs" if is_vrt2 else "glyphs"
-        for char_val in char_list:
-            cursor.execute(f"SELECT image_data IS NOT NULL FROM {table} WHERE character = ?", (char_val,))
-            row = cursor.fetchone()
-            has_image = row[0] if row and row[0] is not None else False
-            results.append((char_val, has_image))
-        conn.close()
+        if is_pua:
+            table = "pua_glyphs"
+        elif is_vrt2:
+            table = "vrt2_glyphs"
+        else:
+            table = "glyphs"
+        
+        try:
+            for char_val in char_list:
+                cursor.execute(f"SELECT image_data IS NOT NULL FROM {table} WHERE character = ?", (char_val,))
+                row = cursor.fetchone()
+                has_image = row[0] if row and row[0] is not None else False
+                results.append((char_val, has_image))
+        except sqlite3.OperationalError:
+             return []
+        finally:
+            conn.close()
         return results
 
     @Slot()
-    def run(self): # MODIFIED METHOD
+    def run(self):
         try:
-            db_manager = DatabaseManager(self.db_path) 
+            db_manager = DatabaseManager(self.db_path)
+            # Compatibility: ensure pua_glyphs table exists
+            conn = db_manager._get_connection(); cursor = conn.cursor()
+            cursor.execute("""CREATE TABLE IF NOT EXISTS pua_glyphs (
+                character TEXT PRIMARY KEY, unicode_val INTEGER UNIQUE, image_data BLOB,
+                reference_image_data BLOB, advance_width INTEGER DEFAULT 1000,
+                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP )""")
+            conn.commit(); conn.close()
+
 
             self.signals.load_progress.emit(0, "基本設定を読み込み中...")
             char_set_list_raw = db_manager.get_project_character_set() 
@@ -1104,6 +1136,11 @@ class LoadProjectWorker(QRunnable):
             
             self.signals.load_progress.emit(40, "グリフメタデータを確認中(縦書き)...")
             nr_vrt2_list_with_img_info = self._get_char_list_with_image_info(db_manager, nr_vrt2_list_raw, is_vrt2=True)
+            
+            self.signals.load_progress.emit(50, "グリフメタデータを確認中(私用領域)...")
+            pua_glyphs_raw_data = db_manager.get_all_pua_glyphs_with_preview_data()
+            pua_list_with_img_info = [(char, img_bytes is not None) for char, img_bytes in pua_glyphs_raw_data]
+
 
             self.signals.load_progress.emit(60, "GUI設定を読み込み中...")
             font_name = db_manager.load_gui_setting(SETTING_FONT_NAME, DEFAULT_FONT_NAME)
@@ -1119,26 +1156,24 @@ class LoadProjectWorker(QRunnable):
             guideline_u_str = db_manager.load_gui_setting(SETTING_GUIDELINE_U, "")
             guideline_v_str = db_manager.load_gui_setting(SETTING_GUIDELINE_V, "")
 
-            # ブラシ幅の読み込み
             loaded_brush_width_str = db_manager.load_gui_setting(SETTING_PEN_WIDTH, str(DEFAULT_PEN_WIDTH))
             try:
                 loaded_brush_width_val = int(loaded_brush_width_str)
             except ValueError:
                 loaded_brush_width_val = DEFAULT_PEN_WIDTH
 
-            # 消しゴム幅の読み込み (互換性対応)
             loaded_eraser_width_str = db_manager.load_gui_setting(SETTING_ERASER_WIDTH)
-            if loaded_eraser_width_str is not None: # SETTING_ERASER_WIDTH が存在する場合
+            if loaded_eraser_width_str is not None:
                 try:
                     loaded_eraser_width_val = int(loaded_eraser_width_str)
-                except ValueError: # 値が不正ならブラシ幅にフォールバック
+                except ValueError:
                     loaded_eraser_width_val = loaded_brush_width_val
-            else: # SETTING_ERASER_WIDTH が存在しない古いプロジェクトの場合、ブラシ幅を使用
+            else:
                 loaded_eraser_width_val = loaded_brush_width_val
             
             gui_settings = {
-                SETTING_PEN_WIDTH: str(loaded_brush_width_val), # ブラシ幅として保存
-                SETTING_ERASER_WIDTH: str(loaded_eraser_width_val), # 消しゴム幅として保存
+                SETTING_PEN_WIDTH: str(loaded_brush_width_val),
+                SETTING_ERASER_WIDTH: str(loaded_eraser_width_val),
                 SETTING_PEN_SHAPE: db_manager.load_gui_setting(SETTING_PEN_SHAPE, DEFAULT_PEN_SHAPE),
                 SETTING_CURRENT_TOOL: db_manager.load_gui_setting(SETTING_CURRENT_TOOL, DEFAULT_CURRENT_TOOL),
                 SETTING_MIRROR_MODE: db_manager.load_gui_setting(SETTING_MIRROR_MODE, str(DEFAULT_MIRROR_MODE)),
@@ -1166,7 +1201,8 @@ class LoadProjectWorker(QRunnable):
                 'r_vrt2_list': r_vrt2_list_raw,
                 'nr_vrt2_list': nr_vrt2_list_raw,
                 'char_set_list_with_img_info': char_set_list_with_img_info, 
-                'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info, 
+                'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info,
+                'pua_list_with_img_info': pua_list_with_img_info,
                 'font_name': font_name,
                 'font_weight': font_weight,
                 'copyright_info': copyright_info,
@@ -1272,6 +1308,16 @@ class DatabaseManager:
                 last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pua_glyphs (
+                character TEXT PRIMARY KEY,
+                unicode_val INTEGER UNIQUE,
+                image_data BLOB,
+                reference_image_data BLOB DEFAULT NULL,
+                advance_width INTEGER DEFAULT 1000,
+                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         initial_char_string = "".join(characters)
         cursor.execute("INSERT OR REPLACE INTO project_settings (key, value) VALUES (?, ?)",
@@ -1310,10 +1356,10 @@ class DatabaseManager:
         self._save_default_gui_settings(cursor) 
         conn.commit(); conn.close()
 
-    def _save_default_gui_settings(self, cursor: sqlite3.Cursor): # MODIFIED METHOD
+    def _save_default_gui_settings(self, cursor: sqlite3.Cursor):
         defaults = {
-            SETTING_PEN_WIDTH: str(DEFAULT_PEN_WIDTH), # これはブラシ幅のデフォルト
-            SETTING_ERASER_WIDTH: str(DEFAULT_ERASER_WIDTH), # 消しゴム幅のデフォルトを追加
+            SETTING_PEN_WIDTH: str(DEFAULT_PEN_WIDTH),
+            SETTING_ERASER_WIDTH: str(DEFAULT_ERASER_WIDTH),
             SETTING_PEN_SHAPE: DEFAULT_PEN_SHAPE,
             SETTING_CURRENT_TOOL: DEFAULT_CURRENT_TOOL,
             SETTING_MIRROR_MODE: str(DEFAULT_MIRROR_MODE),
@@ -1385,31 +1431,61 @@ class DatabaseManager:
                 cursor.execute(f"DELETE FROM {table_to_check} WHERE character = ?", (char_to_remove,))
         conn.commit(); conn.close()
 
-    def load_glyph_image(self, character: str, is_vrt2: bool = False) -> Optional[QPixmap]:
+    def load_glyph_image(self, character: str, is_vrt2: bool = False, is_pua: bool = False) -> Optional[QPixmap]:
         if not self.db_path: return None
         conn = self._get_connection(); cursor = conn.cursor()
-        table = "vrt2_glyphs" if is_vrt2 else "glyphs"
-        cursor.execute(f"SELECT image_data FROM {table} WHERE character = ?", (character,))
-        row = cursor.fetchone(); conn.close()
-        if row and row['image_data']: pixmap = QPixmap(); pixmap.loadFromData(row['image_data']); return pixmap
-        return None
+        if is_pua:
+            table = "pua_glyphs"
+        elif is_vrt2:
+            table = "vrt2_glyphs"
+        else:
+            table = "glyphs"
+        
+        try:
+            cursor.execute(f"SELECT image_data FROM {table} WHERE character = ?", (character,))
+            row = cursor.fetchone()
+            if row and row['image_data']: 
+                pixmap = QPixmap(); pixmap.loadFromData(row['image_data']); return pixmap
+            return None
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
     
-    def load_glyph_image_bytes(self, character: str, is_vrt2: bool = False) -> Optional[bytes]: # For ImageLoadWorker
+    def load_glyph_image_bytes(self, character: str, is_vrt2: bool = False, is_pua: bool = False) -> Optional[bytes]:
         if not self.db_path: return None
         conn = self._get_connection(); cursor = conn.cursor()
-        table = "vrt2_glyphs" if is_vrt2 else "glyphs"
-        cursor.execute(f"SELECT image_data FROM {table} WHERE character = ?", (character,))
-        row = cursor.fetchone(); conn.close()
-        return row['image_data'] if row and row['image_data'] else None
+        if is_pua:
+            table = "pua_glyphs"
+        elif is_vrt2:
+            table = "vrt2_glyphs"
+        else:
+            table = "glyphs"
+        
+        try:
+            cursor.execute(f"SELECT image_data FROM {table} WHERE character = ?", (character,))
+            row = cursor.fetchone()
+            return row['image_data'] if row and row['image_data'] else None
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
 
 
-    def load_reference_image(self, character: str) -> Optional[QPixmap]:
+    def load_reference_image(self, character: str, is_pua: bool = False) -> Optional[QPixmap]:
         if not self.db_path: return None
         conn = self._get_connection(); cursor = conn.cursor()
-        cursor.execute(f"SELECT reference_image_data FROM glyphs WHERE character = ?", (character,))
-        row = cursor.fetchone(); conn.close()
-        if row and row['reference_image_data']: pixmap = QPixmap(); pixmap.loadFromData(row['reference_image_data']); return pixmap
-        return None
+        table = "pua_glyphs" if is_pua else "glyphs"
+        try:
+            cursor.execute(f"SELECT reference_image_data FROM {table} WHERE character = ?", (character,))
+            row = cursor.fetchone()
+            if row and row['reference_image_data']: 
+                pixmap = QPixmap(); pixmap.loadFromData(row['reference_image_data']); return pixmap
+            return None
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
     
     def load_vrt2_glyph_reference_image(self, character: str) -> Optional[QPixmap]:
         if not self.db_path: return None
@@ -1428,12 +1504,18 @@ class DatabaseManager:
         cursor.execute("INSERT OR REPLACE INTO vrt2_glyphs (character, image_data, last_modified) VALUES (?, ?, CURRENT_TIMESTAMP)", (character, image_data))
         conn.commit(); conn.close()
 
-    def load_glyph_advance_width(self, character: str) -> int:
+    def load_glyph_advance_width(self, character: str, is_pua: bool = False) -> int:
         if not self.db_path: return DEFAULT_ADVANCE_WIDTH
         conn = self._get_connection(); cursor = conn.cursor()
-        cursor.execute("SELECT advance_width FROM glyphs WHERE character = ?", (character,))
-        row = cursor.fetchone(); conn.close()
-        return row['advance_width'] if row and row['advance_width'] is not None else DEFAULT_ADVANCE_WIDTH
+        table = "pua_glyphs" if is_pua else "glyphs"
+        try:
+            cursor.execute(f"SELECT advance_width FROM {table} WHERE character = ?", (character,))
+            row = cursor.fetchone()
+            return row['advance_width'] if row and row['advance_width'] is not None else DEFAULT_ADVANCE_WIDTH
+        except sqlite3.OperationalError:
+            return DEFAULT_ADVANCE_WIDTH
+        finally:
+            conn.close()
 
     def save_glyph_advance_width(self, character: str, advance_width: int): 
         if not self.db_path: return
@@ -1473,24 +1555,26 @@ class DatabaseManager:
         row = cursor.fetchone(); conn.close()
         return row['value'] if row else default_value
 
-    def update_glyph_image_data_bytes(self, character: str, image_data: bytes) -> bool:
+    def update_glyph_image_data_bytes(self, character: str, image_data: bytes, is_pua: bool = False) -> bool:
         if not self.db_path: return False
         conn = self._get_connection(); cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM glyphs WHERE character = ?", (character,)); exists = cursor.fetchone()
-        if not exists: conn.close(); return False 
+        table = "pua_glyphs" if is_pua else "glyphs"
         try:
-            cursor.execute("UPDATE glyphs SET image_data = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (image_data, character))
+            cursor.execute(f"SELECT 1 FROM {table} WHERE character = ?", (character,)); exists = cursor.fetchone()
+            if not exists: conn.close(); return False 
+            cursor.execute(f"UPDATE {table} SET image_data = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (image_data, character))
             updated_rows = cursor.rowcount; conn.commit(); return updated_rows > 0
         except Exception: conn.rollback(); return False
         finally: conn.close()
 
-    def update_glyph_reference_image_data_bytes(self, character: str, image_data: Optional[bytes]) -> bool:
+    def update_glyph_reference_image_data_bytes(self, character: str, image_data: Optional[bytes], is_pua: bool = False) -> bool:
         if not self.db_path: return False
         conn = self._get_connection(); cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM glyphs WHERE character = ?", (character,)); exists = cursor.fetchone()
-        if not exists: conn.close(); return False
+        table = "pua_glyphs" if is_pua else "glyphs"
         try:
-            cursor.execute("UPDATE glyphs SET reference_image_data = ? WHERE character = ?", (image_data, character))
+            cursor.execute(f"SELECT 1 FROM {table} WHERE character = ?", (character,)); exists = cursor.fetchone()
+            if not exists: conn.close(); return False
+            cursor.execute(f"UPDATE {table} SET reference_image_data = ? WHERE character = ?", (image_data, character))
             updated_rows = cursor.rowcount; conn.commit(); return updated_rows > 0
         except Exception: conn.rollback(); return False
         finally: conn.close()
@@ -1506,27 +1590,110 @@ class DatabaseManager:
         except Exception: conn.rollback(); return False
         finally: conn.close()
 
+    def get_pua_glyph_count(self) -> int:
+        if not self.db_path: return 0
+        conn = self._get_connection(); cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
+            if cursor.fetchone() is None:
+                return 0
+            cursor.execute("SELECT COUNT(*) FROM pua_glyphs")
+            count = cursor.fetchone()[0]
+            return count if count is not None else 0
+        finally:
+            conn.close()
 
+    def add_pua_glyphs(self, count: int) -> Tuple[int, Optional[str]]:
+        if not self.db_path or count <= 0: return 0, "無効な要求です。"
+        conn = self._get_connection(); cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pua_glyphs (
+                    character TEXT PRIMARY KEY, unicode_val INTEGER UNIQUE, image_data BLOB,
+                    reference_image_data BLOB, advance_width INTEGER DEFAULT 1000,
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP )""")
+
+            cursor.execute("SELECT unicode_val FROM pua_glyphs")
+            existing_codepoints = {row['unicode_val'] for row in cursor.fetchall()}
+            
+            added_count = 0
+            empty_image_bytes = self._create_empty_image_data()
+            
+            for _ in range(count):
+                next_codepoint = -1
+                for cp in range(PUA_START_CODEPOINT, PUA_END_CODEPOINT + 1):
+                    if cp not in existing_codepoints:
+                        next_codepoint = cp
+                        break
+                
+                if next_codepoint != -1:
+                    char = chr(next_codepoint)
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO pua_glyphs (character, unicode_val, image_data, advance_width)
+                        VALUES (?, ?, ?, ?)
+                    """, (char, next_codepoint, empty_image_bytes, DEFAULT_ADVANCE_WIDTH))
+                    existing_codepoints.add(next_codepoint)
+                    added_count += 1
+                else:
+                    conn.commit()
+                    return added_count, "私用領域に空きがありません。"
+
+            conn.commit()
+            return added_count, None
+        except Exception as e:
+            conn.rollback()
+            return 0, f"データベースエラー: {e}"
+        finally:
+            conn.close()
+
+    def delete_pua_glyph(self, character: str) -> bool:
+        if not self.db_path or not character: return False
+        conn = self._get_connection(); cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM pua_glyphs WHERE character = ?", (character,))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def get_all_pua_glyphs_with_preview_data(self) -> List[Tuple[str, Optional[bytes]]]:
+        if not self.db_path: return []
+        conn = self._get_connection(); cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
+            if cursor.fetchone() is None:
+                return []
+            cursor.execute("SELECT character, unicode_val, image_data FROM pua_glyphs ORDER BY unicode_val ASC")
+            results = [(row['character'], row['image_data']) for row in cursor.fetchall()]
+            return results
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
 
 
 
 class Canvas(QWidget):
-    brush_width_changed = Signal(int)   # ブラシ太さ変更シグナル
-    eraser_width_changed = Signal(int)  # 消しゴム太さ変更シグナル
+    brush_width_changed = Signal(int)
+    eraser_width_changed = Signal(int)
     tool_changed = Signal(str)
     undo_redo_state_changed = Signal(bool, bool)
-    glyph_modified_signal = Signal(str, QPixmap, bool) # char, pixmap, is_vrt2
+    glyph_modified_signal = Signal(str, QPixmap, bool, bool) # char, pixmap, is_vrt2, is_pua
     glyph_margin_width_changed = Signal(int)
-    glyph_advance_width_changed = Signal(int) # advance_width (shared for H/V)
+    glyph_advance_width_changed = Signal(int)
 
     def __init__(self):
         super().__init__()
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus); self.setAcceptDrops(True) 
-        self.setMouseTracking(True) # Enable mouse tracking for Shift hover preview
+        self.setMouseTracking(True)
         self.ascender_height_for_baseline = DEFAULT_ASCENDER_HEIGHT
         self.glyph_margin_width: int = DEFAULT_GLYPH_MARGIN_WIDTH
         self.current_glyph_character: Optional[str] = None
         self.editing_vrt2_glyph: bool = False
+        self.editing_pua_glyph: bool = False
         self.current_glyph_advance_width: int = DEFAULT_ADVANCE_WIDTH
         self.image_size = QSize(CANVAS_IMAGE_WIDTH, CANVAS_IMAGE_HEIGHT)
         self.setFixedSize(self.image_size.width() + 2 * VIRTUAL_MARGIN, self.image_size.height() + 2 * VIRTUAL_MARGIN)
@@ -1547,7 +1714,7 @@ class Canvas(QWidget):
         self.guidelines_u: List[Tuple[int, QColor]] = []
         self.guidelines_v: List[Tuple[int, QColor]] = []
         self.last_stroke_end_point: Optional[QPointF] = None 
-        self.straight_line_preview_active = False # Flag to indicate if line preview is active
+        self.straight_line_preview_active = False
 
     def _reset_straight_line_mode(self):
         self.straight_line_preview_active = False
@@ -1567,10 +1734,12 @@ class Canvas(QWidget):
             self.current_glyph_advance_width = width
             self.glyph_advance_width_changed.emit(width); self.update()
 
-    def load_glyph(self, character: str, pixmap: Optional[QPixmap], reference_pixmap: Optional[QPixmap], advance_width: int, is_vrt2: bool = False):
+    def load_glyph(self, character: str, pixmap: Optional[QPixmap], reference_pixmap: Optional[QPixmap], advance_width: int, is_vrt2: bool = False, is_pua: bool = False):
         self._reset_straight_line_mode() 
         self.last_stroke_end_point = None 
-        self.current_glyph_character = character; self.editing_vrt2_glyph = is_vrt2
+        self.current_glyph_character = character
+        self.editing_vrt2_glyph = is_vrt2
+        self.editing_pua_glyph = is_pua
         self.current_glyph_advance_width = advance_width; self.reference_image = reference_pixmap
         if pixmap:
             self.image = pixmap.copy()
@@ -1583,7 +1752,7 @@ class Canvas(QWidget):
         self._save_state_to_undo_stack(is_initial_load=True); self.update()
 
     def set_reference_image_opacity(self, opacity: float): self.reference_image_opacity = max(0.0, min(1.0, opacity)); self.update()
-    def get_current_image_and_type(self) -> Tuple[QPixmap, bool]: return self.image.copy(), self.editing_vrt2_glyph
+    def get_current_image_and_type(self) -> Tuple[QPixmap, bool, bool]: return self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph
     def get_current_image(self) -> QPixmap: return self.image.copy()
     def _emit_undo_redo_state(self): self.undo_redo_state_changed.emit(len(self.undo_stack) > 1, bool(self.redo_stack))
 
@@ -1599,7 +1768,7 @@ class Canvas(QWidget):
             self._reset_straight_line_mode()
             popped_state = self.undo_stack.pop(); self.redo_stack.append(popped_state)
             self.image = self.undo_stack[-1].copy(); self.update(); self._emit_undo_redo_state()
-            if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+            if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
 
     def redo(self):
         if self.redo_stack:
@@ -1607,7 +1776,7 @@ class Canvas(QWidget):
             self._reset_straight_line_mode()
             popped_state = self.redo_stack.pop(); self.undo_stack.append(popped_state)
             self.image = popped_state.copy(); self.update(); self._emit_undo_redo_state()
-            if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+            if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
 
     def set_brush_width(self, width: int):
         self.brush_width = max(1, width) 
@@ -1616,7 +1785,7 @@ class Canvas(QWidget):
             if self.drawing and self.stroke_points:
                 self._rebuild_current_path_from_stroke_points(finalize=False)
             elif self.straight_line_preview_active and self.last_stroke_end_point:
-                self._rebuild_straight_line_preview(QCursor.pos()) # Rebuild with current cursor for width
+                self._rebuild_straight_line_preview(QCursor.pos())
 
     def set_eraser_width(self, width: int):
         self.eraser_width = max(1, width) 
@@ -1625,7 +1794,7 @@ class Canvas(QWidget):
             if self.drawing and self.stroke_points:
                 self._rebuild_current_path_from_stroke_points(finalize=False)
             elif self.straight_line_preview_active and self.last_stroke_end_point:
-                self._rebuild_straight_line_preview(QCursor.pos()) # Rebuild with current cursor for width
+                self._rebuild_straight_line_preview(QCursor.pos())
 
 
     def get_current_active_width(self) -> int:
@@ -1911,7 +2080,14 @@ class Canvas(QWidget):
         canvas_painter.drawPath(outer_margin_path)
         canvas_painter.restore()
         canvas_painter.save()
-        border_pen = QPen(Qt.darkGray); border_pen.setWidth(1)
+        if self.mirror_mode:
+            # 左右反転モードが有効な場合は、赤色の枠線にする
+            border_pen = QPen(QColor(255, 80, 80)) # 明るめの赤
+            border_pen.setWidth(2) # 少し太くして目立たせる
+        else:
+            # 通常時は濃いグレーの枠線
+            border_pen = QPen(Qt.darkGray)
+            border_pen.setWidth(1)
         canvas_painter.setPen(border_pen); canvas_painter.setBrush(Qt.NoBrush)
         canvas_painter.drawRect(image_area_rect_in_widget.adjusted(0,0,-1,-1))
         canvas_painter.restore()
@@ -1926,10 +2102,9 @@ class Canvas(QWidget):
             if is_shift_pressed:
                 self.drawing = False  
                 self.stroke_points = [] 
-                self.straight_line_preview_active = False # Finalize any active preview
+                self.straight_line_preview_active = False
 
                 if self.last_stroke_end_point is not None:
-                    # This is the second tap (or click after Shift was pressed)
                     path_to_draw = QPainterPath()
                     path_to_draw.moveTo(self.last_stroke_end_point)
                     path_to_draw.lineTo(logical_pos)
@@ -1940,24 +2115,21 @@ class Canvas(QWidget):
 
                     self._save_state_to_undo_stack()
                     if self.current_glyph_character:
-                        self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                        self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
                     
                     self.last_stroke_end_point = logical_pos 
                     self.current_path = QPainterPath() 
                     self.update()
                 else:
-                    # First tap with Shift, or no previous pen stroke.
-                    # Set this as the start point for a potential line.
                     self.last_stroke_end_point = logical_pos
-                    # Start previewing immediately if Shift remains pressed.
                     if QApplication.keyboardModifiers() & Qt.ShiftModifier:
                          self.straight_line_preview_active = True
-                         self._rebuild_straight_line_preview(event.position().toPoint()) # Use view pos for initial preview
-                    else: # Shift was released after click
+                         self._rebuild_straight_line_preview(event.position().toPoint())
+                    else:
                          self._reset_straight_line_mode()
                     self.update()
                 return 
-            else: # Regular click without Shift - start freehand drawing
+            else:
                 self._reset_straight_line_mode() 
                 self.drawing = True
                 self.current_path = QPainterPath()
@@ -1982,15 +2154,12 @@ class Canvas(QWidget):
         
         if self.current_tool in ["brush", "eraser"]:
             if is_shift_pressed and self.last_stroke_end_point is not None:
-                # Shift is held, and we have a starting point for a line. Preview it.
-                self.drawing = False # Ensure freehand mode is off
+                self.drawing = False
                 self.straight_line_preview_active = True
-                self._rebuild_straight_line_preview(event.position().toPoint()) # <--- 修正
-                return # Handled by straight line preview
+                self._rebuild_straight_line_preview(event.position().toPoint())
+                return
             elif self.straight_line_preview_active and not is_shift_pressed:
-                # Shift was released while a line preview was active. Cancel preview.
                 self._reset_straight_line_mode()
-                # Do not return, allow freehand logic if button is pressed.
 
         if self.move_mode and self.moving_image:
             if event.buttons() & Qt.LeftButton:
@@ -1999,8 +2168,7 @@ class Canvas(QWidget):
                 self.update()
             return
 
-        if (event.buttons() & Qt.LeftButton) and self.drawing: # Freehand drawing move
-            # Ensure line preview is not active if we are freehand dragging
+        if (event.buttons() & Qt.LeftButton) and self.drawing:
             if self.straight_line_preview_active:
                 self._reset_straight_line_mode()
 
@@ -2008,12 +2176,7 @@ class Canvas(QWidget):
             if not self.stroke_points or (logical_pos - self.stroke_points[-1]).manhattanLength() >= 1.0:
                 self.stroke_points.append(logical_pos)
                 self._rebuild_current_path_from_stroke_points(finalize=False)
-                # self.update() is called by _rebuild_...
             return
-        
-        
-        # If no buttons are pressed but Shift is, and we have a line start point, update preview
-        # This is now handled by the first block in this method (is_shift_pressed and self.last_stroke_end_point)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
@@ -2022,32 +2185,14 @@ class Canvas(QWidget):
 
         if event.button() == Qt.LeftButton:
             if self.straight_line_preview_active:
-                # This means a line was being previewed (Shift was held, or was held during drag).
-                # The line is drawn on Press, so release for Shift+Drag does nothing extra to draw,
-                # but it should finalize the last_stroke_end_point.
-                # The actual drawing happens in mousePress on the *second* Shift+Click.
-                # If it was a Shift+ClickDragRelease, the line should be drawn.
-                # This state is tricky. `straight_line_preview_active` is set on Shift+Hover
-                # or Shift+Drag. If it was a pure Shift+Click (tap), this release finalizes that point.
-                
-                # Let's simplify: If straight_line_preview_active is true, it means Shift was involved.
-                # The line drawing logic is primarily in mousePress.
-                # This release should mainly update last_stroke_end_point if a line was drawn.
-                # And reset the preview state.
                 if self.last_stroke_end_point and (self.last_stroke_end_point - logical_pos_on_release).manhattanLength() >= 1.0:
-                    # This implies a drag occurred while previewing a line.
-                    # The line was actually drawn on the *initial* Shift+Press that started the drag,
-                    # or on the second Shift+Press for tap-tap.
-                    # This release effectively finalizes the *end point* of that drag if it happened.
-                    # However, the drawing command was on press.
-                    # Here, we just update the 'last_stroke_end_point' for the next potential line.
                     self.last_stroke_end_point = logical_pos_on_release
                 
-                self._reset_straight_line_mode() # Always reset preview on release
+                self._reset_straight_line_mode()
                 self.update()
                 return
 
-            elif self.drawing: # Freehand drawing release
+            elif self.drawing:
                 if self.stroke_points:
                     if len(self.stroke_points) == 1 and self.stroke_points[0] == logical_pos_on_release: 
                         self.stroke_points.append(logical_pos_on_release) 
@@ -2061,7 +2206,7 @@ class Canvas(QWidget):
                         image_painter.end()
                         self._save_state_to_undo_stack()
                         if self.current_glyph_character: 
-                            self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                            self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
                         
                         if self.stroke_points:
                              self.last_stroke_end_point = self.stroke_points[-1]
@@ -2078,7 +2223,7 @@ class Canvas(QWidget):
                 if self.move_mode: self.setCursor(Qt.OpenHandCursor)
                 else: self.unsetCursor()
                 self._save_state_to_undo_stack()
-                if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
                 self.update()
             return
         
@@ -2101,9 +2246,6 @@ class Canvas(QWidget):
         if event.key() == Qt.Key_Shift:
             if self.straight_line_preview_active:
                 self._reset_straight_line_mode()
-            # If a Shift+Click tap set last_stroke_end_point, but no line was drawn
-            # and Shift is released, last_stroke_end_point remains for the next Shift+Click.
-            # No need to clear last_stroke_end_point here unless a line was actually previewed and cancelled.
             event.accept()
 
 
@@ -2138,7 +2280,7 @@ class Canvas(QWidget):
                 painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
                 self.image = QPixmap.fromImage(final_image)
                 self._save_state_to_undo_stack()
-                if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph)
+                if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
                 self.last_stroke_end_point = None 
                 self._reset_straight_line_mode()
                 self.update(); event.acceptProposedAction()
@@ -2154,13 +2296,13 @@ class Canvas(QWidget):
 
 class DrawingEditorWidget(QWidget):
 
-    gui_setting_changed_signal = Signal(str, str) # key, value
-    vrt2_edit_mode_toggled = Signal(bool) # is_editing_vrt2_glyph
+    gui_setting_changed_signal = Signal(str, str)
+    vrt2_edit_mode_toggled = Signal(bool)
     transfer_to_vrt2_requested = Signal()
-    advance_width_changed_signal = Signal(str, int) # char, new_adv_width
-    reference_image_selected_signal = Signal(str, QPixmap, bool) # char, pixmap, is_vrt2
-    reference_image_deleted_signal = Signal(str, bool) # char, is_vrt2
-    glyph_to_reference_and_reset_requested = Signal(bool) # is_vrt2_target
+    advance_width_changed_signal = Signal(str, int)
+    reference_image_selected_signal = Signal(str, QPixmap, bool)
+    reference_image_deleted_signal = Signal(str, bool)
+    glyph_to_reference_and_reset_requested = Signal(bool)
 
     navigate_history_back_requested = Signal()
     navigate_history_forward_requested = Signal()
@@ -2169,6 +2311,7 @@ class DrawingEditorWidget(QWidget):
         super().__init__(parent)
         self.canvas = Canvas()
         self.rotated_vrt2_chars: Set[str] = set()
+        self.editing_pua_glyph: bool = False
         main_layout = QVBoxLayout(self)
         self.unicode_label = QLineEdit("Unicode: N/A")
         self.unicode_label.setReadOnly(True); self.unicode_label.setAlignment(Qt.AlignCenter)
@@ -2200,12 +2343,12 @@ class DrawingEditorWidget(QWidget):
         controls_outer_layout.addLayout(top_controls_layout)
         
         slider_layout = QHBoxLayout()
-        self.width_label = QLabel("太さ:") # ラベルは汎用的に「太さ」
+        self.width_label = QLabel("太さ:")
         slider_layout.addWidget(self.width_label)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(1, 100)
-        self.slider.setValue(self.canvas.get_current_active_width()) # 初期値はアクティブなツールの太さ
-        self.slider.valueChanged.connect(self._handle_active_tool_width_slider_changed) # スライダー変更時のハンドラ
+        self.slider.setValue(self.canvas.get_current_active_width())
+        self.slider.valueChanged.connect(self._handle_active_tool_width_slider_changed)
         slider_layout.addWidget(self.slider, 1)
         controls_outer_layout.addLayout(slider_layout)
         
@@ -2215,7 +2358,6 @@ class DrawingEditorWidget(QWidget):
         cols = 5
         for i, size_val in enumerate(pen_sizes):
             button = QPushButton(str(size_val)); button.setToolTip(f"{size_val}px")
-            # プリセットボタンもアクティブなツールの太さを変更
             button.clicked.connect(lambda checked=False, s=size_val: self._handle_active_tool_width_slider_changed(s))
             row, col = divmod(i, cols)
             pen_size_grid_layout.addWidget(button, row, col)
@@ -2405,7 +2547,8 @@ class DrawingEditorWidget(QWidget):
                     self.canvas.glyph_modified_signal.emit(
                         self.canvas.current_glyph_character,
                         self.canvas.image.copy(),
-                        self.canvas.editing_vrt2_glyph
+                        self.canvas.editing_vrt2_glyph,
+                        self.canvas.editing_pua_glyph
                     )
                 self.canvas.update()
                 if self.window() and hasattr(self.window(), 'statusBar'):
@@ -2489,13 +2632,11 @@ class DrawingEditorWidget(QWidget):
 
             try:
                 coord = int(coord_str)
-                if 0 <= coord <= 1000: # Assuming 0-1000 range for guidelines
+                if 0 <= coord <= 1000:
                     parsed_lines.append((coord, color))
                 else:
-                    # print(f"Guideline coordinate {coord} out of range (0-1000).")
                     pass
             except ValueError:
-                # print(f"Invalid guideline coordinate format: {coord_str}")
                 pass
         return parsed_lines
 
@@ -2597,47 +2738,42 @@ class DrawingEditorWidget(QWidget):
             self.vrt2_toggle_button.blockSignals(False)
 
     def _update_slider_for_brush_width(self, width: int):
-        """ブラシの太さがCanvas側で変更された場合にスライダーを更新 (ツールがブラシの場合のみ)"""
         if self.canvas.current_tool == "brush":
             self._update_slider_value_no_signal(width)
 
     def _update_slider_for_eraser_width(self, width: int):
-        """消しゴムの太さがCanvas側で変更された場合にスライダーを更新 (ツールが消しゴムの場合のみ)"""
         if self.canvas.current_tool == "eraser":
             self._update_slider_value_no_signal(width)
 
     def _on_canvas_tool_changed(self, tool_name: str):
-        """Canvasのツールが変更された時の処理。UIのツールボタンとスライダー値を更新。"""
         self._update_tool_buttons_state_no_signal(tool_name)
         active_width = self.canvas.get_current_active_width()
         self._update_slider_value_no_signal(active_width)
-        # self.width_label.setText(f"{'ブラシ' if tool_name == 'brush' else '消しゴム'}太さ:") # オプション: ラベルも変更
 
     def _handle_pen_button_clicked(self):
-        self.canvas.set_brush_mode() # Canvas内でtool_changedシグナルが発行される
+        self.canvas.set_brush_mode()
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "brush")
         self.canvas.setFocus()
 
     def _handle_eraser_button_clicked(self):
-        self.canvas.set_eraser_mode() # Canvas内でtool_changedシグナルが発行される
+        self.canvas.set_eraser_mode()
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, "eraser")
         self.canvas.setFocus()
 
     def _handle_move_button_clicked(self):
         is_move_tool_selected = self.move_button.isChecked()
-        self.canvas.set_move_mode(is_move_tool_selected) # Canvas内でtool_changedシグナルが発行される場合がある
+        self.canvas.set_move_mode(is_move_tool_selected)
         self.gui_setting_changed_signal.emit(SETTING_CURRENT_TOOL, self.canvas.current_tool)
         self.canvas.setFocus()
 
     def _handle_active_tool_width_slider_changed(self, width: int):
-        """スライダーやプリセットボタンで太さが変更された時の処理。アクティブなツールの太さを更新。"""
         current_tool = self.canvas.current_tool
         if current_tool == "brush":
             self.canvas.set_brush_width(width)
-            self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width)) # SETTING_PEN_WIDTH はブラシ用
+            self.gui_setting_changed_signal.emit(SETTING_PEN_WIDTH, str(width))
         elif current_tool == "eraser":
             self.canvas.set_eraser_width(width)
-            self.gui_setting_changed_signal.emit(SETTING_ERASER_WIDTH, str(width)) # SETTING_ERASER_WIDTH は消しゴム用
+            self.gui_setting_changed_signal.emit(SETTING_ERASER_WIDTH, str(width))
         
         if QApplication.focusWidget() != self.slider:
             self.canvas.setFocus()
@@ -2659,7 +2795,6 @@ class DrawingEditorWidget(QWidget):
             self.canvas.setFocus()
 
     def _update_slider_value_no_signal(self, width: int):
-        """スライダーの値をシグナルを発行せずに更新します。"""
         self.slider.blockSignals(True)
         self.slider.setValue(width)
         self.slider.blockSignals(False)
@@ -2687,13 +2822,13 @@ class DrawingEditorWidget(QWidget):
         else: base_text = "Unicode: N/A"
         final_text = base_text
         if self.canvas and character:
-            if self.canvas.editing_vrt2_glyph: final_text += " vert"
+            if self.canvas.editing_pua_glyph:
+                final_text += " PUA"
+            elif self.canvas.editing_vrt2_glyph: final_text += " vert"
             elif character != '.notdef' and character in self.rotated_vrt2_chars: final_text += " vert-r"
         self.unicode_label.setText(final_text)
 
 
-
-# DrawingEditorWidgetクラス内の_handle_smooth_button_clickedメソッドをこのコードに置き換えてください
 
     def _handle_smooth_button_clicked(self):
         """「平滑化-角」ボタンがクリックされたときの処理"""
@@ -2719,7 +2854,7 @@ class DrawingEditorWidget(QWidget):
                 cv_image = qpixmap_to_cv_np(current_pixmap)
             except Exception as e:
                 QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
-                main_window._is_smoothing_in_progress = False # エラー時はフラグを戻す
+                main_window._is_smoothing_in_progress = False
                 main_window.glyph_grid_widget.setEnabled(True)
                 return
                 
@@ -2730,14 +2865,14 @@ class DrawingEditorWidget(QWidget):
 
                 if smoothed_image_np is None:
                     QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
-                    main_window._is_smoothing_in_progress = False # スキップ時もフラグを戻す
+                    main_window._is_smoothing_in_progress = False
                     main_window.glyph_grid_widget.setEnabled(True)
                     return
 
             except Exception as e:
                 import traceback
                 QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
-                main_window._is_smoothing_in_progress = False # エラー時はフラグを戻す
+                main_window._is_smoothing_in_progress = False
                 main_window.glyph_grid_widget.setEnabled(True)
                 return
                 
@@ -2753,7 +2888,8 @@ class DrawingEditorWidget(QWidget):
             self.canvas.glyph_modified_signal.emit(
                 self.canvas.current_glyph_character,
                 self.canvas.image.copy(),
-                self.canvas.editing_vrt2_glyph
+                self.canvas.editing_vrt2_glyph,
+                self.canvas.editing_pua_glyph
             )
             
             # 7. ステータスバーにメッセージを表示
@@ -2788,7 +2924,8 @@ class DrawingEditorWidget(QWidget):
         self.ref_opacity_slider.setEnabled(enabled); self.ref_opacity_label.setEnabled(enabled)
         self.unicode_label.setEnabled(enabled)
         is_vrt2_currently = self.canvas.editing_vrt2_glyph if self.canvas else False
-        adv_controls_enabled = enabled
+        is_pua_currently = self.canvas.editing_pua_glyph if self.canvas else False
+        adv_controls_enabled = enabled and not is_vrt2_currently
         self.adv_width_slider.setEnabled(adv_controls_enabled); self.adv_width_spinbox.setEnabled(adv_controls_enabled)
         self.adv_width_label.setText("文字送り高さ:" if (enabled and is_vrt2_currently) else "文字送り幅:")
         self.load_ref_button.setEnabled(enabled)
@@ -2824,24 +2961,22 @@ class DrawingEditorWidget(QWidget):
         self.redo_button.setEnabled(can_redo and controls_are_generally_enabled)
 
     def apply_gui_settings(self, settings: Dict[str, Any]):
-        # ブラシ幅の読み込み (旧 PEN_WIDTH)
         brush_width_str = settings.get(SETTING_PEN_WIDTH)
         if brush_width_str is not None:
             try:
                 self.canvas.set_brush_width(int(brush_width_str))
             except ValueError:
                 self.canvas.set_brush_width(DEFAULT_PEN_WIDTH)
-        else: # 古いプロジェクト等で PEN_WIDTH がない場合
+        else:
             self.canvas.set_brush_width(DEFAULT_PEN_WIDTH)
 
-        # 消しゴム幅の読み込み (新 ERASER_WIDTH)
         eraser_width_str = settings.get(SETTING_ERASER_WIDTH)
         if eraser_width_str is not None:
             try:
                 self.canvas.set_eraser_width(int(eraser_width_str))
-            except ValueError: # ERASER_WIDTH が不正な値の場合、ブラシ幅かデフォルト値にフォールバック
-                self.canvas.set_eraser_width(self.canvas.brush_width) # ブラシ幅と同じにする
-        else: # 古いプロジェクトで ERASER_WIDTH がない場合、ブラシ幅と同じにする
+            except ValueError:
+                self.canvas.set_eraser_width(self.canvas.brush_width)
+        else:
             self.canvas.set_eraser_width(self.canvas.brush_width)
 
         pen_shape = settings.get(SETTING_PEN_SHAPE)
@@ -2851,11 +2986,11 @@ class DrawingEditorWidget(QWidget):
         
         current_tool = settings.get(SETTING_CURRENT_TOOL)
         if current_tool == "eraser":
-            self.canvas.set_eraser_mode() # これにより _on_canvas_tool_changed が呼ばれスライダー値も更新されるはず
+            self.canvas.set_eraser_mode()
         elif current_tool == "move":
             self.canvas.set_move_mode(True)
-        else: # "brush" or default
-            self.canvas.set_brush_mode() # これにより _on_canvas_tool_changed が呼ばれスライダー値も更新されるはず
+        else:
+            self.canvas.set_brush_mode()
         
         mirror_mode_str = settings.get(SETTING_MIRROR_MODE)
         if mirror_mode_str is not None:
@@ -2893,22 +3028,23 @@ class DrawingEditorWidget(QWidget):
 
 
 class ImageLoaderSignals(QObject):
-    image_loaded = Signal(str, QPixmap) # character_key, pixmap
-    load_failed = Signal(str)          # character_key
+    image_loaded = Signal(str, QPixmap)
+    load_failed = Signal(str)
 
 class ImageLoadWorker(QRunnable):
-    def __init__(self, db_path: str, character_key: str, is_vrt2: bool, db_manager: DatabaseManager):
+    def __init__(self, db_path: str, character_key: str, is_vrt2: bool, is_pua: bool, db_manager: DatabaseManager):
         super().__init__()
-        self.db_path = db_path # Though db_manager is passed, path might be useful for direct conn if needed
+        self.db_path = db_path
         self.character_key = character_key
         self.is_vrt2 = is_vrt2
+        self.is_pua = is_pua
         self.signals = ImageLoaderSignals()
-        self.db_manager = db_manager # Use the main app's db_manager instance
+        self.db_manager = db_manager
 
     @Slot()
     def run(self):
         try:
-            img_bytes = self.db_manager.load_glyph_image_bytes(self.character_key, self.is_vrt2)
+            img_bytes = self.db_manager.load_glyph_image_bytes(self.character_key, self.is_vrt2, self.is_pua)
 
             if img_bytes:
                 pixmap = QPixmap()
@@ -2919,41 +3055,30 @@ class ImageLoadWorker(QRunnable):
         except Exception as e:
             self.signals.load_failed.emit(self.character_key)
 
-# --- GlyphTableModel (New, based on dbtest.py and main.py needs) ---
 class GlyphTableModel(QAbstractTableModel):
-    def __init__(self, db_manager: DatabaseManager, is_vrt2_tab: bool, parent: Optional[QObject] = None):
+    def __init__(self, db_manager: DatabaseManager, is_vrt2_tab: bool, is_pua_tab: bool, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._db_manager = db_manager
         self._is_vrt2_tab = is_vrt2_tab
+        self._is_pua_tab = is_pua_tab
         
-        # (char_key, display_char, has_initial_image_from_db)
         self._glyph_metadata_all: List[Tuple[str, str, bool]] = []
-        # Indices into _glyph_metadata_all for currently visible items
         self._filtered_indices: List[int] = []
         
-        self._pixmap_cache: Dict[str, QPixmap] = {} # char_key -> QPixmap
-        self._requested_to_load: Set[str] = set()   # char_key currently being loaded
+        self._pixmap_cache: Dict[str, QPixmap] = {}
+        self._requested_to_load: Set[str] = set()
         
         self._column_count = DELEGATE_GRID_COLUMNS
-        self.thread_pool = QThreadPool() # Each model instance can have its own pool
-        self.thread_pool.setMaxThreadCount(max(1, QThread.idealThreadCount() // 2)) # Conservative thread count
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(max(1, QThread.idealThreadCount() // 2))
 
         self._show_written_only = False
-        self.non_rotated_vrt2_chars_for_highlight: Set[str] = set() # For standard tab highlight
+        self.non_rotated_vrt2_chars_for_highlight: Set[str] = set()
 
     def get_total_glyph_count(self) -> int:
-        """
-        このモデルが管理する全グリフの総数を返します。
-        フィルタリング状態には影響されません。
-        """
         return len(self._glyph_metadata_all)
 
     def get_written_glyph_count(self) -> int:
-        """
-        このモデルが管理するグリフのうち、書き込み済みのものの数を返します。
-        フィルタリング状態には影響されません。
-        「書き込み済み」とは、初期状態でDBに画像があったか、または現在キャッシュに画像があるものを指します。
-        """
         written_count = 0
         for char_key, _, has_initial_image in self._glyph_metadata_all:
             if has_initial_image or char_key in self._pixmap_cache:
@@ -2961,14 +3086,13 @@ class GlyphTableModel(QAbstractTableModel):
         return written_count
 
 
-    def set_character_data(self, char_data: List[Tuple[str, bool]]): # List of (char, has_initial_image)
+    def set_character_data(self, char_data: List[Tuple[str, bool]]):
         self.beginResetModel()
         self._glyph_metadata_all = []
         self._pixmap_cache.clear()
         self._requested_to_load.clear()
 
         for char_key, has_initial_image in char_data:
-            # display_char is same as char_key for this application
             self._glyph_metadata_all.append((char_key, char_key, has_initial_image))
         
         self._rebuild_filtered_indices()
@@ -2986,8 +3110,7 @@ class GlyphTableModel(QAbstractTableModel):
         for i, (char_key, _, has_initial_image) in enumerate(self._glyph_metadata_all):
             if not self._show_written_only:
                 self._filtered_indices.append(i)
-            else: # Show written only
-                # Written if it initially had an image OR if it's in pixmap_cache (loaded/drawn later)
+            else:
                 if has_initial_image or char_key in self._pixmap_cache:
                     self._filtered_indices.append(i)
     
@@ -3008,23 +3131,23 @@ class GlyphTableModel(QAbstractTableModel):
         metadata_idx = self._filtered_indices[flat_idx_in_filtered]
         char_key, display_char, _ = self._glyph_metadata_all[metadata_idx]
 
-        if role == Qt.DisplayRole: return display_char # For accessibility or tooltip if needed
-        elif role == Qt.UserRole: return char_key     # The actual character string (key)
-        elif role == Qt.UserRole + 1: # Pixmap data
+        if role == Qt.DisplayRole: return display_char
+        elif role == Qt.UserRole: return char_key
+        elif role == Qt.UserRole + 1:
             if char_key in self._pixmap_cache:
                 return self._pixmap_cache[char_key]
             else:
                 if char_key not in self._requested_to_load:
                     self._request_image_load(char_key)
-                return None # Placeholder will be drawn by delegate
-        elif role == Qt.UserRole + 2: # Is VRT2 highlight needed (for standard tab)?
+                return None
+        elif role == Qt.UserRole + 2:
             return (not self._is_vrt2_tab) and (char_key in self.non_rotated_vrt2_chars_for_highlight)
         return None
 
     def _request_image_load(self, char_key: str):
-        if not self._db_manager.db_path: return # No DB path, cannot load
+        if not self._db_manager.db_path: return
         self._requested_to_load.add(char_key)
-        worker = ImageLoadWorker(self._db_manager.db_path, char_key, self._is_vrt2_tab, self._db_manager)
+        worker = ImageLoadWorker(self._db_manager.db_path, char_key, self._is_vrt2_tab, self._is_pua_tab, self._db_manager)
         worker.signals.image_loaded.connect(self._on_image_loaded)
         worker.signals.load_failed.connect(self._on_image_load_failed)
         self.thread_pool.start(worker)
@@ -3035,18 +3158,15 @@ class GlyphTableModel(QAbstractTableModel):
         if char_key in self._requested_to_load:
             self._requested_to_load.remove(char_key)
 
-        # Find if this char_key is currently visible and get its QModelIndex
         try:
-            # Find original index in _glyph_metadata_all
             original_idx_in_all = -1
             for i, (ck, _, _) in enumerate(self._glyph_metadata_all):
                 if ck == char_key:
                     original_idx_in_all = i
                     break
             
-            if original_idx_in_all == -1: return # Should not happen
+            if original_idx_in_all == -1: return
 
-            # If filter is on and item's visibility might have changed
             if self._show_written_only:
                 _, _, has_initial_image = self._glyph_metadata_all[original_idx_in_all]
                 was_visible_due_to_initial = has_initial_image 
@@ -3059,29 +3179,28 @@ class GlyphTableModel(QAbstractTableModel):
                         current_flat_idx_in_filtered = i_filt
                         break
 
-                if not was_visible_due_to_initial and not is_now_in_filtered_indices: # Was not visible, now should be
+                if not was_visible_due_to_initial and not is_now_in_filtered_indices:
                     self.beginResetModel()
-                    self._rebuild_filtered_indices() # Rebuild and emit reset
+                    self._rebuild_filtered_indices()
                     self.endResetModel()
                     return 
-                elif is_now_in_filtered_indices : # Was already visible, just update its cell
+                elif is_now_in_filtered_indices :
                      row = current_flat_idx_in_filtered // self._column_count
                      col = current_flat_idx_in_filtered % self._column_count
                      model_idx = self.index(row, col)
                      if model_idx.isValid():
                          self.dataChanged.emit(model_idx, model_idx, [Qt.UserRole + 1])
-                # else: item became visible but filter rebuild handled it or item still not visible
             
-            else: # Filter is off, item is always visible if in _glyph_metadata_all
-                if original_idx_in_all in self._filtered_indices: # Should always be true if filter off
+            else:
+                if original_idx_in_all in self._filtered_indices:
                     flat_idx = self._filtered_indices.index(original_idx_in_all)
                     row = flat_idx // self._column_count
                     col = flat_idx % self._column_count
                     model_idx = self.index(row, col)
                     if model_idx.isValid():
                         self.dataChanged.emit(model_idx, model_idx, [Qt.UserRole + 1])
-        except ValueError: # char_key not found in _filtered_indices.index, means it's not visible
-            pass # No UI update needed if item not visible
+        except ValueError:
+            pass
 
 
     @Slot(str)
@@ -3090,20 +3209,19 @@ class GlyphTableModel(QAbstractTableModel):
             self._requested_to_load.remove(char_key)
 
     def update_glyph_pixmap(self, char_key: str, pixmap: Optional[QPixmap]):
-        # Called when a glyph is saved (potentially changing from None to Pixmap or vice versa)
         _, _, initial_has_image = next((m for m in self._glyph_metadata_all if m[0] == char_key), (None,None,False))
 
-        if pixmap is None: # Image was deleted (e.g., became blank)
+        if pixmap is None:
             if char_key in self._pixmap_cache:
                 del self._pixmap_cache[char_key]
-        else: # Image was updated/created
+        else:
             self._pixmap_cache[char_key] = pixmap
 
         if self._show_written_only:
             self.beginResetModel()
-            self._rebuild_filtered_indices() # This uses the now-updated _pixmap_cache
+            self._rebuild_filtered_indices()
             self.endResetModel()
-            return # Model reset takes care of UI updates.
+            return
 
         try:
             original_idx_in_all = -1
@@ -3113,9 +3231,9 @@ class GlyphTableModel(QAbstractTableModel):
                     break
             
             if original_idx_in_all == -1:
-                return # Character not found in metadata (should not happen if logic is correct)
-            if original_idx_in_all < len(self._filtered_indices): # Check if it's within current possibly filtered (though here assumed not)
-                flat_idx = self._filtered_indices.index(original_idx_in_all) # Find its position in the *filtered* list
+                return
+            if original_idx_in_all < len(self._filtered_indices):
+                flat_idx = self._filtered_indices.index(original_idx_in_all)
                 row, col = divmod(flat_idx, self._column_count)
                 model_idx = self.index(row, col)
                 if model_idx.isValid():
@@ -3135,29 +3253,25 @@ class GlyphTableModel(QAbstractTableModel):
                 return flat_idx
         return None
 
-    def get_metadata_count(self) -> int: # Number of items currently displayed by model
+    def get_metadata_count(self) -> int:
         return len(self._filtered_indices)
 
     def is_glyph_written(self, char_key: str) -> bool:
-        """Checks if a glyph is considered 'written' (has an initial image or is cached)."""
-        if char_key in self._pixmap_cache: # If in cache, it has a pixmap (so it's written)
+        if char_key in self._pixmap_cache:
             return True
-        # Check initial state from metadata
         for ck, _, has_initial_image in self._glyph_metadata_all:
             if ck == char_key:
                 return has_initial_image
-        return False # Not found in metadata, or no image
+        return False
 
 
-# --- GlyphTableDelegate (New, based on dbtest.py and main.py needs) ---
 class GlyphTableDelegate(QStyledItemDelegate):
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
-        self.char_label_font = QFont("Arial", 10) # Or use application default font
+        self.char_label_font = QFont("Arial", 10)
         fm = QFontMetrics(self.char_label_font)
         self.char_label_height = fm.height() + 2 * DELEGATE_CHAR_LABEL_PADDING
         
-        # To be set by GlyphGridWidget if this delegate is for the standard glyphs tab
         self.non_rotated_vrt2_chars: Set[str] = set()
 
     def _get_adjusted_color(self, base_color: QColor, factor_light: int, factor_dark: int, palette: QPalette) -> QColor:
@@ -3168,7 +3282,6 @@ class GlyphTableDelegate(QStyledItemDelegate):
         pen = QPen()
         pen.setWidth(DELEGATE_FRAME_BORDER_WIDTH)
         
-        # Use colors from the palette for a more theme-consistent look
         light_color = palette.color(QPalette.ColorRole.Light)
         dark_color = palette.color(QPalette.ColorRole.Dark)
         mid_color = palette.color(QPalette.ColorRole.Mid)
@@ -3185,7 +3298,6 @@ class GlyphTableDelegate(QStyledItemDelegate):
         painter.drawLine(rect.topLeft(), rect.bottomLeft())
 
         painter.setPen(QPen(bottom_right_color, DELEGATE_FRAME_BORDER_WIDTH))
-        # Adjust for pixel-perfect lines when width > 1, not strictly needed for width 1
         painter.drawLine(rect.topRight(), rect.bottomRight())
         painter.drawLine(rect.bottomLeft(), rect.bottomRight())
 
@@ -3193,9 +3305,9 @@ class GlyphTableDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        char_key = index.data(Qt.UserRole)       # Actual character string (key)
-        pixmap_data = index.data(Qt.UserRole + 1) # QPixmap or None
-        is_nrvg_highlight = index.data(Qt.UserRole + 2) # Bool or None
+        char_key = index.data(Qt.UserRole)
+        pixmap_data = index.data(Qt.UserRole + 1)
+        is_nrvg_highlight = index.data(Qt.UserRole + 2)
 
         if not char_key:
             painter.restore()
@@ -3206,31 +3318,25 @@ class GlyphTableDelegate(QStyledItemDelegate):
         painter.fillRect(rect, option.palette.color(QPalette.ColorRole.Base))
 
 
-        # Item visual container
         item_rect = rect.adjusted(DELEGATE_ITEM_MARGIN, DELEGATE_ITEM_MARGIN, 
                                   -DELEGATE_ITEM_MARGIN, -DELEGATE_ITEM_MARGIN)
         if not item_rect.isValid():
             painter.restore()
             return
 
-        # Background of the item itself (like the old QFrame)
-        item_bg_color = palette.color(QPalette.ColorRole.Button) # A common color for unselected items
+        item_bg_color = palette.color(QPalette.ColorRole.Button)
         if option.state & QStyle.State_Selected:
-            item_bg_color = palette.color(QPalette.ColorRole.Highlight).lighter(110) # Slightly lighter highlight
+            item_bg_color = palette.color(QPalette.ColorRole.Highlight).lighter(110)
         
         painter.fillRect(item_rect, item_bg_color)
 
 
-        # Frame effect (raised or sunken for selection)
-        frame_rect = item_rect.adjusted(0,0,-1,-1) # For pixel perfect border
+        frame_rect = item_rect.adjusted(0,0,-1,-1)
         self._paint_frame_effect(painter, frame_rect, palette, sunken=(option.state & QStyle.State_Selected))
 
-        # If selected, draw an additional outline for more emphasis
         if option.state & QStyle.State_Selected:
             painter.setPen(QPen(palette.color(QPalette.ColorRole.Highlight), DELEGATE_SELECTION_OUTLINE_WIDTH))
-            # Draw outline slightly inside the margin, or around item_rect
             painter.drawRect(item_rect.adjusted(0,0,-1,-1)) 
-            # Content rect needs to be inset further if selection outline is thick
             content_offset = DELEGATE_FRAME_BORDER_WIDTH + DELEGATE_SELECTION_OUTLINE_WIDTH
         else:
             content_offset = DELEGATE_FRAME_BORDER_WIDTH
@@ -3243,7 +3349,6 @@ class GlyphTableDelegate(QStyledItemDelegate):
             painter.restore()
             return
 
-        # Character Label
         char_label_actual_rect = QRect(content_draw_rect.left(), content_draw_rect.top(),
                                    content_draw_rect.width(), self.char_label_height)
         
@@ -3253,9 +3358,8 @@ class GlyphTableDelegate(QStyledItemDelegate):
         if option.state & QStyle.State_Selected:
             label_bg_color = palette.color(QPalette.ColorRole.Highlight)
             label_text_color = palette.color(QPalette.ColorRole.HighlightedText)
-        elif is_nrvg_highlight: # Standard glyph that is also in NR-VRT2 set (highlight)
+        elif is_nrvg_highlight:
             label_bg_color = VRT2_PREVIEW_BACKGROUND_TINT.lighter(110)
-            # Text color for VRT2 highlight can be adjusted for contrast
             label_text_color = Qt.black if VRT2_PREVIEW_BACKGROUND_TINT.lightnessF() > 0.5 else Qt.white
 
 
@@ -3267,11 +3371,9 @@ class GlyphTableDelegate(QStyledItemDelegate):
         painter.setPen(label_text_color)
         painter.setFont(self.char_label_font)
         text_draw_rect = char_label_actual_rect.adjusted(DELEGATE_CHAR_LABEL_PADDING, 0, -DELEGATE_CHAR_LABEL_PADDING, 0)
-        # Truncate display_char if too long for label (though char_key is usually single char)
         display_text = char_key if len(char_key) < 5 else char_key[:4] + "…"
         painter.drawText(text_draw_rect, Qt.AlignCenter | Qt.TextSingleLine, display_text)
 
-        # Preview Area
         preview_top_y = char_label_actual_rect.bottom() + DELEGATE_CELL_CONTENT_PADDING
         available_preview_width = content_draw_rect.width()
         available_preview_height = content_draw_rect.bottom() - preview_top_y
@@ -3286,7 +3388,7 @@ class GlyphTableDelegate(QStyledItemDelegate):
             )
 
             preview_bg_color = palette.color(QPalette.ColorRole.Window)
-            if is_nrvg_highlight and not (option.state & QStyle.State_Selected): # Apply tint if not selected
+            if is_nrvg_highlight and not (option.state & QStyle.State_Selected):
                  preview_bg_color = VRT2_PREVIEW_BACKGROUND_TINT
 
 
@@ -3303,12 +3405,12 @@ class GlyphTableDelegate(QStyledItemDelegate):
                     px = target_pixmap_rect.left() + (target_pixmap_rect.width() - scaled_pixmap.width()) / 2
                     py = target_pixmap_rect.top() + (target_pixmap_rect.height() - scaled_pixmap.height()) / 2
                     painter.drawPixmap(QPoint(int(px), int(py)), scaled_pixmap)
-            else: # Placeholder if no image loaded / load failed
+            else:
                 painter.fillRect(preview_area_rect, DELEGATE_PLACEHOLDER_COLOR)
                 if preview_area_rect.width() > 10 and preview_area_rect.height() > 10:
-                    loading_font = QFont(self.char_label_font.family(), 8) # Smaller font
+                    loading_font = QFont(self.char_label_font.family(), 8)
                     painter.setFont(loading_font)
-                    painter.setPen(palette.color(QPalette.ColorRole.Mid)) # Muted color
+                    painter.setPen(palette.color(QPalette.ColorRole.Mid))
                     painter.drawText(preview_area_rect, Qt.AlignCenter, "...")
         painter.restore()
 
@@ -3337,12 +3439,13 @@ class GlyphTableDelegate(QStyledItemDelegate):
 class GlyphGridWidget(QWidget):
     glyph_selected_signal = Signal(str)
     vrt2_glyph_selected_signal = Signal(str)
+    pua_glyph_selected_signal = Signal(str)
 
     def __init__(self, db_manager: DatabaseManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._db_manager = db_manager
         self.non_rotated_vrt2_chars: Set[str] = set()
-        self._is_selecting_programmatically = False # 再帰防止フラグ
+        self._is_selecting_programmatically = False
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0,0,0,0)
@@ -3358,40 +3461,46 @@ class GlyphGridWidget(QWidget):
         top_controls_layout.addWidget(self.search_button)
         main_layout.addLayout(top_controls_layout)
 
-        filter_and_count_layout = QHBoxLayout() # チェックボックスとカウント用ラベルを配置する水平レイアウト
+        filter_and_count_layout = QHBoxLayout()
         self.show_written_only_checkbox = QCheckBox("書き込み済みグリフのみ表示")
         self.show_written_only_checkbox.toggled.connect(self._on_filter_changed)
         filter_and_count_layout.addWidget(self.show_written_only_checkbox)
 
-        filter_and_count_layout.addStretch(1) # ラベルを右に寄せるためのスペーサー
+        filter_and_count_layout.addStretch(1)
 
         self.glyph_count_label = QLabel("-/-")
         self.glyph_count_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         filter_and_count_layout.addWidget(self.glyph_count_label)
         
-        main_layout.addLayout(filter_and_count_layout) # メインレイアウトに新しい水平レイアウトを追加
+        main_layout.addLayout(filter_and_count_layout)
 
         self.tab_widget = QTabWidget()
         main_layout.addWidget(self.tab_widget, 1)
 
         self.std_glyph_view = QTableView()
-        self.std_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, parent=self)
+        self.std_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, is_pua_tab=False, parent=self)
         self.std_glyph_delegate = GlyphTableDelegate(self.std_glyph_view)
         self._setup_table_view(self.std_glyph_view, self.std_glyph_model, self.std_glyph_delegate)
         self.tab_widget.addTab(self.std_glyph_view, "標準グリフ")
 
         self.vrt2_glyph_view = QTableView()
-        self.vrt2_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=True, parent=self)
+        self.vrt2_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=True, is_pua_tab=False, parent=self)
         self.vrt2_glyph_delegate = GlyphTableDelegate(self.vrt2_glyph_view)
         self._setup_table_view(self.vrt2_glyph_view, self.vrt2_glyph_model, self.vrt2_glyph_delegate)
         self.tab_widget.addTab(self.vrt2_glyph_view, "縦書きグリフ")
+
+        self.pua_glyph_view = QTableView()
+        self.pua_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, is_pua_tab=True, parent=self)
+        self.pua_glyph_delegate = GlyphTableDelegate(self.pua_glyph_view)
+        self._setup_table_view(self.pua_glyph_view, self.pua_glyph_model, self.pua_glyph_delegate)
+        self.tab_widget.addTab(self.pua_glyph_view, "私用領域グリフ")
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self.current_active_view = self.std_glyph_view
         
         grid_width = DELEGATE_GRID_COLUMNS * DELEGATE_CELL_BASE_WIDTH + \
                      (DELEGATE_GRID_COLUMNS * DELEGATE_ITEM_MARGIN * 2) + \
-                     2 # Account for borders/padding
+                     2
         self.setFixedWidth(grid_width) 
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
@@ -3402,7 +3511,7 @@ class GlyphGridWidget(QWidget):
         view.horizontalHeader().hide()
         view.verticalHeader().hide()
         view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems) # Important
+        view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         view.setShowGrid(False)
         view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -3434,7 +3543,7 @@ class GlyphGridWidget(QWidget):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if event.type() == QEvent.Type.KeyPress:
-            if watched is self.std_glyph_view or watched is self.vrt2_glyph_view:
+            if watched is self.std_glyph_view or watched is self.vrt2_glyph_view or watched is self.pua_glyph_view:
                 key_event = QKeyEvent(event)
                 if key_event.key() in [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down]:
                     if key_event.modifiers() == Qt.NoModifier or key_event.modifiers() == Qt.KeypadModifier :
@@ -3463,25 +3572,22 @@ class GlyphGridWidget(QWidget):
         if char_to_find == '.' and len(search_text) > 1 and search_text.lower() == ".notdef":
             char_to_find = ".notdef"
         
-        target_model = self.std_glyph_model if self.current_active_view == self.std_glyph_view else self.vrt2_glyph_model
+        target_model = self.current_active_view.model()
         target_view = self.current_active_view
         
         flat_idx = target_model.get_flat_index_of_char_key(char_to_find)
         if flat_idx is not None:
             self._select_char_in_view(char_to_find, target_view, target_model)
-            # MainWindow.load_glyph_for_editing will set focus to canvas
             self.search_input.clear() 
             return
         
         QMessageBox.information(self, "検索結果", f"文字 '{search_text}' は現在表示中のリストに見つかりません。")
-        # After QMessageBox, focus might shift. Ensure canvas focus if a glyph is active.
         main_window = self.window()
         if isinstance(main_window, MainWindow) and main_window.drawing_editor_widget.canvas.current_glyph_character:
             main_window.drawing_editor_widget.canvas.setFocus()
 
     def _update_glyph_count_label(self):
-        """現在アクティブなタブのグリフ数をラベルに表示します。"""
-        if not hasattr(self, 'glyph_count_label'): # 初期化途中の場合など
+        if not hasattr(self, 'glyph_count_label'):
             return
 
         active_model = self.current_active_view.model()
@@ -3495,10 +3601,8 @@ class GlyphGridWidget(QWidget):
     def _on_filter_changed(self, checked: bool):
         self.std_glyph_model.set_filter_written_only(checked)
         self.vrt2_glyph_model.set_filter_written_only(checked)
+        self.pua_glyph_model.set_filter_written_only(checked)
         
-        # After filter change, a new selection (or no selection) will occur.
-        # This will call _try_to_restore_selection_or_select_first,
-        # which in turn ensures the signal is emitted to MainWindow.
         self._try_to_restore_selection_or_select_first(self.current_active_view)
         self._update_glyph_count_label()
 
@@ -3509,21 +3613,15 @@ class GlyphGridWidget(QWidget):
 
         if index == 0:
             self.current_active_view = self.std_glyph_view
-        else:
+        elif index == 1:
             self.current_active_view = self.vrt2_glyph_view
+        elif index == 2:
+            self.current_active_view = self.pua_glyph_view
         
         self.search_input.clear()
         
-        # Attempt to restore selection or select the first item in the new tab.
-        # This will call _select_char_in_view, which will handle emitting signals.
         self._try_to_restore_selection_or_select_first(self.current_active_view)
 
-        # The _select_char_in_view (via _try_to_restore...) should ensure the correct
-        # signal is emitted, leading to load_glyph_for_editing and canvas focus.
-        # If, after _try_to_restore..., no item is selected, _select_char_in_view(None...)
-        # will trigger a signal with an empty char_key.
-
-        # Explicitly emit signal for the current state of the new active tab
         final_selected_idx = self.current_active_view.currentIndex()
         model = self.current_active_view.model()
         char_key_to_load: Optional[str] = None
@@ -3531,10 +3629,12 @@ class GlyphGridWidget(QWidget):
             char_key_to_load = model.data(final_selected_idx, Qt.UserRole)
         
         is_vrt2 = (self.current_active_view == self.vrt2_glyph_view)
+        is_pua = (self.current_active_view == self.pua_glyph_view)
+        
         if char_key_to_load:
-            self._emit_selection_signal(char_key_to_load, is_vrt2)
+            self._emit_selection_signal(char_key_to_load, is_vrt2, is_pua)
         else:
-            self._emit_selection_signal("", is_vrt2)
+            self._emit_selection_signal("", is_vrt2, is_pua)
 
         self._update_glyph_count_label()
 
@@ -3547,31 +3647,28 @@ class GlyphGridWidget(QWidget):
         if not isinstance(view, QTableView):
             return
 
-        if not index.isValid(): # Clicked on empty area of the view
-            main_window = self.window() # Try to get MainWindow instance
+        if not index.isValid():
+            main_window = self.window()
             if isinstance(main_window, MainWindow):
                 if main_window.drawing_editor_widget.canvas.current_glyph_character:
                      main_window.drawing_editor_widget.canvas.setFocus()
             return
         
-        # An actual item was clicked.
         model = view.model()
         if not isinstance(model, GlyphTableModel): return
 
         char_key_from_click = model.data(index, Qt.UserRole)
         if char_key_from_click:
             is_vrt2_source = (view == self.vrt2_glyph_view)
-            # This will trigger load_glyph_for_editing (via MainWindow), which focuses the canvas.
-            self._emit_selection_signal(char_key_from_click, is_vrt2_source)
+            is_pua_source = (view == self.pua_glyph_view)
+            self._emit_selection_signal(char_key_from_click, is_vrt2_source, is_pua_source)
 
 
     def _on_current_item_changed_in_view(self, current: QModelIndex, previous: QModelIndex):
         if self._is_selecting_programmatically:
             return
 
-        active_view = self.current_active_view # Should be the sender's view context
-        # It's possible sender() might be more robust if this slot is connected to multiple views' selection models
-        # For now, current_active_view is updated by _on_tab_changed.
+        active_view = self.current_active_view
         
         model = active_view.model()
         if not isinstance(model, GlyphTableModel):
@@ -3579,18 +3676,21 @@ class GlyphGridWidget(QWidget):
 
         if not current.isValid():
             is_vrt2_source_for_clear = (active_view == self.vrt2_glyph_view)
-            self._emit_selection_signal("", is_vrt2_source_for_clear)
+            is_pua_source_for_clear = (active_view == self.pua_glyph_view)
+            self._emit_selection_signal("", is_vrt2_source_for_clear, is_pua_source_for_clear)
             return
         
         char_key_from_current_idx = model.data(current, Qt.UserRole)
         if char_key_from_current_idx:
             is_vrt2_source = (active_view == self.vrt2_glyph_view)
-            self._emit_selection_signal(char_key_from_current_idx, is_vrt2_source)
+            is_pua_source = (active_view == self.pua_glyph_view)
+            self._emit_selection_signal(char_key_from_current_idx, is_vrt2_source, is_pua_source)
 
 
-    def _emit_selection_signal(self, char_key: str, is_vrt2_source: bool):
-        # This is the single point for emitting selection to MainWindow
-        if is_vrt2_source:
+    def _emit_selection_signal(self, char_key: str, is_vrt2_source: bool, is_pua_source: bool):
+        if is_pua_source:
+            self.pua_glyph_selected_signal.emit(char_key)
+        elif is_vrt2_source:
             self.vrt2_glyph_selected_signal.emit(char_key)
         else:
             self.glyph_selected_signal.emit(char_key)
@@ -3606,44 +3706,55 @@ class GlyphGridWidget(QWidget):
     def clear_grid_and_models(self):
         self.std_glyph_model.set_character_data([])
         self.vrt2_glyph_model.set_character_data([])
+        self.pua_glyph_model.set_character_data([])
         self._update_glyph_count_label() 
 
     def populate_models(self, 
                         std_char_data: List[Tuple[str, bool]], 
-                        vrt2_char_data: List[Tuple[str, bool]]):
+                        vrt2_char_data: List[Tuple[str, bool]],
+                        pua_char_data: List[Tuple[str, bool]]):
         self._is_selecting_programmatically = True
         try:
             self.std_glyph_model.set_character_data(std_char_data)
             self.vrt2_glyph_model.set_character_data(vrt2_char_data)
+            self.pua_glyph_model.set_character_data(pua_char_data)
         finally:
             self._is_selecting_programmatically = False
         self._update_glyph_count_label() 
 
 
-    def set_active_glyph(self, character: Optional[str], is_vrt2_source: bool = False):
+    def set_active_glyph(self, character: Optional[str], is_vrt2_source: bool = False, is_pua_source: bool = False):
         if self._is_selecting_programmatically: 
             return
 
         self._is_selecting_programmatically = True 
         try:
-            target_view = self.vrt2_glyph_view if is_vrt2_source else self.std_glyph_view
-            target_model = self.vrt2_glyph_model if is_vrt2_source else self.std_glyph_model
+            if is_pua_source:
+                target_view = self.pua_glyph_view
+                target_model = self.pua_glyph_model
+                target_tab_index = 2
+            elif is_vrt2_source:
+                target_view = self.vrt2_glyph_view
+                target_model = self.vrt2_glyph_model
+                target_tab_index = 1
+            else:
+                target_view = self.std_glyph_view
+                target_model = self.std_glyph_model
+                target_tab_index = 0
 
-            target_tab_index = 1 if is_vrt2_source else 0
             if self.tab_widget.currentIndex() != target_tab_index:
                 self.tab_widget.setCurrentIndex(target_tab_index) 
             self.current_active_view = target_view
 
             if character is None or not character:
-                target_view.selectionModel().clearSelection() # Use clearSelection for full clear
-                # _on_current_item_changed_in_view will handle emitting empty signal
+                target_view.selectionModel().clearSelection()
             else:
                 flat_idx = target_model.get_flat_index_of_char_key(character)
                 if flat_idx is not None:
                     row, col = divmod(flat_idx, target_model.columnCount())
                     q_model_idx = target_model.index(row, col)
                     if q_model_idx.isValid():
-                        if target_view.currentIndex() != q_model_idx: # Only if selection changes
+                        if target_view.currentIndex() != q_model_idx:
                              target_view.selectionModel().setCurrentIndex(q_model_idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Current)
                         target_view.scrollTo(q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
                     else: 
@@ -3660,7 +3771,7 @@ class GlyphGridWidget(QWidget):
             return
         
         target_q_model_idx: Optional[QModelIndex] = None
-        must_emit_manually = False # To track if selection didn't change but signal needed
+        must_emit_manually = False
 
         if character:
             flat_idx = model.get_flat_index_of_char_key(character)
@@ -3674,25 +3785,21 @@ class GlyphGridWidget(QWidget):
 
         if target_q_model_idx:
             if current_view_idx != target_q_model_idx:
-                # Selection will change, _on_current_item_changed_in_view handles signal
                 current_selection_model.setCurrentIndex(target_q_model_idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Current)
             else:
-                # Selection is the same, currentChanged won't fire. We need to ensure editor knows.
                 must_emit_manually = True
             view.scrollTo(target_q_model_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-        else: # No valid target character or character not found
+        else:
             if current_view_idx.isValid():
-                current_selection_model.clearSelection() # Will trigger currentChanged if valid -> invalid
-            # else: already clear, no signal needed from here by currentChanged
+                current_selection_model.clearSelection()
 
-        if must_emit_manually and character: # Character is valid and already selected
-            is_vrt2 = (view == self.vrt2_glyph_view)
-            self._emit_selection_signal(character, is_vrt2)
+        is_pua = (view == self.pua_glyph_view)
+        is_vrt2 = (view == self.vrt2_glyph_view)
+
+        if must_emit_manually and character:
+            self._emit_selection_signal(character, is_vrt2, is_pua)
         elif not target_q_model_idx and not current_view_idx.isValid() and character is None:
-            # This case: asked to select None, and view is already clear.
-            # No currentChanged, but editor needs to know.
-            is_vrt2 = (view == self.vrt2_glyph_view)
-            self._emit_selection_signal("", is_vrt2)
+            self._emit_selection_signal("", is_vrt2, is_pua)
 
 
     def _try_to_restore_selection_or_select_first(self, view_to_update: QTableView):
@@ -3707,27 +3814,30 @@ class GlyphGridWidget(QWidget):
         
         char_to_set: Optional[str] = None
         if current_char_key and model_to_update.get_flat_index_of_char_key(current_char_key) is not None:
-            char_to_set = current_char_key # Try to keep current selection if valid
+            char_to_set = current_char_key
         elif model_to_update.get_metadata_count() > 0:
-            char_to_set = model_to_update.get_char_key_at_flat_index(0) # Fallback to first
+            char_to_set = model_to_update.get_char_key_at_flat_index(0)
         
         self._select_char_in_view(char_to_set, view_to_update, model_to_update)
 
-    # =============== START OF MODIFIED update_glyph_preview METHOD ===============
-    def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool):
+    def update_glyph_preview(self, character: str, pixmap: Optional[QPixmap], is_vrt2_source: bool, is_pua_source: bool = False):
         if self._is_selecting_programmatically:
             return
 
         self._is_selecting_programmatically = True
         try:
-            # Determine the view and model that correspond to the glyph being updated
-            view_of_updated_glyph = self.vrt2_glyph_view if is_vrt2_source else self.std_glyph_view
+            if is_pua_source:
+                view_of_updated_glyph = self.pua_glyph_view
+            elif is_vrt2_source:
+                view_of_updated_glyph = self.vrt2_glyph_view
+            else:
+                view_of_updated_glyph = self.std_glyph_view
+                
             model_of_updated_glyph = view_of_updated_glyph.model()
             
-            if not isinstance(model_of_updated_glyph, GlyphTableModel): # Should not happen
+            if not isinstance(model_of_updated_glyph, GlyphTableModel):
                 return
 
-            # Store selection state *before* model update, specific to the view being updated
             current_idx_in_target_view = view_of_updated_glyph.currentIndex()
             is_updated_char_selected_before_model_change = False
             if current_idx_in_target_view.isValid():
@@ -3735,48 +3845,23 @@ class GlyphGridWidget(QWidget):
                 if char_key_at_current_idx == character:
                     is_updated_char_selected_before_model_change = True
 
-            # Perform the model update. This might trigger modelReset if filter is on.
             model_of_updated_glyph.update_glyph_pixmap(character, pixmap)
             
-            # Update count label for the *currently active* tab
             self._update_glyph_count_label()
 
-            # If the filter is on AND the updated glyph *was* selected in its view before the model change
             if self.show_written_only_checkbox.isChecked() and is_updated_char_selected_before_model_change:
                 
-                # Re-check if the character (which was updated and previously selected)
-                # is still present in the (now potentially re-filtered) model.
                 flat_idx = model_of_updated_glyph.get_flat_index_of_char_key(character)
                 if flat_idx is not None:
-                    # The character is still visible, so restore its selection.
                     row, col = divmod(flat_idx, model_of_updated_glyph.columnCount())
                     q_model_idx_to_restore = model_of_updated_glyph.index(row, col)
                     
                     if q_model_idx_to_restore.isValid():
-                        # We are in _is_selecting_programmatically = True context.
-                        # Setting current index will not trigger unwanted history updates.
                         if view_of_updated_glyph.currentIndex() != q_model_idx_to_restore:
                              view_of_updated_glyph.selectionModel().setCurrentIndex(q_model_idx_to_restore, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Current)
                         view_of_updated_glyph.scrollTo(q_model_idx_to_restore, QAbstractItemView.ScrollHint.EnsureVisible)
                 else:
-                    # The previously selected item (which was the one being updated) is no longer visible.
-                    # This could happen if a glyph was "erased" to blank and the filter hides non-written.
-                    # As a fallback, try to select the first item in that view.
-                    # _try_to_restore_selection_or_select_first itself handles the _is_selecting_programmatically flag for its internal _select_char_in_view call.
-                    # However, we are already in a True block, so we need to call it carefully or ensure it's safe.
-                    # Let's temporarily set it to False for this specific call, as _try_to_restore... might need to emit.
-                    # This part is tricky. A simpler way: if the selected item disappears, the view might clear selection.
-                    # If current_active_view is view_of_updated_glyph, then its selection change (or clear)
-                    # would trigger _on_current_item_changed_in_view, which would then call _emit_selection_signal.
-                    # For now, if item disappears, let QTableView handle selection clear.
-                    # If it's cleared, _on_current_item_changed_in_view would emit ("" or new selection).
-                    # This might be sufficient. If not, _try_to_restore_selection_or_select_first would be needed here.
-                    # Let's rely on QTableView clearing selection for now if item vanishes.
-                    # If the view is the active one, its currentChanged signal will fire.
-                    pass # Selection will be naturally cleared by QTableView if the item vanishes.
-
-            # If the filter is OFF, QTableView usually maintains selection on data change unless the item itself is removed.
-            # update_glyph_pixmap only changes data or affects filtering, doesn't remove items from underlying metadata.
+                    pass
 
         finally:
             self._is_selecting_programmatically = False
@@ -3816,7 +3901,6 @@ class GlyphGridWidget(QWidget):
 
 
     def keyPressEvent(self, event: QKeyEvent):
-        # 【修正点】MainWindowで平滑化処理中の場合はキー操作を無視する
         main_window = self.window()
         if isinstance(main_window, MainWindow) and main_window._is_smoothing_in_progress:
             event.accept()
@@ -3922,13 +4006,9 @@ class PropertiesWidget(QWidget):
         layout.addLayout(font_weight_layout); layout.addSpacing(10)
 
         layout.addWidget(QLabel("著作権情報:"))
-        self.copyright_text_edit = QTextEdit() # Using QTextEdit for potentially multi-line info
+        self.copyright_text_edit = QTextEdit()
         self.copyright_text_edit.setPlaceholderText("例: (C) 2024 Your Name. All rights reserved.")
-        self.copyright_text_edit.setFixedHeight(60) # Adjust as needed
-        # For QTextEdit, textChanged is better, but can be noisy. We'll use a debounce or save on focus out.
-        # For simplicity, let's connect to a method that MainWindow will call or use a timer.
-        # A simpler approach for now: signal on textChanged and let MainWindow debounce if needed, or save periodically.
-        # Let's use a debouncer here for cleaner signals.
+        self.copyright_text_edit.setFixedHeight(60)
         self.copyright_text_edit.textChanged.connect(self._on_copyright_text_changed)
         self._copyright_debounce_timer = QTimer(self)
         self._copyright_debounce_timer.setSingleShot(True)
@@ -3938,7 +4018,7 @@ class PropertiesWidget(QWidget):
         layout.addWidget(QLabel("ライセンス情報:"))
         self.license_text_edit = QTextEdit()
         self.license_text_edit.setPlaceholderText("例: SIL Open Font License, Version 1.1")
-        self.license_text_edit.setFixedHeight(100) # Adjust as needed
+        self.license_text_edit.setFixedHeight(100)
         self.license_text_edit.textChanged.connect(self._on_license_text_changed)
         self._license_debounce_timer = QTimer(self)
         self._license_debounce_timer.setSingleShot(True)
@@ -3970,13 +4050,13 @@ class PropertiesWidget(QWidget):
 
 
     def _on_copyright_text_changed(self):
-        self._copyright_debounce_timer.start(750) # Debounce for 750ms
+        self._copyright_debounce_timer.start(750)
 
     def _emit_copyright_info(self):
         self.copyright_info_changed_signal.emit(self.copyright_text_edit.toPlainText())
 
     def _on_license_text_changed(self):
-        self._license_debounce_timer.start(750) # Debounce for 750ms
+        self._license_debounce_timer.start(750)
 
     def _emit_license_info(self):
         self.license_info_changed_signal.emit(self.license_text_edit.toPlainText())
@@ -4019,29 +4099,22 @@ class PropertiesWidget(QWidget):
 
 
     def mousePressEvent(self, event: QMouseEvent):
-        # このウィジェットの背景(余白)がクリックされたかを確認
-        # childAt() は、指定された位置に子ウィジェットがあればそれを返す。なければ None。
-        # もしクリック位置に具体的な操作可能な子ウィジェット (ボタン、テキスト入力など) がなく、
-        # PropertiesWidget 自身がクリックされたと見なせる場合、フォーカスを移す。
         clicked_child = self.childAt(event.position().toPoint())
         
-        # もしクリックされたのが PropertiesWidget 自身 (背景) であり、
-        # かつ MainWindow のインスタンスを取得でき、そのキャンバスにグリフがロードされていればフォーカスを移す
-        if clicked_child is None or clicked_child is self: # clicked_child is None means background
-            main_window = self.window() # PropertiesWidget のトップレベルウィンドウ (MainWindow のはず)
-            if isinstance(main_window, MainWindow): # MainWindow の型を確認
+        if clicked_child is None or clicked_child is self:
+            main_window = self.window()
+            if isinstance(main_window, MainWindow):
                 if main_window.drawing_editor_widget.canvas.current_glyph_character:
                     main_window.drawing_editor_widget.canvas.setFocus()
-                    event.accept() # イベントを消費
+                    event.accept()
                     return
         
-        super().mousePressEvent(event) # それ以外は通常の処理
+        super().mousePressEvent(event)
 
 
 
 
 
-# --- Batch Advance Width Dialog (変更なし) ---
 class BatchAdvanceWidthDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4065,6 +4138,35 @@ class BatchAdvanceWidthDialog(QDialog):
         adv_width = self.advance_width_spinbox.value()
         return char_spec if char_spec else None, adv_width
 
+class AddPuaDialog(QDialog):
+    def __init__(self, available_slots: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("私用領域グリフの追加")
+        self.setMinimumWidth(350)
+        layout = QVBoxLayout(self)
+        form_layout = QGridLayout()
+        
+        self.available_label = QLabel(f"追加可能な最大グリフ数: {available_slots}")
+        form_layout.addWidget(self.available_label, 0, 0, 1, 2)
+
+        form_layout.addWidget(QLabel("追加するグリフ数:"), 1, 0)
+        self.count_spinbox = QSpinBox()
+        self.count_spinbox.setRange(1, max(1, available_slots))
+        self.count_spinbox.setValue(1)
+        form_layout.addWidget(self.count_spinbox, 1, 1)
+
+        layout.addLayout(form_layout)
+        
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.button(QDialogButtonBox.Ok).setText("追加")
+        self.button_box.button(QDialogButtonBox.Ok).setEnabled(available_slots > 0)
+        self.button_box.button(QDialogButtonBox.Cancel).setText("キャンセル")
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+        
+    def get_value(self) -> int:
+        return self.count_spinbox.value()
 
 
 
@@ -4075,7 +4177,7 @@ class BatchAdvanceWidthDialog(QDialog):
 
 
 class ClickableKanjiLabel(QLabel):
-    clicked_with_info = Signal(str, bool) # char_key, is_vrt2_glyph
+    clicked_with_info = Signal(str, bool)
 
     def __init__(self, char_key: str, is_vrt2_glyph: bool, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -4107,8 +4209,6 @@ class MainWindow(QMainWindow):
     KV_MODE_HIDDEN = 2
 
 
-# MainWindowクラス内の__init__メソッドを以下に置き換えてください
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("P-Glyph")
@@ -4116,7 +4216,7 @@ class MainWindow(QMainWindow):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
 
         self.db_manager = DatabaseManager() 
-        self.db_mutex = QMutex()  # <--- この行を追加
+        self.db_mutex = QMutex()
         self.current_project_path: Optional[str] = None
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(QThread.idealThreadCount())
@@ -4124,7 +4224,7 @@ class MainWindow(QMainWindow):
         self._is_smoothing_in_progress = False
 
 
-        self.edit_history: List[Tuple[str, bool]] = [] 
+        self.edit_history: List[Tuple[str, bool, bool]] = [] 
         self.current_history_index: int = -1
         self._is_navigating_history: bool = False 
 
@@ -4138,6 +4238,7 @@ class MainWindow(QMainWindow):
         self._batch_operation_in_progress: bool = False 
         self._last_active_glyph_char_from_load: Optional[str] = None
         self._last_active_glyph_is_vrt2_from_load: bool = False
+        self._last_active_glyph_is_pua_from_load: bool = False
 
 
         self.drawing_editor_widget = DrawingEditorWidget()
@@ -4186,6 +4287,8 @@ class MainWindow(QMainWindow):
         self.file_menu: Optional[QMenu] = None; self.new_project_action: Optional[QAction] = None
         self.open_project_action: Optional[QAction] = None; self.exit_action: Optional[QAction] = None
         self.edit_menu: Optional[QMenu] = None; self.batch_adv_width_action: Optional[QAction] = None
+        self.add_pua_glyph_action: Optional[QAction] = None
+        self.delete_pua_glyph_action: Optional[QAction] = None
         self.batch_import_glyphs_action: Optional[QAction] = None
         self.batch_import_reference_images_action: Optional[QAction] = None
         self._create_menus()
@@ -4196,8 +4299,9 @@ class MainWindow(QMainWindow):
 
         if self.kanji_viewer_font_combo:
             self.kanji_viewer_font_combo.currentTextChanged.connect(self._handle_kv_font_combo_changed)
-        self.glyph_grid_widget.glyph_selected_signal.connect(lambda char: self.load_glyph_for_editing(char, is_vrt2_edit_mode=False))
-        self.glyph_grid_widget.vrt2_glyph_selected_signal.connect(lambda char: self.load_glyph_for_editing(char, is_vrt2_edit_mode=True))
+        self.glyph_grid_widget.glyph_selected_signal.connect(lambda char: self.load_glyph_for_editing(char, is_vrt2_edit_mode=False, is_pua_edit_mode=False))
+        self.glyph_grid_widget.vrt2_glyph_selected_signal.connect(lambda char: self.load_glyph_for_editing(char, is_vrt2_edit_mode=True, is_pua_edit_mode=False))
+        self.glyph_grid_widget.pua_glyph_selected_signal.connect(lambda char: self.load_glyph_for_editing(char, is_vrt2_edit_mode=False, is_pua_edit_mode=True))
         self.drawing_editor_widget.canvas.glyph_modified_signal.connect(self.handle_glyph_modification_from_canvas)
         self.drawing_editor_widget.reference_image_selected_signal.connect(self.save_reference_image_async)
         self.drawing_editor_widget.reference_image_deleted_signal.connect(self.handle_delete_reference_image_async)
@@ -4219,19 +4323,81 @@ class MainWindow(QMainWindow):
         self.drawing_editor_widget.transfer_to_vrt2_requested.connect(self.handle_transfer_to_vrt2)
         self.drawing_editor_widget.advance_width_changed_signal.connect(self.save_glyph_advance_width_async)
         
-        # --- NEW Signal connections for history navigation ---
         self.drawing_editor_widget.navigate_history_back_requested.connect(self._navigate_edit_history_back)
         self.drawing_editor_widget.navigate_history_forward_requested.connect(self._navigate_edit_history_forward)
-        # --- END NEW Signal connections ---
 
         self._update_ui_for_project_state() 
         self._load_kanji_viewer_data_and_fonts() 
         QTimer.singleShot(0, self._kv_initial_display_setup) 
         QTimer.singleShot(100, self._update_bookmark_button_state)
-        self.drawing_editor_widget.update_history_buttons_state(False, False) # NEW: Initial state
+        self.drawing_editor_widget.update_history_buttons_state(False, False)
 
 
-    # --- NEW Methods for edit history management ---
+
+    def open_add_pua_dialog(self):
+        if not self.current_project_path or self._project_loading_in_progress:
+            QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
+        
+        current_pua_count = self.db_manager.get_pua_glyph_count()
+        available_slots = PUA_MAX_COUNT - current_pua_count
+        
+        dialog = AddPuaDialog(available_slots, self)
+        if dialog.exec() == QDialog.Accepted:
+            count_to_add = dialog.get_value()
+            if count_to_add > 0:
+                self.statusBar().showMessage(f"{count_to_add}個の私用領域グリフを追加中...", 0)
+                QApplication.processEvents()
+                
+                added_count, error_msg = self.db_manager.add_pua_glyphs(count_to_add)
+                
+                if error_msg:
+                    QMessageBox.warning(self, "追加エラー", f"グリフの追加に失敗しました: {error_msg}")
+                else:
+                    QMessageBox.information(self, "追加完了", f"{added_count}個の私用領域グリフを追加しました。")
+                
+                # グリッドをリロード
+                self._set_project_loading_state(True) 
+                self.glyph_grid_widget.clear_grid_and_models() 
+                worker = LoadProjectWorker(self.current_project_path)
+                worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
+                worker.signals.error.connect(self._on_project_load_error)
+                worker.signals.finished.connect(self._check_and_finalize_loading_state) 
+                self.thread_pool.start(worker)
+
+        if self.drawing_editor_widget.canvas.current_glyph_character:
+            self.drawing_editor_widget.canvas.setFocus()
+    
+    def delete_current_pua_glyph(self):
+        canvas = self.drawing_editor_widget.canvas
+        if not canvas.editing_pua_glyph or not canvas.current_glyph_character:
+            QMessageBox.information(self, "情報", "削除対象の私用領域グリフが選択されていません。")
+            return
+            
+        char_to_delete = canvas.current_glyph_character
+        reply = QMessageBox.question(self, "削除の確認", 
+                                     f"私用領域グリフ「U+{ord(char_to_delete):04X}」を完全に削除しますか？\nこの操作は元に戻せません。",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            self.statusBar().showMessage(f"グリフ「U+{ord(char_to_delete):04X}」を削除中...", 0)
+            if self.db_manager.delete_pua_glyph(char_to_delete):
+                QMessageBox.information(self, "削除完了", "グリフを削除しました。")
+                # グリッドをリロード
+                self._set_project_loading_state(True) 
+                self.glyph_grid_widget.clear_grid_and_models()
+                worker = LoadProjectWorker(self.current_project_path)
+                worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
+                worker.signals.error.connect(self._on_project_load_error)
+                worker.signals.finished.connect(self._check_and_finalize_loading_state) 
+                self.thread_pool.start(worker)
+            else:
+                QMessageBox.critical(self, "削除エラー", "グリフの削除に失敗しました。")
+                self.statusBar().clearMessage()
+
+        if canvas.current_glyph_character:
+            canvas.setFocus()
+
+
     def _update_history_navigation_buttons(self):
         if not self.current_project_path or self._project_loading_in_progress:
             self.drawing_editor_widget.update_history_buttons_state(False, False)
@@ -4245,11 +4411,11 @@ class MainWindow(QMainWindow):
         if self._project_loading_in_progress or not self.current_project_path: return
         if self.current_history_index > 0:
             self.current_history_index -= 1
-            char, is_vrt2 = self.edit_history[self.current_history_index]
+            char, is_vrt2, is_pua = self.edit_history[self.current_history_index]
             
             self._is_navigating_history = True
             try:
-                self.load_glyph_for_editing(char, is_vrt2_edit_mode=is_vrt2)
+                self.load_glyph_for_editing(char, is_vrt2_edit_mode=is_vrt2, is_pua_edit_mode=is_pua)
             finally:
                 self._is_navigating_history = False
             
@@ -4263,23 +4429,24 @@ class MainWindow(QMainWindow):
         if self._project_loading_in_progress or not self.current_project_path: return
         if self.current_history_index < len(self.edit_history) - 1:
             self.current_history_index += 1
-            char, is_vrt2 = self.edit_history[self.current_history_index]
+            char, is_vrt2, is_pua = self.edit_history[self.current_history_index]
 
             self._is_navigating_history = True
             try:
-                self.load_glyph_for_editing(char, is_vrt2_edit_mode=is_vrt2)
+                self.load_glyph_for_editing(char, is_vrt2_edit_mode=is_vrt2, is_pua_edit_mode=is_pua)
             finally:
                 self._is_navigating_history = False
 
             self._update_history_navigation_buttons()
             if self.drawing_editor_widget.canvas.current_glyph_character:
                 self.drawing_editor_widget.canvas.setFocus()
-    
-    def _add_to_edit_history(self, character: str, is_vrt2: bool):
+
+
+    def _add_to_edit_history(self, character: str, is_vrt2: bool, is_pua: bool):
         if self._is_navigating_history: 
             return
 
-        new_entry = (character, is_vrt2)
+        new_entry = (character, is_vrt2, is_pua)
 
         if self.current_history_index < len(self.edit_history) - 1:
             self.edit_history = self.edit_history[:self.current_history_index + 1]
@@ -4297,7 +4464,6 @@ class MainWindow(QMainWindow):
         self.edit_history.clear()
         self.current_history_index = -1
         self._update_history_navigation_buttons()
-    # --- END NEW Methods ---
 
 
     def _get_font_bookmarks_path(self) -> str:
@@ -4563,7 +4729,6 @@ class MainWindow(QMainWindow):
 
 
 
-# In class MainWindow:
     @Slot(int, dict, str, int)
     def _handle_kv_related_kanji_result(self, process_id: int, results_dict: dict, font_family_from_worker: str, font_px_size: int):
         with QMutexLocker(self._worker_management_mutex):
@@ -4724,16 +4889,12 @@ class MainWindow(QMainWindow):
             scroll_area = QScrollArea(); scroll_area.setWidgetResizable(True); scroll_area.setWidget(tab_content_widget)
             scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded); scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             
-            # ▼▼▼【ここからが追加部分】▼▼▼
             def refocus_editor():
-                """エディタのキャンバスにフォーカスを戻すためのヘルパー関数"""
                 if self.drawing_editor_widget.canvas.current_glyph_character:
                     self.drawing_editor_widget.canvas.setFocus()
 
-            # スクロールバーのいずれかのアクション（スライダーのプレス、矢印クリック等）でフォーカスを戻す
             scroll_area.verticalScrollBar().actionTriggered.connect(refocus_editor)
             scroll_area.horizontalScrollBar().actionTriggered.connect(refocus_editor)
-            # ▲▲▲【ここまでが追加部分】▲▲▲
 
             tab_idx = self.kanji_viewer_related_tabs.addTab(scroll_area, radical)
             if radical == current_tab_text_before_clear: new_selected_index_to_restore = tab_idx
@@ -4796,7 +4957,15 @@ class MainWindow(QMainWindow):
         self.exit_action = QAction("&終了", self); self.exit_action.triggered.connect(self.close)
         self.file_menu.addAction(self.exit_action); self.edit_menu = menu_bar.addMenu("&編集")
         self.batch_adv_width_action = QAction("文字送り幅一括編集...", self); self.batch_adv_width_action.triggered.connect(self.open_batch_advance_width_dialog)
-        self.edit_menu.addAction(self.batch_adv_width_action); self.edit_menu.addSeparator()
+        self.edit_menu.addAction(self.batch_adv_width_action)
+        self.edit_menu.addSeparator()
+        self.add_pua_glyph_action = QAction("私用領域グリフの追加...", self)
+        self.add_pua_glyph_action.triggered.connect(self.open_add_pua_dialog)
+        self.edit_menu.addAction(self.add_pua_glyph_action)
+        self.delete_pua_glyph_action = QAction("現在の私用領域グリフを削除", self)
+        self.delete_pua_glyph_action.triggered.connect(self.delete_current_pua_glyph)
+        self.edit_menu.addAction(self.delete_pua_glyph_action)
+        self.edit_menu.addSeparator()
         self.batch_import_glyphs_action = QAction("グリフの一括読み込み...", self); self.batch_import_glyphs_action.triggered.connect(self.batch_import_glyphs)
         self.edit_menu.addAction(self.batch_import_glyphs_action)
         self.batch_import_reference_images_action = QAction("下書きの一括読み込み...", self); self.batch_import_reference_images_action.triggered.connect(self.batch_import_reference_images)
@@ -4808,6 +4977,8 @@ class MainWindow(QMainWindow):
         self.properties_widget.setEnabled(not loading and self.current_project_path is not None)
         self.glyph_grid_widget.set_search_and_filter_enabled(not loading and self.current_project_path is not None)
         if self.batch_adv_width_action: self.batch_adv_width_action.setEnabled(not loading and self.current_project_path is not None)
+        if self.add_pua_glyph_action: self.add_pua_glyph_action.setEnabled(not loading and self.current_project_path is not None)
+        if self.delete_pua_glyph_action: self.delete_pua_glyph_action.setEnabled(not loading and self.current_project_path is not None)
         if self.batch_import_glyphs_action: self.batch_import_glyphs_action.setEnabled(not loading and self.current_project_path is not None)
         if self.batch_import_reference_images_action: self.batch_import_reference_images_action.setEnabled(not loading and self.current_project_path is not None)
         if self.new_project_action: self.new_project_action.setEnabled(not loading)
@@ -4825,6 +4996,12 @@ class MainWindow(QMainWindow):
         self.glyph_grid_widget.set_search_and_filter_enabled(project_loaded_and_not_processing) 
 
         if self.batch_adv_width_action: self.batch_adv_width_action.setEnabled(project_loaded_and_not_processing)
+        if self.add_pua_glyph_action: self.add_pua_glyph_action.setEnabled(project_loaded_and_not_processing)
+        if self.delete_pua_glyph_action:
+            self.delete_pua_glyph_action.setEnabled(
+                project_loaded_and_not_processing and 
+                self.drawing_editor_widget.canvas.editing_pua_glyph
+            )
         if self.batch_import_glyphs_action: self.batch_import_glyphs_action.setEnabled(project_loaded_and_not_processing)
         if self.batch_import_reference_images_action: self.batch_import_reference_images_action.setEnabled(project_loaded_and_not_processing)
         kv_data_ok = self._kanji_viewer_data_loaded_successfully and bool(self.kanji_viewer_font_combo and self.kanji_viewer_font_combo.count() > 0)
@@ -4862,7 +5039,7 @@ class MainWindow(QMainWindow):
                 self.glyph_grid_widget.set_active_glyph(None)
                 self.drawing_editor_widget.update_unicode_display(None)
                 self.project_glyph_chars_cache.clear(); self.non_rotated_vrt2_chars.clear()
-                self._clear_edit_history() # MODIFIED: Clear history
+                self._clear_edit_history()
                 if self.kv_mode_button_group and self.kv_mode_written_button: 
                     self.kv_mode_button_group.blockSignals(True); self.kv_mode_written_button.setChecked(True); self.kv_mode_button_group.blockSignals(False)
                 self.kv_display_mode = MainWindow.KV_MODE_WRITTEN_GLYPHS
@@ -4875,7 +5052,7 @@ class MainWindow(QMainWindow):
                     self._kv_set_label_font_and_text(self.kanji_viewer_display_label, self._kv_initial_char_to_display, default_kv_font, self.kanji_viewer_display_label.rect(), 0.85)
                 if self.kanji_viewer_related_tabs: self.kanji_viewer_related_tabs.clear()
         self._update_bookmark_button_state() 
-        self._update_history_navigation_buttons() # MODIFIED: Update history buttons
+        self._update_history_navigation_buttons()
 
     def _load_font_settings_txt(self): 
         script_dir = os.path.dirname(os.path.abspath(__file__)); settings_file_path = os.path.join(script_dir, FONT_SETTINGS_FILENAME)
@@ -4917,7 +5094,7 @@ class MainWindow(QMainWindow):
         if filepath:
             if not filepath.endswith(".fontproj"): filepath += ".fontproj"
             self._set_project_loading_state(True) 
-            self._clear_edit_history() # MODIFIED: Clear history
+            self._clear_edit_history()
             initial_chars = self._load_font_settings_txt()
             r_vrt2_chars = self._load_vrt2_settings_txt(R_VERT_FILENAME, DEFAULT_R_VERT_CHARS)
             nr_vrt2_chars = self._load_vrt2_settings_txt(VERT_FILENAME, DEFAULT_VERT_CHARS)
@@ -4937,7 +5114,6 @@ class MainWindow(QMainWindow):
         self.current_project_path = filepath
         self.db_manager.connect_db(filepath) 
         self.glyph_grid_widget.clear_grid_and_models() 
-        # self._clear_edit_history() is already called in new_project before this slot is triggered by create_worker
         load_worker = LoadProjectWorker(self.current_project_path)
         load_worker.signals.basic_info_loaded.connect(self._on_project_basic_info_loaded)
         load_worker.signals.load_progress.connect(self._on_load_progress)
@@ -4949,14 +5125,14 @@ class MainWindow(QMainWindow):
     def _on_project_create_error(self, error_message: str): 
         QMessageBox.critical(self, "プロジェクト作成エラー", error_message)
         self.current_project_path = None; self.project_glyph_chars_cache.clear(); self.non_rotated_vrt2_chars.clear()
-        self._clear_edit_history() # MODIFIED: Clear history on error too
+        self._clear_edit_history()
         self._set_project_loading_state(False) 
 
     def open_project(self): 
         if self._project_loading_in_progress: QMessageBox.information(self, "処理中", "プロジェクトの読み込みまたは作成処理が進行中です。"); return
         filepath, _ = QFileDialog.getOpenFileName(self, "プロジェクトを開く", "", "Font Project Files (*.fontproj)")
         if filepath:
-            self._clear_edit_history() # MODIFIED: Clear history
+            self._clear_edit_history()
             self._set_project_loading_state(True) 
             self.current_project_path = filepath; self.db_manager.connect_db(filepath) 
             self.glyph_grid_widget.clear_grid_and_models() 
@@ -4971,7 +5147,7 @@ class MainWindow(QMainWindow):
     def _check_and_finalize_loading_state(self): 
         if self._project_loading_in_progress: 
             self._set_project_loading_state(False)
-            self._select_initial_glyph_after_full_load() # This will add the first glyph to history
+            self._select_initial_glyph_after_full_load()
             if self.current_project_path: 
                 self.statusBar().showMessage(f"プロジェクト '{os.path.basename(self.current_project_path)}' の読み込み完了。", 5000)
 
@@ -4997,7 +5173,8 @@ class MainWindow(QMainWindow):
         
         self.glyph_grid_widget.populate_models(
             basic_data['char_set_list_with_img_info'],
-            basic_data['nr_vrt2_list_with_img_info']
+            basic_data['nr_vrt2_list_with_img_info'],
+            basic_data['pua_list_with_img_info']
         )
         self.project_glyph_chars_cache = set(basic_data['char_set_list']) 
 
@@ -5036,14 +5213,30 @@ class MainWindow(QMainWindow):
         if not self.current_project_path or self._project_loading_in_progress: return
         char_to_load_initially: Optional[str] = None
         load_as_vrt2_initially = False
+        load_as_pua_initially = False
 
         if self._last_active_glyph_char_from_load:
             char_key = self._last_active_glyph_char_from_load
             is_vrt2 = self._last_active_glyph_is_vrt2_from_load
-            model_to_check = self.glyph_grid_widget.vrt2_glyph_model if is_vrt2 else self.glyph_grid_widget.std_glyph_model
+            is_pua = False
+            try:
+                codepoint = ord(char_key)
+                if PUA_START_CODEPOINT <= codepoint <= PUA_END_CODEPOINT:
+                    is_pua = True
+            except (TypeError, ValueError):
+                pass
+
+            if is_pua:
+                model_to_check = self.glyph_grid_widget.pua_glyph_model
+            elif is_vrt2:
+                model_to_check = self.glyph_grid_widget.vrt2_glyph_model
+            else:
+                model_to_check = self.glyph_grid_widget.std_glyph_model
+                
             if model_to_check.get_flat_index_of_char_key(char_key) is not None:
                 char_to_load_initially = char_key
                 load_as_vrt2_initially = is_vrt2
+                load_as_pua_initially = is_pua
         
         if not char_to_load_initially: 
             first_nav_info = self.glyph_grid_widget.get_first_navigable_glyph_info()
@@ -5052,12 +5245,10 @@ class MainWindow(QMainWindow):
         
         self.drawing_editor_widget.update_vrt2_controls(False, False)
         
-        # MODIFIED: Clear history before loading the very first glyph
         self._clear_edit_history() 
 
         if char_to_load_initially:
-            # load_glyph_for_editing will call _add_to_edit_history
-            self.load_glyph_for_editing(char_to_load_initially, is_vrt2_edit_mode=load_as_vrt2_initially)
+            self.load_glyph_for_editing(char_to_load_initially, is_vrt2_edit_mode=load_as_vrt2_initially, is_pua_edit_mode=load_as_pua_initially)
         else: 
             adv_width = DEFAULT_ADVANCE_WIDTH 
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
@@ -5067,7 +5258,6 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.canvas.setFocus() 
         
         self._update_bookmark_button_state()
-        # _update_history_navigation_buttons is handled by _add_to_edit_history or _clear_edit_history
 
     @Slot(int, str)
     def _on_load_progress(self, progress: int, message: str): 
@@ -5079,33 +5269,41 @@ class MainWindow(QMainWindow):
         self.current_project_path = None; self.db_manager.db_path = None 
         self.project_glyph_chars_cache.clear(); 
         self.non_rotated_vrt2_chars.clear()
-        self._clear_edit_history() # MODIFIED: Clear history on error too
+        self._clear_edit_history()
         self.statusBar().showMessage("プロジェクトの読み込みに失敗しました。", 5000)
 
     def _save_current_advance_width_sync(self, character: str, advance_width: int): 
         if not self.current_project_path or not character: return
         try:
-            # === 修正点 ===
-            # メインスレッドからの書き込みも、共有Mutexでロックします。
             locker = QMutexLocker(self.db_mutex)
             self.db_manager.save_glyph_advance_width(character, advance_width)
         except Exception as e:
-            # エラーが発生した場合でも、プログラムは続行します。
             print(f"Error in _save_current_advance_width_sync: {e}")
 
 
 
     @Slot(str) 
     @Slot(str, bool) 
-    def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False):
+    def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False, is_pua_edit_mode: bool = False):
         if self._project_loading_in_progress: return 
 
+        if self.drawing_editor_widget.mirror_checkbox.isChecked():
+            # チェックボックスのシグナルが発動しないようにブロックしながら状態を変更
+            self.drawing_editor_widget.mirror_checkbox.blockSignals(True)
+            self.drawing_editor_widget.mirror_checkbox.setChecked(False)
+            self.drawing_editor_widget.mirror_checkbox.blockSignals(False)
+            
+            # Canvasの状態を更新
+            self.drawing_editor_widget.canvas.set_mirror_mode(False)
+            
+            # 設定を非同期で保存
+            self.save_gui_setting_async(SETTING_MIRROR_MODE, "False")
+            
         current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
         current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value() 
         
-        # MODIFIED: Add to history if not navigating and character is valid
         if character and not self._is_navigating_history and not self._batch_operation_in_progress:
-            self._add_to_edit_history(character, is_vrt2_edit_mode)
+            self._add_to_edit_history(character, is_vrt2_edit_mode, is_pua_edit_mode)
         
         if current_canvas_char and not self._batch_operation_in_progress: 
             if current_canvas_char != character or \
@@ -5124,27 +5322,31 @@ class MainWindow(QMainWindow):
         
         if not self.current_project_path or not character: 
             adv_width = DEFAULT_ADVANCE_WIDTH
-            self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False)
+            self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False, is_pua=False)
             self.drawing_editor_widget.set_enabled_controls(False)
             self.glyph_grid_widget.set_active_glyph(None) 
             self.drawing_editor_widget.update_unicode_display(None)
             self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
             self.drawing_editor_widget.update_vrt2_controls(False, False)
-            if not self._is_navigating_history: # Avoid recursive update if called from nav
-                self._update_history_navigation_buttons() # MODIFIED
+            if not self._is_navigating_history:
+                self._update_history_navigation_buttons()
             self.drawing_editor_widget.canvas.setFocus() 
             return
         
-        adv_width = self.db_manager.load_glyph_advance_width(character)
-        pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode)
+        adv_width = self.db_manager.load_glyph_advance_width(character, is_pua=is_pua_edit_mode)
+        pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
         reference_pixmap = None
-        if is_vrt2_edit_mode: reference_pixmap = self.db_manager.load_vrt2_glyph_reference_image(character)
-        else: reference_pixmap = self.db_manager.load_reference_image(character)
+        if is_pua_edit_mode:
+            reference_pixmap = self.db_manager.load_reference_image(character, is_pua=True)
+        elif is_vrt2_edit_mode:
+            reference_pixmap = self.db_manager.load_vrt2_glyph_reference_image(character)
+        else:
+            reference_pixmap = self.db_manager.load_reference_image(character, is_pua=False)
         
-        self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode)
+        self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
         self.drawing_editor_widget.set_enabled_controls(True)
         
-        self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode) 
+        self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode, is_pua_source=is_pua_edit_mode) 
         
         self.drawing_editor_widget.update_unicode_display(character)
         self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
@@ -5160,26 +5362,27 @@ class MainWindow(QMainWindow):
             current_glyph_has_content_on_canvas = self.drawing_editor_widget.canvas.image and not self.drawing_editor_widget.canvas.image.isNull() 
             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(editor_is_generally_enabled and current_glyph_has_content_on_canvas)
         
+        self.delete_pua_glyph_action.setEnabled(is_pua_edit_mode)
+
         if character and not self._project_loading_in_progress and not self._batch_operation_in_progress:
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_edit_mode))
 
-        if not self._is_navigating_history: # MODIFIED
+        if not self._is_navigating_history:
              self._update_history_navigation_buttons()
 
         self.drawing_editor_widget.canvas.setFocus() 
 
 
 
-    @Slot(str, QPixmap, bool)
-    def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool): 
+    @Slot(str, QPixmap, bool, bool)
+    def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool, is_pua: bool): 
         if not self.current_project_path or self._project_loading_in_progress: return
         
-        worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex)
+        worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, is_pua_glyph=is_pua, mutex=self.db_mutex)
         worker.signals.result.connect(self.on_glyph_save_success)
         worker.signals.error.connect(self.on_glyph_save_error)
 
-        # 【修正点】平滑化処理の場合、完了時にフラグをリセットするスロットを接続
         if self._is_smoothing_in_progress:
             worker.signals.finished.connect(self._on_smoothing_finished)
 
@@ -5191,10 +5394,19 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(can_enable_button)
 
     @Slot(str, QPixmap, bool)
-    def on_glyph_save_success(self, character: str, saved_pixmap: QPixmap, is_vrt2_glyph: bool): 
+    def on_glyph_save_success(self, character: str, saved_pixmap: QPixmap, is_vrt2_or_pua: bool): 
         if self._project_loading_in_progress: return 
         if self.current_project_path: 
-             self.glyph_grid_widget.update_glyph_preview(character, saved_pixmap, is_vrt2_source=is_vrt2_glyph)
+            is_pua = False
+            try:
+                codepoint = ord(character)
+                if PUA_START_CODEPOINT <= codepoint <= PUA_END_CODEPOINT:
+                    is_pua = True
+            except TypeError:
+                pass
+            
+            is_vrt2 = is_vrt2_or_pua and not is_pua
+            self.glyph_grid_widget.update_glyph_preview(character, saved_pixmap, is_vrt2_source=is_vrt2, is_pua_source=is_pua)
 
     @Slot(str)
     def on_glyph_save_error(self, error_message: str): 
@@ -5204,9 +5416,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_smoothing_finished(self):
-        """平滑化に伴う非同期処理が完了したときに呼ばれるスロット"""
         self._is_smoothing_in_progress = False
-        # 処理が終わったので、グリッドウィジェットを再度有効にする
         self.glyph_grid_widget.setEnabled(True)
         if self.drawing_editor_widget.canvas.current_glyph_character:
             self.drawing_editor_widget.canvas.setFocus()
@@ -5214,7 +5424,8 @@ class MainWindow(QMainWindow):
     @Slot(str, QPixmap, bool) 
     def save_reference_image_async(self, character: str, pixmap: QPixmap, is_vrt2: bool): 
         if self.current_project_path and character and not self._project_loading_in_progress:
-            worker = SaveReferenceImageWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex) # <--- 修正
+            is_pua = self.drawing_editor_widget.canvas.editing_pua_glyph
+            worker = SaveReferenceImageWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, is_pua_glyph=is_pua, mutex=self.db_mutex)
             worker.signals.result.connect(self.on_reference_image_save_success)
             worker.signals.error.connect(self.on_reference_image_save_error)
             self.thread_pool.start(worker)
@@ -5222,17 +5433,18 @@ class MainWindow(QMainWindow):
     @Slot(str, bool) 
     def handle_delete_reference_image_async(self, character: str, is_vrt2: bool): 
         if self.current_project_path and character and not self._project_loading_in_progress:
-            worker = SaveReferenceImageWorker(self.current_project_path, character, None, is_vrt2_glyph=is_vrt2, mutex=self.db_mutex) # <--- 修正
+            is_pua = self.drawing_editor_widget.canvas.editing_pua_glyph
+            worker = SaveReferenceImageWorker(self.current_project_path, character, None, is_vrt2_glyph=is_vrt2, is_pua_glyph=is_pua, mutex=self.db_mutex)
             worker.signals.result.connect(self.on_reference_image_save_success)
             worker.signals.error.connect(self.on_reference_image_save_error)
             self.thread_pool.start(worker)
 
     @Slot(str, QPixmap, bool) 
-    def on_reference_image_save_success(self, character: str, saved_pixmap: Optional[QPixmap], is_vrt2_saved: bool): 
+    def on_reference_image_save_success(self, character: str, saved_pixmap: Optional[QPixmap], is_vrt2_or_pua: bool): 
         if self._project_loading_in_progress: return
         current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
         current_canvas_is_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
-        if character == current_canvas_char and is_vrt2_saved == current_canvas_is_vrt2_editing:
+        if character == current_canvas_char and is_vrt2_or_pua == current_canvas_is_vrt2_editing:
             self.drawing_editor_widget.canvas.reference_image = saved_pixmap.copy() if saved_pixmap else None
             self.drawing_editor_widget.canvas.update()
             self.drawing_editor_widget.delete_ref_button.setEnabled(self.drawing_editor_widget.load_ref_button.isEnabled() and (saved_pixmap is not None))
@@ -5248,7 +5460,7 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def save_gui_setting_async(self, key: str, value: str): 
         if self.current_project_path and not self._project_loading_in_progress:
-            worker = SaveGuiStateWorker(self.current_project_path, key, value, self.db_mutex) # <--- 修正
+            worker = SaveGuiStateWorker(self.current_project_path, key, value, self.db_mutex)
             worker.signals.error.connect(self.on_gui_save_error) 
             self.thread_pool.start(worker)
     
@@ -5259,7 +5471,8 @@ class MainWindow(QMainWindow):
     @Slot(str, int)
     def save_glyph_advance_width_async(self, character: str, advance_width: int): 
         if self.current_project_path and character and not self._project_loading_in_progress:
-            worker = SaveAdvanceWidthWorker(self.current_project_path, character, advance_width, self.db_mutex) # <--- 修正
+            is_pua = self.drawing_editor_widget.canvas.editing_pua_glyph
+            worker = SaveAdvanceWidthWorker(self.current_project_path, character, advance_width, is_pua_glyph=is_pua, mutex=self.db_mutex)
             worker.signals.error.connect(self.on_gui_save_error) 
             self.thread_pool.start(worker)
 
@@ -5273,14 +5486,32 @@ class MainWindow(QMainWindow):
     def update_project_character_set(self, new_char_string: str): 
         if not self.current_project_path or self._project_loading_in_progress:
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
-        processed_chars = self._process_char_set_string(new_char_string)
+        
+        original_chars = self._process_char_set_string(new_char_string)
+        processed_chars = []
+        pua_chars_found = []
+        for char in original_chars:
+            try:
+                codepoint = ord(char)
+                if PUA_START_CODEPOINT <= codepoint <= PUA_END_CODEPOINT:
+                    pua_chars_found.append(f"U+{codepoint:04X} ({char})")
+                else:
+                    processed_chars.append(char)
+            except TypeError:
+                processed_chars.append(char)
+        
+        if pua_chars_found:
+            QMessageBox.warning(self, "文字セットの検証",
+                                f"以下の私用領域(PUA)の文字は標準文字セットには追加できません。\n"
+                                f"これらは自動的に除外されました。\n\n"
+                                f"{', '.join(pua_chars_found)}\n\n"
+                                f"私用領域のグリフは、メニューの「編集」->「私用領域グリフの追加」から管理してください。")
+            self.properties_widget.load_character_set("".join(processed_chars))
+            
         try:
-            # === 修正点 ===
-            # DB構造の変更を伴うため、Mutexで保護します。
             locker = QMutexLocker(self.db_mutex)
             self.db_manager.update_project_character_set(processed_chars) 
             
-            # DB更新後にUIと非同期ワーカーを開始します。
             self._set_project_loading_state(True) 
             self._clear_edit_history()
             self.glyph_grid_widget.clear_grid_and_models() 
@@ -5301,7 +5532,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         try:
-            # === 修正点 ===
             locker = QMutexLocker(self.db_mutex)
             self.db_manager.update_rotated_vrt2_character_set(processed_chars)
 
@@ -5327,8 +5557,6 @@ class MainWindow(QMainWindow):
         new_nr_vrt2_set = set(processed_chars)
         
         try:
-            # === 修正点 ===
-            # 複数のDB更新をアトミックに行うため、Mutexで保護します。
             locker = QMutexLocker(self.db_mutex)
             r_vrt2_set_from_db = set(self.db_manager.get_rotated_vrt2_character_set())
             conflicts_resolved_r_vrt2 = list(r_vrt2_set_from_db - new_nr_vrt2_set)
@@ -5381,7 +5609,7 @@ class MainWindow(QMainWindow):
             standard_pixmap = QPixmap(self.drawing_editor_widget.canvas.image_size); standard_pixmap.fill(QColor(Qt.white))
         try:
             pixmap_for_worker = standard_pixmap.copy() 
-            vrt2_save_worker = SaveGlyphWorker(self.current_project_path, current_char, pixmap_for_worker, is_vrt2_glyph=True, mutex=self.db_mutex) # <--- 修正
+            vrt2_save_worker = SaveGlyphWorker(self.current_project_path, current_char, pixmap_for_worker, is_vrt2_glyph=True, is_pua_glyph=False, mutex=self.db_mutex)
             vrt2_save_worker.signals.result.connect(self._handle_transfer_to_vrt2_result)
             vrt2_save_worker.signals.error.connect(self._handle_transfer_to_vrt2_error)
             vrt2_save_worker.signals.finished.connect(self._reenable_vrt2_buttons_after_transfer) 
@@ -5417,28 +5645,63 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"'{char_display_name}' の縦書きグリフ転送処理完了。", 3000)
 
 
+
+
     @Slot(bool) 
     def handle_glyph_to_reference_and_reset(self, is_vrt2_target: bool): 
         if not self.current_project_path or self._project_loading_in_progress:
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
-        canvas = self.drawing_editor_widget.canvas; current_char = canvas.current_glyph_character
-        if not current_char: QMessageBox.information(self, "操作不可", "グリフが選択されていません。"); return
+        canvas = self.drawing_editor_widget.canvas
+        current_char = canvas.current_glyph_character
+        if not current_char:
+            QMessageBox.information(self, "操作不可", "グリフが選択されていません。"); return
+
+        # 現在のグリフがPUAかどうかをキャンバスから取得
+        is_pua_target = canvas.editing_pua_glyph
+
+        # is_vrt2_target はPUAの場合は常にFalseのはずだが、念のため整合性をチェック
+        if is_pua_target and is_vrt2_target:
+             QMessageBox.critical(self, "内部エラー", "PUAグリフとVRT2グリフが同時に編集中としてマークされています。"); return
         if canvas.editing_vrt2_glyph != is_vrt2_target:
             QMessageBox.critical(self, "内部エラー", "グリフを下書きへ転送操作でモード不一致。"); return
+
         current_glyph_pixmap = canvas.get_current_image()
-        if current_glyph_pixmap.isNull(): QMessageBox.information(self, "情報", "グリフに描画内容がありません。"); return
-        self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(False); QApplication.processEvents()
-        ref_worker = SaveReferenceImageWorker(self.current_project_path, current_char, current_glyph_pixmap.copy(), is_vrt2_glyph=is_vrt2_target, mutex=self.db_mutex) # <--- 修正
+        if current_glyph_pixmap.isNull():
+            QMessageBox.information(self, "情報", "グリフに描画内容がありません。"); return
+
+        self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(False)
+        QApplication.processEvents()
+
+        # SaveReferenceImageWorkerに is_pua_glyph フラグを渡す
+        ref_worker = SaveReferenceImageWorker(self.current_project_path, current_char, current_glyph_pixmap.copy(), 
+                                              is_vrt2_glyph=is_vrt2_target, 
+                                              is_pua_glyph=is_pua_target, 
+                                              mutex=self.db_mutex)
         ref_worker.signals.result.connect(self._on_glyph_to_ref_transfer_ref_save_success)
         ref_worker.signals.error.connect(lambda err: self._on_glyph_to_ref_transfer_error("下書き保存", err))
-        ref_worker.signals.finished.connect(self._check_glyph_to_ref_reset_completion); self.thread_pool.start(ref_worker)
-        blank_pixmap = QPixmap(canvas.image_size); blank_pixmap.fill(QColor(Qt.white))
-        canvas.image = blank_pixmap.copy(); canvas._save_state_to_undo_stack(); canvas.update() 
-        glyph_worker = SaveGlyphWorker(self.current_project_path, current_char, blank_pixmap.copy(), is_vrt2_glyph=is_vrt2_target, mutex=self.db_mutex) # <--- 修正
+        ref_worker.signals.finished.connect(self._check_glyph_to_ref_reset_completion)
+        self.thread_pool.start(ref_worker)
+        
+        blank_pixmap = QPixmap(canvas.image_size)
+        blank_pixmap.fill(QColor(Qt.white))
+        canvas.image = blank_pixmap.copy()
+        canvas._save_state_to_undo_stack()
+        canvas.update() 
+        
+        # SaveGlyphWorkerに is_pua_glyph フラグを渡す
+        glyph_worker = SaveGlyphWorker(self.current_project_path, current_char, blank_pixmap.copy(), 
+                                       is_vrt2_glyph=is_vrt2_target, 
+                                       is_pua_glyph=is_pua_target, 
+                                       mutex=self.db_mutex)
         glyph_worker.signals.result.connect(self._on_glyph_to_ref_transfer_glyph_reset_success)
         glyph_worker.signals.error.connect(lambda err: self._on_glyph_to_ref_transfer_error("グリフ白紙化", err))
-        glyph_worker.signals.finished.connect(self._check_glyph_to_ref_reset_completion); self.thread_pool.start(glyph_worker)
+        glyph_worker.signals.finished.connect(self._check_glyph_to_ref_reset_completion)
+        self.thread_pool.start(glyph_worker)
+
         self._glyph_to_ref_reset_op_count = 2
+
+
+
 
     _glyph_to_ref_reset_op_count = 0 
 
@@ -5451,7 +5714,8 @@ class MainWindow(QMainWindow):
 
     def _on_glyph_to_ref_transfer_glyph_reset_success(self, character: str, reset_glyph_pixmap: QPixmap, is_vrt2_glyph_reset: bool): 
         if self._project_loading_in_progress: return
-        self.glyph_grid_widget.update_glyph_preview(character, reset_glyph_pixmap, is_vrt2_source=is_vrt2_glyph_reset) 
+        is_pua = self.drawing_editor_widget.canvas.editing_pua_glyph
+        self.glyph_grid_widget.update_glyph_preview(character, reset_glyph_pixmap, is_vrt2_source=is_vrt2_glyph_reset, is_pua_source=is_pua) 
         if hasattr(self.drawing_editor_widget, 'glyph_to_ref_reset_button'):
              self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(False) 
 
@@ -5536,7 +5800,6 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
-        # MODIFIED: History navigation shortcuts
         is_editor_component_focused_for_history = (
             focus_widget == self or
             focus_widget == self.centralWidget() or
@@ -5557,7 +5820,6 @@ class MainWindow(QMainWindow):
                         self._navigate_edit_history_forward()
                         event.accept()
                         return
-        # END MODIFIED
 
         if isinstance(focus_widget, (QLineEdit, QTextEdit, QSpinBox, QComboBox)):
             return 
@@ -5669,8 +5931,6 @@ class MainWindow(QMainWindow):
             if not self.project_glyph_chars_cache and target_chars_list: 
                 QMessageBox.warning(self, "エラー", "プロジェクトにグリフが読み込まれていないか空です。"); return
 
-        # === 修正点 ===
-        # バッチ処理中に他のDBアクセスをブロックするため、Mutexで保護します。
         locker = QMutexLocker(self.db_mutex)
         
         updated_count = 0; skipped_count = 0
@@ -5686,7 +5946,6 @@ class MainWindow(QMainWindow):
         except Exception as e: conn.rollback(); QMessageBox.critical(self, "一括更新エラー", f"データベース更新中にエラーが発生しました: {e}"); return
         finally: conn.close()
 
-        # ロックが解除された後にUIを更新
         QCoreApplication.processEvents() 
 
         summary_message = f"{updated_count} 文字の送り幅を {new_adv_width} に更新しました。"
