@@ -717,14 +717,24 @@ def find_kanji_by_shared_radical_per_radical(
     if input_kanji not in kanji_to_radicals_map: return {}
     target_radicals = kanji_to_radicals_map.get(input_kanji, [])
     if not target_radicals: return {}
+    
     results_per_radical = {}
     for radical in target_radicals:
         if radical in radical_to_kanji_map:
             kanji_list_for_radical = radical_to_kanji_map.get(radical, [])
-            filtered_kanji_list = sorted(list(set(
-                k for k in kanji_list_for_radical if k != input_kanji
+            
+            temp_list = list(kanji_list_for_radical)
+
+            if radical in radical_to_kanji_map:
+                temp_list.append(radical)
+
+            final_kanji_list = sorted(list(set(
+                k for k in temp_list if k != input_kanji
             )))
-            if filtered_kanji_list: results_per_radical[radical] = filtered_kanji_list
+
+            if final_kanji_list:
+                results_per_radical[radical] = final_kanji_list
+                
     return results_per_radical
 
 
@@ -5298,7 +5308,7 @@ class MainWindow(QMainWindow):
             
             # 設定を非同期で保存
             self.save_gui_setting_async(SETTING_MIRROR_MODE, "False")
-            
+
         current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
         current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value() 
         
