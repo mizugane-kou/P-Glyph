@@ -2522,6 +2522,8 @@ class DrawingEditorWidget(QWidget):
              self.window().statusBar().showMessage("グリフ画像をクリップボードにコピーしました。", 2000)
         self.canvas.setFocus()
 
+
+
     def paste_from_clipboard(self):
         if not self.canvas.current_glyph_character:
             QMessageBox.warning(self, "グリフ未選択", "グリフが選択されていません。画像をペーストできません。")
@@ -2540,17 +2542,40 @@ class DrawingEditorWidget(QWidget):
 
             try:
                 target_size = self.canvas.image_size
+                
+                # クリップボードの画像が透過情報を持っているかチェック
+                has_transparency = qimage_from_clipboard.hasAlphaChannel()
+
+
+                # ペースト先の画像を準備
+                if has_transparency:
+                    # 透過画像の場合：現在のキャンバス画像をベースにする
+                    # QPixmapからQImageに変換してPainterで描画できるようにする
+                    base_image = self.canvas.image.toImage()
+                    # 念のため、フォーマットを合わせておく
+                    final_image = base_image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+                else:
+                    # 不透明画像の場合：白紙の画像をベースにする
+                    final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
+                    final_image.fill(QColor(Qt.white))
+
+                # ペーストする画像をリサイズ
                 scaled_image = qimage_from_clipboard.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 
-                final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
-                final_image.fill(QColor(Qt.white)) 
-
+                # Painterを使って画像を合成
                 painter = QPainter(final_image)
+                # デフォルトの合成モード（SourceOver）がアルファブレンドを行う
+                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                
+                # 画像を中央に配置するためのオフセット計算
                 x_offset = (target_size.width() - scaled_image.width()) // 2
                 y_offset = (target_size.height() - scaled_image.height()) // 2
+                
+                # 合成（描画）
                 painter.drawImage(x_offset, y_offset, scaled_image)
                 painter.end()
 
+                # キャンバスを更新
                 self.canvas.image = QPixmap.fromImage(final_image)
                 self.canvas._save_state_to_undo_stack() 
                 if self.canvas.current_glyph_character: 
@@ -2561,13 +2586,17 @@ class DrawingEditorWidget(QWidget):
                         self.canvas.editing_pua_glyph
                     )
                 self.canvas.update()
+                
+                status_message = "画像をレイヤーとしてペーストしました。" if has_transparency else "画像をペーストしました。"
                 if self.window() and hasattr(self.window(), 'statusBar'):
-                    self.window().statusBar().showMessage("画像をクリップボードからペーストしました。", 2000)
+                    self.window().statusBar().showMessage(status_message, 2000)
             except Exception as e:
                 QMessageBox.critical(self, "ペースト処理エラー", f"画像の処理中にエラーが発生しました: {e}")
         else:
             QMessageBox.information(self, "ペースト不可", "クリップボードに画像データがありません。")
         self.canvas.setFocus()
+
+
 
     def export_current_glyph_image(self):
         if not self.canvas.current_glyph_character:
