@@ -2525,6 +2525,10 @@ class DrawingEditorWidget(QWidget):
         self.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
         self.set_enabled_controls(False)
 
+        # 平滑化処理が他のDB処理の完了を待っているかを示すフラグ
+        self._smoothing_is_deferred = False
+
+
     def set_rotated_vrt2_chars(self, chars: Set[str]):
         self.rotated_vrt2_chars = chars
         self.update_unicode_display(self.canvas.current_glyph_character)
@@ -2890,76 +2894,82 @@ class DrawingEditorWidget(QWidget):
 
 
 
+
     def _handle_smooth_button_clicked(self):
-        """「平滑化-角」ボタンがクリックされたときの処理"""
+        """「平滑化-角」ボタンがクリックされた時のエントリーポイント"""
         main_window = self.window()
         if not isinstance(main_window, MainWindow):
             return
 
-        try:
-            # グリフが選択されていない場合
-            if not self.canvas.current_glyph_character:
-                QMessageBox.warning(self, "グリフ未選択", "平滑化するグリフが選択されていません。")
-                return
-
-            # 【修正点】MainWindowのフラグを立て、グリッド操作を一時的に無効化
-            main_window._is_smoothing_in_progress = True
-            main_window.glyph_grid_widget.setEnabled(False)
-
-            # 1. 現在のグリフ画像を取得
-            current_pixmap = self.canvas.get_current_image()
+        # 長時間処理が既に実行中かチェック (ボタンが押せる時点ではFalseのはずだが念のため)
+        if main_window._is_smoothing_in_progress:
+            main_window.statusBar().showMessage("他の処理が完了するまでお待ちください。", 2000)
+            return
             
-            # 2. QPixmapをOpenCVのnumpy配列に変換
-            try:
-                cv_image = qpixmap_to_cv_np(current_pixmap)
-            except Exception as e:
-                QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
-                main_window._is_smoothing_in_progress = False
-                main_window.glyph_grid_widget.setEnabled(True)
-                return
-                
-            # 3. ContourProcessorで平滑化処理を実行
-            try:
-                processor = ContourProcessor(cv_image)
-                smoothed_image_np = processor.run()
+        # 他の「通常」DBワーカが実行中か確認
+        is_db_busy = False
+        with QMutexLocker(main_window.active_db_workers_mutex):
+            is_db_busy = main_window.active_db_workers > 0
 
-                if smoothed_image_np is None:
-                    QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
-                    main_window._is_smoothing_in_progress = False
-                    main_window.glyph_grid_widget.setEnabled(True)
-                    return
+        if is_db_busy:
+            # DBがビジーなら、処理を遅延させるフラグを立てて待機
+            self._smoothing_is_deferred = True
+            # UIをロック状態にする
+            main_window.set_long_operation_state(True)
+            main_window.statusBar().showMessage("描画の保存完了後に平滑化を実行します...", 3000)
+        else:
+            # DBが空いていれば、即座に実行
+            self._execute_smoothing_process()
 
-            except Exception as e:
-                import traceback
-                QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
-                main_window._is_smoothing_in_progress = False
-                main_window.glyph_grid_widget.setEnabled(True)
+
+
+    def _execute_smoothing_process(self):
+        """実際の平滑化処理とワーカ投入を行う"""
+        main_window = self.window()
+        if not isinstance(main_window, MainWindow): return
+
+        # 処理を開始する前に、UI全体をロック状態にする
+        main_window.set_long_operation_state(True)
+        
+        if not self.canvas.current_glyph_character:
+            QMessageBox.warning(self, "グリフ未選択", "平滑化するグリフが選択されていません。")
+            main_window.set_long_operation_state(False) # ロックを解除して終了
+            return
+        
+        try:
+            # ... (ここから先の平滑化のコアロジックは変更なし) ...
+            current_pixmap = self.canvas.get_current_image()
+            cv_image = qpixmap_to_cv_np(current_pixmap)
+            processor = ContourProcessor(cv_image)
+            smoothed_image_np = processor.run()
+
+            if smoothed_image_np is None:
+                QMessageBox.information(self, "平滑化情報", "画像から有効な輪郭が見つからなかったため、処理をスキップしました。")
+                main_window.set_long_operation_state(False) # ロックを解除して終了
                 return
-                
-            # 4. 処理結果のnumpy配列をQPixmapに変換
+
             smoothed_pixmap = cv_np_to_qpixmap(smoothed_image_np)
-
-            # 5. Canvasの表示を更新し、アンドゥスタックに保存
             self.canvas.image = smoothed_pixmap
             self.canvas._save_state_to_undo_stack()
             self.canvas.update()
 
-            # 6. データベース保存のためにシグナルを発行 (これにより非同期保存が開始される)
+            # MainWindowの保存ハンドラに処理を移譲する
             self.canvas.glyph_modified_signal.emit(
                 self.canvas.current_glyph_character,
                 self.canvas.image.copy(),
                 self.canvas.editing_vrt2_glyph,
                 self.canvas.editing_pua_glyph
             )
-            
-            # 7. ステータスバーにメッセージを表示
-            if main_window and hasattr(main_window, 'statusBar'):
+
+            if main_window.statusBar():
                 main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' を平滑化しました。", 3000)
 
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "平滑化処理エラー", f"平滑化処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
+            main_window.set_long_operation_state(False) # エラー時も必ずロックを解除
         finally:
             self.canvas.setFocus()
-
-
 
 
     def _handle_erode_button_clicked(self):
@@ -4388,8 +4398,11 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(QThread.idealThreadCount())
 
-        self._is_smoothing_in_progress = False
+        # 現在実行中のDBワーカ数を管理するカウンター
+        self.active_db_workers = 0
+        self.active_db_workers_mutex = QMutex() # カウンターへのアクセスを保護
 
+        self._is_smoothing_in_progress = False
 
         self.edit_history: List[Tuple[str, bool, bool]] = [] 
         self.current_history_index: int = -1
@@ -5551,9 +5564,15 @@ class MainWindow(QMainWindow):
     def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool, is_pua: bool): 
         if not self.current_project_path or self._project_loading_in_progress: return
         
+        # ワーカを投入する前にカウンターをインクリメント
+        self.change_active_db_workers(1)
+        
         worker = SaveGlyphWorker(self.current_project_path, character, pixmap, is_vrt2_glyph=is_vrt2, is_pua_glyph=is_pua, mutex=self.db_mutex)
         worker.signals.result.connect(self.on_glyph_save_success)
         worker.signals.error.connect(self.on_glyph_save_error)
+
+        # ワーカ完了時にカウンターをデクリメントするスロットに接続
+        worker.signals.finished.connect(self.decrement_active_db_workers)
 
         if self._is_smoothing_in_progress:
             worker.signals.finished.connect(self._on_smoothing_finished)
@@ -5588,8 +5607,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_smoothing_finished(self):
-        self._is_smoothing_in_progress = False
-        self.glyph_grid_widget.setEnabled(True)
+        # 長時間処理が完了したことを状態管理メソッドに通知
+        self.set_long_operation_state(False)
+        
+        # 最後にフォーカスを戻す
         if self.drawing_editor_widget.canvas.current_glyph_character:
             self.drawing_editor_widget.canvas.setFocus()
 
@@ -6343,6 +6364,9 @@ class MainWindow(QMainWindow):
             self.thread_pool.waitForDone(-1); event.accept()
         else: event.ignore()
 
+
+
+
     def resizeEvent(self, event: QResizeEvent): 
         super().resizeEvent(event)
         if self._project_loading_in_progress: return
@@ -6359,6 +6383,37 @@ class MainWindow(QMainWindow):
             if char_to_update and len(char_to_update) == 1: 
                 with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = char_to_update
                 self._kv_deferred_update_timer.start(self._kv_update_delay_ms)
+
+    def change_active_db_workers(self, delta: int):
+        """アクティブなDBワーカの数をスレッドセーフに変更する"""
+        with QMutexLocker(self.active_db_workers_mutex):
+            self.active_db_workers += delta
+
+    @Slot()
+    def decrement_active_db_workers(self):
+        """ワーカ完了時にカウンターをデクリメントし、遅延処理があれば実行する"""
+        self.change_active_db_workers(-1)
+        
+        with QMutexLocker(self.active_db_workers_mutex):
+            if self.active_db_workers == 0:
+                editor = self.drawing_editor_widget
+                # 平滑化処理が待機中であれば実行を指示する
+                if editor and hasattr(editor, '_smoothing_is_deferred') and editor._smoothing_is_deferred:
+                    editor._smoothing_is_deferred = False
+                    # UIイベントキュー経由で実行することで、タイミング問題を避ける
+                    QTimer.singleShot(0, editor._execute_smoothing_process)
+
+    def set_long_operation_state(self, is_busy: bool):
+        """長時間処理（平滑化など）の開始/終了に応じてUIの状態を一元管理する"""
+        self._is_smoothing_in_progress = is_busy
+        
+        # 関連するUIを一括で無効化/有効化する
+        self.glyph_grid_widget.setEnabled(not is_busy)
+        
+        editor = self.drawing_editor_widget
+        if editor:
+            editor.smooth_button.setEnabled(not is_busy)
+            editor.erode_button.setEnabled(not is_busy)
 
 
 
