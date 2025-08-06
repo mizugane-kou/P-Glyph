@@ -163,7 +163,7 @@ SKIMAGE_CONTOUR_LEVEL = 128.0   # 輪郭を検出する輝度レベル
 HV_TOLERANCE = 6.0             # 水平・垂直とみなす角度の許容範囲（度）
 GROUPING_ANGLE_TOLERANCE = 15  # セグメントを同一グループとして結合するための角度の許容範囲（度）
 NOISE_LENGTH_THRESHOLD = 10.0  # ノイズとみなす短いグループの最大長（ピクセル）
-THIN_FEATURE_THRESHOLD = 5.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
+THIN_FEATURE_THRESHOLD = 4.0  # ノイズと判定しない細い特徴（線）を区別する閾値（ピクセル）
 
 # main.py の既存の定数
 IMG_WIDTH = 500
@@ -898,6 +898,7 @@ class SaveGlyphWorker(QRunnable):
         self.mutex = mutex
         self.signals = SaveGlyphWorkerSignals()
 
+
     @Slot()
     def run(self):
         try:
@@ -910,36 +911,43 @@ class SaveGlyphWorker(QRunnable):
             qimage.save(buffer, "PNG")
             image_data = byte_array.data()
 
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
-            cursor = conn.cursor()
+            conn = None
+            try:
+                # タイムアウトを延長し、WALモードを有効にする
+                conn = sqlite3.connect(self.db_path, timeout=10.0)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
 
-            if self.is_pua_glyph:
-                table = "pua_glyphs"
-                cursor.execute(f"""
-                    UPDATE {table}
-                    SET image_data = ?, last_modified = CURRENT_TIMESTAMP
-                    WHERE character = ?
-                """, (image_data, self.character))
-            elif self.is_vrt2_glyph:
-                table = "vrt2_glyphs"
-                cursor.execute(f"""
-                    INSERT OR REPLACE INTO {table} (character, image_data, last_modified)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                """, (self.character, image_data))
-            else:
-                table = "glyphs"
-                cursor.execute(f"""
-                    UPDATE {table}
-                    SET image_data = ?, last_modified = CURRENT_TIMESTAMP
-                    WHERE character = ?
-                """, (image_data, self.character))
+                if self.is_pua_glyph:
+                    table = "pua_glyphs"
+                    cursor.execute(f"""
+                        UPDATE {table}
+                        SET image_data = ?, last_modified = CURRENT_TIMESTAMP
+                        WHERE character = ?
+                    """, (image_data, self.character))
+                elif self.is_vrt2_glyph:
+                    table = "vrt2_glyphs"
+                    cursor.execute(f"""
+                        INSERT OR REPLACE INTO {table} (character, image_data, last_modified)
+                        VALUES (?, ?, CURRENT_TIMESTAMP)
+                    """, (self.character, image_data))
+                else:
+                    table = "glyphs"
+                    cursor.execute(f"""
+                        UPDATE {table}
+                        SET image_data = ?, last_modified = CURRENT_TIMESTAMP
+                        WHERE character = ?
+                    """, (image_data, self.character))
 
-            if cursor.rowcount == 0 and not self.is_vrt2_glyph:
-                 pass
+                if cursor.rowcount == 0 and not self.is_vrt2_glyph:
+                     pass
 
-            conn.commit()
-            conn.close()
-            self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph)
+                conn.commit()
+                self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph)
+
+            finally:
+                if conn:
+                    conn.close()
 
         except Exception as e:
             import traceback
@@ -949,6 +957,7 @@ class SaveGlyphWorker(QRunnable):
             self.signals.error.emit(f"Error saving {err_type} '{self.character}': {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
+
 
 
 class SaveGuiStateWorker(QRunnable):
@@ -1273,7 +1282,9 @@ class DatabaseManager:
     def _get_connection(self):
         if not self.db_path:
             raise ConnectionError("Database path not set.")
-        conn = sqlite3.connect(self.db_path)
+        # タイムアウトを設定し、WALモードを有効にする
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -2396,6 +2407,14 @@ class DrawingEditorWidget(QWidget):
         self.smooth_button.setToolTip("現在のグリフ画像に対して輪郭が滑らかな直線となるように平滑化します。")
         self.smooth_button.clicked.connect(self._handle_smooth_button_clicked)
 
+        self.erode_button = QPushButton("細")
+        self.erode_button.setToolTip("現在のグリフ画像の輪郭を1ピクセル収縮させます。")
+        self.erode_button.clicked.connect(self._handle_erode_button_clicked)
+
+
+
+
+
         self.copy_button.clicked.connect(self.copy_to_clipboard)
         self.paste_button.clicked.connect(self.paste_from_clipboard)
         self.export_button.clicked.connect(self.export_current_glyph_image)
@@ -2408,6 +2427,8 @@ class DrawingEditorWidget(QWidget):
         display_options_layout.addWidget(self.export_button)
 
         display_options_layout.addWidget(self.smooth_button)
+
+        display_options_layout.addWidget(self.erode_button)
 
         display_options_layout.addSpacing(10) 
         display_options_layout.addStretch(1) 
@@ -2940,6 +2961,95 @@ class DrawingEditorWidget(QWidget):
 
 
 
+
+    def _handle_erode_button_clicked(self):
+        """「細」ボタンがクリックされたときの処理 (輪郭収縮)"""
+        main_window = self.window()
+        if not isinstance(main_window, MainWindow):
+            return
+
+        try:
+            # グリフが選択されていない場合
+            if not self.canvas.current_glyph_character:
+                QMessageBox.warning(self, "グリフ未選択", "処理するグリフが選択されていません。")
+                return
+
+            # 平滑化処理とUI無効化ロジックを共有
+            main_window._is_smoothing_in_progress = True
+            main_window.glyph_grid_widget.setEnabled(False)
+
+            # 1. 現在のグリフ画像を取得
+            current_pixmap = self.canvas.get_current_image()
+            
+            # 2. QPixmapをOpenCVのnumpy配列(BGR)に変換
+            try:
+                bgr_image = qpixmap_to_cv_np(current_pixmap)
+            except Exception as e:
+                QMessageBox.critical(self, "画像変換エラー", f"画像の内部形式変換中にエラーが発生しました: {e}")
+                main_window._is_smoothing_in_progress = False
+                main_window.glyph_grid_widget.setEnabled(True)
+                return
+                
+            # 3. 輪郭収縮処理を実行
+            try:
+                # グレースケールに変換
+                gray_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+                
+                # 白黒反転 (cv2.erodeは前景の白い領域を収縮させるため)
+                # 元画像が白背景(255)に黒文字(0)なので、反転して黒背景(0)に白文字(255)にする
+                inverted_image = cv2.bitwise_not(gray_image)
+
+                # 収縮処理に使用する3x3のカーネルを定義
+                kernel = np.ones((3, 3), np.uint8)
+
+                # 収縮処理を1回適用
+                eroded_image = cv2.erode(inverted_image, kernel, iterations=1)
+
+                # 再度反転して元の白黒に戻す
+                result_gray_image = cv2.bitwise_not(eroded_image)
+
+            except Exception as e:
+                import traceback
+                QMessageBox.critical(self, "輪郭収縮処理エラー", f"輪郭収縮処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
+                main_window._is_smoothing_in_progress = False
+                main_window.glyph_grid_widget.setEnabled(True)
+                return
+                
+            # 4. 処理結果のグレースケール画像をBGRに変換し、QPixmapに戻す
+            result_bgr_image = cv2.cvtColor(result_gray_image, cv2.COLOR_GRAY2BGR)
+            eroded_pixmap = cv_np_to_qpixmap(result_bgr_image)
+
+            # 5. Canvasの表示を更新し、アンドゥスタックに保存
+            self.canvas.image = eroded_pixmap
+            self.canvas._save_state_to_undo_stack()
+            self.canvas.update()
+
+            # 6. データベース保存のためにシグナルを発行 (非同期保存完了後にUIが有効化される)
+            self.canvas.glyph_modified_signal.emit(
+                self.canvas.current_glyph_character,
+                self.canvas.image.copy(),
+                self.canvas.editing_vrt2_glyph,
+                self.canvas.editing_pua_glyph
+            )
+            
+            # 7. ステータスバーにメッセージを表示
+            if main_window and hasattr(main_window, 'statusBar'):
+                main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' の輪郭を収縮しました。", 3000)
+
+        finally:
+            # UIの有効化は非同期保存後に行われるため、ここではフォーカス設定のみ
+            self.canvas.setFocus()
+
+
+
+
+
+
+
+
+
+
+
     def set_enabled_controls(self, enabled: bool):
         self.pen_button.setEnabled(enabled); self.eraser_button.setEnabled(enabled)
         self.move_button.setEnabled(enabled); self.slider.setEnabled(enabled)
@@ -2951,6 +3061,7 @@ class DrawingEditorWidget(QWidget):
         self.paste_button.setEnabled(enabled)
         self.export_button.setEnabled(enabled)
         self.smooth_button.setEnabled(enabled)
+        self.erode_button.setEnabled(enabled)
         self.mirror_checkbox.setEnabled(enabled)
         
         if not enabled: 
@@ -4029,6 +4140,7 @@ class PropertiesWidget(QWidget):
     copyright_info_changed_signal = Signal(str) 
     license_info_changed_signal = Signal(str) 
     export_font_signal = Signal()
+    export_font_rectified_signal = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4080,8 +4192,23 @@ class PropertiesWidget(QWidget):
         apply_nr_vrt2_button = QPushButton("非回転縦書き文字セットを適用")
         apply_nr_vrt2_button.clicked.connect(self._apply_nr_vrt2_changes); layout.addWidget(apply_nr_vrt2_button)
         layout.addSpacing(20)
+
+        
+        # ボタンを横に並べるためのレイアウトを作成
+        export_button_layout = QHBoxLayout()
+        
+        # 既存の書き出しボタン
         self.export_font_button = QPushButton("フォントを書き出す")
-        self.export_font_button.clicked.connect(self.export_font_signal); layout.addWidget(self.export_font_button)
+        self.export_font_button.clicked.connect(self.export_font_signal) # .emitは不要
+        export_button_layout.addWidget(self.export_font_button)
+        
+        # 新しい「-角」ボタンを追加
+        self.export_font_rectified_button = QPushButton("フォントを書き出す-角")
+        self.export_font_rectified_button.clicked.connect(self.export_font_rectified_signal) # .emitは不要
+        export_button_layout.addWidget(self.export_font_rectified_button)
+
+        # レイアウトにボタンのレイアウトを追加
+        layout.addLayout(export_button_layout)
         layout.addStretch(1)
 
     def _emit_font_name_change(self): self.font_name_changed_signal.emit(self.font_name_input.text())
@@ -4135,6 +4262,7 @@ class PropertiesWidget(QWidget):
         apply_buttons = [btn for btn in self.findChildren(QPushButton) if btn != self.export_font_button]
         for btn in apply_buttons: btn.setEnabled(enabled)
         self.export_font_button.setEnabled(enabled)
+        self.export_font_rectified_button.setEnabled(enabled)
 
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -4280,6 +4408,10 @@ class MainWindow(QMainWindow):
         self._last_active_glyph_is_pua_from_load: bool = False
 
 
+
+
+
+
         self.drawing_editor_widget = DrawingEditorWidget()
         self.glyph_grid_widget = GlyphGridWidget(self.db_manager) 
         self.properties_widget = PropertiesWidget()
@@ -4357,6 +4489,7 @@ class MainWindow(QMainWindow):
             lambda text: self.save_gui_setting_async(SETTING_LICENSE_INFO, text)
         )
         self.properties_widget.export_font_signal.connect(self.handle_export_font)
+        self.properties_widget.export_font_rectified_signal.connect(self.handle_export_font_rectified)
         self.drawing_editor_widget.gui_setting_changed_signal.connect(self.save_gui_setting_async)
         self.drawing_editor_widget.vrt2_edit_mode_toggled.connect(self.handle_vrt2_edit_mode_toggle)
         self.drawing_editor_widget.transfer_to_vrt2_requested.connect(self.handle_transfer_to_vrt2)
@@ -5777,6 +5910,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "情報", "フォント書き出し処理が既に実行中です。"); return
         self.original_export_button_state = self.properties_widget.export_font_button.isEnabled()
         self.properties_widget.export_font_button.setEnabled(False)
+        self.properties_widget.export_font_rectified_button.setEnabled(False) 
         self.statusBar().showMessage("フォント書き出し中...", 0); QApplication.processEvents() 
         try:
             self.export_process = QProcess(self); self.export_process.setProcessChannelMode(QProcess.MergedChannels)
@@ -5793,6 +5927,45 @@ class MainWindow(QMainWindow):
             import traceback
             QMessageBox.critical(self, "書き出しエラー", f"フォント書き出しの開始中に予期せぬエラーが発生しました: {e}")
             self._cleanup_after_export()
+
+
+
+    @Slot()
+    def handle_export_font_rectified(self): 
+        if not self.current_project_path or self._project_loading_in_progress:
+            QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
+        if self.export_process and self.export_process.state() != QProcess.NotRunning:
+            QMessageBox.information(self, "情報", "フォント書き出し処理が既に実行中です。"); return
+        
+        self.original_export_button_state = self.properties_widget.export_font_button.isEnabled()
+        self.properties_widget.export_font_button.setEnabled(False)
+        self.properties_widget.export_font_rectified_button.setEnabled(False) # 新しいボタンも無効化
+        
+        self.statusBar().showMessage("フォント書き出し中 (角)...", 0); QApplication.processEvents() 
+        
+        try:
+            self.export_process = QProcess(self); self.export_process.setProcessChannelMode(QProcess.MergedChannels)
+            script_dir = Path(sys.argv[0]).resolve().parent
+            
+            # 呼び出すスクリプト名を DB2OTF_2.py に変更
+            db2otf_script_path = script_dir / "DB2OTF_2.py"
+
+            if not db2otf_script_path.exists():
+                QMessageBox.critical(self, "エラー", f"スクリプト {db2otf_script_path} が見つかりません。")
+                self._cleanup_after_export(); return
+            
+            python_executable = sys.executable 
+            arguments = [str(db2otf_script_path), "--db_path", self.current_project_path]
+            self.export_process.finished.connect(self._on_export_process_finished)
+            self.export_process.errorOccurred.connect(self._on_export_process_error)
+            self.export_process.start(python_executable, arguments)
+            
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "書き出しエラー", f"フォント書き出しの開始中に予期せぬエラーが発生しました: {e}")
+            self._cleanup_after_export()
+
+
 
     @Slot(int, QProcess.ExitStatus)
     def _on_export_process_finished(self, exitCode: int, exitStatus: QProcess.ExitStatus): 
@@ -5823,6 +5996,7 @@ class MainWindow(QMainWindow):
         project_still_loaded = self.current_project_path is not None and not self._project_loading_in_progress
         can_be_enabled_after_export = project_still_loaded and self.original_export_button_state
         self.properties_widget.export_font_button.setEnabled(can_be_enabled_after_export)
+        self.properties_widget.export_font_rectified_button.setEnabled(can_be_enabled_after_export)
         if self.statusBar().currentMessage() == "フォント書き出し中...": self.statusBar().clearMessage()
         if self.export_process:
             try: self.export_process.finished.disconnect(self._on_export_process_finished)
