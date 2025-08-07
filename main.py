@@ -4209,11 +4209,16 @@ class PropertiesWidget(QWidget):
         
         # 既存の書き出しボタン
         self.export_font_button = QPushButton("フォントを書き出す")
+        self.export_font_button.setToolTip("通常の出力処理<br>通常のスムージング処理")
         self.export_font_button.clicked.connect(self.export_font_signal) # .emitは不要
         export_button_layout.addWidget(self.export_font_button)
         
         # 新しい「-角」ボタンを追加
         self.export_font_rectified_button = QPushButton("フォントを書き出す-角")
+        self.export_font_rectified_button.setToolTip(
+            '角文字用補正を含む出力処理<br>'
+            'ピーキーな補正なので出力要確認'
+        )
         self.export_font_rectified_button.clicked.connect(self.export_font_rectified_signal) # .emitは不要
         export_button_layout.addWidget(self.export_font_rectified_button)
 
