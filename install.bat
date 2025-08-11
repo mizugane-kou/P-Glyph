@@ -8,11 +8,12 @@ if not exist venv (
 REM 仮想環境を有効化してpipアップグレード、ライブラリインストール
 call venv\Scripts\activate
 pip install --upgrade pip
-pip install PySide6 Pillow numpy scikit-image scipy svgwrite fonttools ufolib2 fontmake opencv-python shapely
+pip install PySide6 opencv-python scikit-image scipy Pillow svgwrite fontTools ufoLib2 fontmake fastapi "uvicorn[standard]" shapely
 
 
 echo --------------------------------------
 echo ライブラリのインストールが完了しました
 echo --------------------------------------
 pause
+
 
