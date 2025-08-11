@@ -93,8 +93,10 @@ DEFAULT_ASCENDER_HEIGHT = 900
 DEFAULT_ADVANCE_WIDTH = 1000
 
 SETTING_FONT_NAME = "font_name"
+SETTING_FONT_ASCII_NAME = "font_ascii_name"
 SETTING_FONT_WEIGHT = "font_weight"
 DEFAULT_FONT_NAME = "MyNewFont"
+DEFAULT_FONT_ASCII_NAME = "MyNewFont"
 FONT_WEIGHT_OPTIONS = ["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black"]
 DEFAULT_FONT_WEIGHT = "Regular" 
 
@@ -1201,6 +1203,7 @@ class LoadProjectWorker(QRunnable):
             conn.close()
         return results
 
+# class LoadProjectWorker の run メソッドを以下のように変更
     @Slot()
     def run(self):
         try:
@@ -1243,6 +1246,7 @@ class LoadProjectWorker(QRunnable):
 
             self.signals.load_progress.emit(60, "GUI設定を読み込み中...")
             font_name = db_manager.load_gui_setting(SETTING_FONT_NAME, DEFAULT_FONT_NAME)
+            font_ascii_name = db_manager.load_gui_setting(SETTING_FONT_ASCII_NAME, DEFAULT_FONT_ASCII_NAME)
             font_weight = db_manager.load_gui_setting(SETTING_FONT_WEIGHT, DEFAULT_FONT_WEIGHT)
             
             copyright_info = db_manager.load_gui_setting(SETTING_COPYRIGHT_INFO, DEFAULT_COPYRIGHT_INFO)
@@ -1303,6 +1307,7 @@ class LoadProjectWorker(QRunnable):
                 'nr_vrt2_list_with_img_info': nr_vrt2_list_with_img_info,
                 'pua_list_with_img_info': pua_list_with_img_info,
                 'font_name': font_name,
+                'font_ascii_name': font_ascii_name,
                 'font_weight': font_weight,
                 'copyright_info': copyright_info,
                 'license_info': license_info,
@@ -1457,6 +1462,7 @@ class DatabaseManager:
         self._save_default_gui_settings(cursor) 
         conn.commit(); conn.close()
 
+
     def _save_default_gui_settings(self, cursor: sqlite3.Cursor):
         defaults = {
             SETTING_PEN_WIDTH: str(DEFAULT_PEN_WIDTH),
@@ -1468,6 +1474,7 @@ class DatabaseManager:
             SETTING_LAST_ACTIVE_GLYPH: "", 
             SETTING_LAST_ACTIVE_GLYPH_IS_VRT2: "False",
             SETTING_FONT_NAME: DEFAULT_FONT_NAME,
+            SETTING_FONT_ASCII_NAME: DEFAULT_FONT_ASCII_NAME,
             SETTING_FONT_WEIGHT: DEFAULT_FONT_WEIGHT,
             SETTING_COPYRIGHT_INFO: DEFAULT_COPYRIGHT_INFO,
             SETTING_LICENSE_INFO: DEFAULT_LICENSE_INFO,
@@ -4220,11 +4227,12 @@ class GlyphGridWidget(QWidget):
         event.accept()
 
 
-
+# class PropertiesWidget のシグナル定義と __init__ メソッドを以下のように変更
 class PropertiesWidget(QWidget):
     character_set_changed_signal = Signal(str)
     rotated_vrt2_set_changed_signal = Signal(str)
     non_rotated_vrt2_set_changed_signal = Signal(str)
+    font_ascii_name_changed_signal = Signal(str)
     font_name_changed_signal = Signal(str)
     font_weight_changed_signal = Signal(str)
     copyright_info_changed_signal = Signal(str) 
@@ -4235,6 +4243,15 @@ class PropertiesWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
+
+        font_ascii_name_layout = QHBoxLayout()
+        font_ascii_name_layout.addWidget(QLabel("ASCII名:"))
+        self.font_ascii_name_input = QLineEdit()
+        self.font_ascii_name_input.setPlaceholderText("例: MyCustomFontASCII")
+        self.font_ascii_name_input.editingFinished.connect(self._emit_font_ascii_name_change)
+        font_ascii_name_layout.addWidget(self.font_ascii_name_input)
+        layout.addLayout(font_ascii_name_layout)
+
         font_name_layout = QHBoxLayout(); font_name_layout.addWidget(QLabel("フォント名:"))
         self.font_name_input = QLineEdit(); self.font_name_input.setPlaceholderText("例: MyCustomFont")
         self.font_name_input.editingFinished.connect(self._emit_font_name_change)
@@ -4306,6 +4323,8 @@ class PropertiesWidget(QWidget):
         layout.addLayout(export_button_layout)
         layout.addStretch(1)
 
+# class PropertiesWidget に以下のメソッドを追加・変更
+    def _emit_font_ascii_name_change(self): self.font_ascii_name_changed_signal.emit(self.font_ascii_name_input.text())
     def _emit_font_name_change(self): self.font_name_changed_signal.emit(self.font_name_input.text())
     def _emit_font_weight_change(self, weight_text: str): self.font_weight_changed_signal.emit(weight_text)
 
@@ -4336,6 +4355,10 @@ class PropertiesWidget(QWidget):
     def _apply_r_vrt2_changes(self): self.rotated_vrt2_set_changed_signal.emit(self.r_vrt2_text_edit.toPlainText())
     def _apply_nr_vrt2_changes(self): self.non_rotated_vrt2_set_changed_signal.emit(self.nr_vrt2_text_edit.toPlainText())
 
+    def load_font_ascii_name(self, name: str):
+        self.font_ascii_name_input.blockSignals(True)
+        self.font_ascii_name_input.setText(name)
+        self.font_ascii_name_input.blockSignals(False)
     def load_font_name(self, name: str):
         self.font_name_input.blockSignals(True); self.font_name_input.setText(name); self.font_name_input.blockSignals(False)
     def load_font_weight(self, weight: str):
@@ -4347,6 +4370,7 @@ class PropertiesWidget(QWidget):
     def load_r_vrt2_set(self, char_string: str): self.r_vrt2_text_edit.setText(char_string)
     def load_nr_vrt2_set(self, char_string: str): self.nr_vrt2_text_edit.setText(char_string)
     def set_enabled_controls(self, enabled: bool):
+        self.font_ascii_name_input.setEnabled(enabled)
         self.font_name_input.setEnabled(enabled)
         self.font_weight_combobox.setEnabled(enabled)
         self.copyright_text_edit.setEnabled(enabled)
@@ -4358,22 +4382,6 @@ class PropertiesWidget(QWidget):
         for btn in apply_buttons: btn.setEnabled(enabled)
         self.export_font_button.setEnabled(enabled)
         self.export_font_rectified_button.setEnabled(enabled)
-
-
-    def mousePressEvent(self, event: QMouseEvent):
-        clicked_child = self.childAt(event.position().toPoint())
-        
-        if clicked_child is None or clicked_child is self:
-            main_window = self.window()
-            if isinstance(main_window, MainWindow):
-                if main_window.drawing_editor_widget.canvas.current_glyph_character:
-                    main_window.drawing_editor_widget.canvas.setFocus()
-                    event.accept()
-                    return
-        
-        super().mousePressEvent(event)
-
-
 
 
 
@@ -4589,6 +4597,7 @@ class MainWindow(QMainWindow):
         self.properties_widget.character_set_changed_signal.connect(self.update_project_character_set)
         self.properties_widget.rotated_vrt2_set_changed_signal.connect(self.update_rotated_vrt2_set)
         self.properties_widget.non_rotated_vrt2_set_changed_signal.connect(self.update_non_rotated_vrt2_set)
+        self.properties_widget.font_ascii_name_changed_signal.connect(self.update_font_ascii_name)
         self.properties_widget.font_name_changed_signal.connect(self.update_font_name)
         self.properties_widget.font_weight_changed_signal.connect(self.update_font_weight)
         self.properties_widget.copyright_info_changed_signal.connect(
@@ -4614,7 +4623,10 @@ class MainWindow(QMainWindow):
         self.drawing_editor_widget.update_history_buttons_state(False, False)
 
 
-
+    @Slot(str)
+    def update_font_ascii_name(self, name: str): 
+        if not self.current_project_path or self._project_loading_in_progress: return
+        self.save_gui_setting_async(SETTING_FONT_ASCII_NAME, name)
 
 
     
@@ -5354,6 +5366,9 @@ class MainWindow(QMainWindow):
             else: self.statusBar().clearMessage()
         self._update_ui_for_project_state() 
 
+
+
+
     def _update_ui_for_project_state(self): 
         project_loaded_and_not_processing = self.current_project_path is not None and not self._project_loading_in_progress
         self.drawing_editor_widget.set_enabled_controls(project_loaded_and_not_processing)
@@ -5397,7 +5412,8 @@ class MainWindow(QMainWindow):
                 self.drawing_editor_widget.canvas.set_reference_image_opacity(DEFAULT_REFERENCE_IMAGE_OPACITY)
                 self.drawing_editor_widget.canvas.load_glyph("", None, None, DEFAULT_ADVANCE_WIDTH, is_vrt2=False) 
                 self.properties_widget.load_character_set(""); self.properties_widget.load_r_vrt2_set("")
-                self.properties_widget.load_nr_vrt2_set(""); self.properties_widget.load_font_name(DEFAULT_FONT_NAME)
+                self.properties_widget.load_nr_vrt2_set(""); self.properties_widget.load_font_ascii_name(DEFAULT_FONT_ASCII_NAME)
+                self.properties_widget.load_font_name(DEFAULT_FONT_NAME)
                 self.properties_widget.load_font_weight(DEFAULT_FONT_WEIGHT)
                 self.properties_widget.load_copyright_info(DEFAULT_COPYRIGHT_INFO)
                 self.properties_widget.load_license_info(DEFAULT_LICENSE_INFO)
@@ -5418,6 +5434,8 @@ class MainWindow(QMainWindow):
                 if self.kanji_viewer_related_tabs: self.kanji_viewer_related_tabs.clear()
         self._update_bookmark_button_state() 
         self._update_history_navigation_buttons()
+
+
 
     def _load_font_settings_txt(self): 
         script_dir = os.path.dirname(os.path.abspath(__file__)); settings_file_path = os.path.join(script_dir, FONT_SETTINGS_FILENAME)
@@ -5528,6 +5546,7 @@ class MainWindow(QMainWindow):
         self.properties_widget.load_nr_vrt2_set("".join(basic_data['nr_vrt2_list']))
         self.non_rotated_vrt2_chars = set(basic_data['nr_vrt2_list'])
         self.glyph_grid_widget.set_non_rotated_vrt2_chars(self.non_rotated_vrt2_chars)
+        self.properties_widget.load_font_ascii_name(basic_data['font_ascii_name'])
         self.properties_widget.load_font_name(basic_data['font_name'])
         self.properties_widget.load_font_weight(basic_data['font_weight'])
         self.properties_widget.load_copyright_info(basic_data.get(SETTING_COPYRIGHT_INFO, DEFAULT_COPYRIGHT_INFO))
@@ -5572,6 +5591,7 @@ class MainWindow(QMainWindow):
             elif self.kv_mode_written_button: self.kv_mode_button_group.blockSignals(True); self.kv_mode_written_button.setChecked(True); self.kv_mode_button_group.blockSignals(False)
         self._last_active_glyph_char_from_load = basic_data.get('last_active_glyph_char')
         self._last_active_glyph_is_vrt2_from_load = basic_data.get('last_active_glyph_is_vrt2', False)
+
 
 
     def _select_initial_glyph_after_full_load(self):
