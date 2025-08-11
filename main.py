@@ -5,13 +5,22 @@ import os
 import sqlite3
 import functools
 import re 
+import time 
 import json 
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any, Set, Union
+
+from fastapi import FastAPI, HTTPException
+import uvicorn
+from pydantic import BaseModel
+import base64
+from io import BytesIO
+
 import cv2
 import numpy as np
 import math
 from scipy.spatial import cKDTree
+
 
 
 from PySide6.QtWidgets import (
@@ -125,6 +134,77 @@ DELEGATE_GRID_COLUMNS = 5 # Number of columns in the table view grid
 PUA_START_CODEPOINT = 0xE000
 PUA_END_CODEPOINT = 0xF8FF
 PUA_MAX_COUNT = PUA_END_CODEPOINT - PUA_START_CODEPOINT + 1
+
+
+
+class ImagePayload(BaseModel):
+    image_base64: str
+
+# --- FastAPIサーバーを動作させるためのスレッド ---
+class ApiServerThread(QThread):
+    # 外部から画像を受け取った時にGUIスレッドに通知するためのシグナル
+    image_received = Signal(QPixmap)
+    reference_image_received = Signal(QPixmap)
+
+    def __init__(self, main_window_instance, parent=None):
+        super().__init__(parent)
+        self.app = FastAPI()
+        self.main_window = main_window_instance
+        self._setup_routes()
+
+    def _setup_routes(self):
+        """APIのエンドポイント（URL）を定義する"""
+
+        @self.app.get("/api/glyph/current")
+        def get_current_glyph():
+            """現在編集中のグリフ情報を取得する"""
+            with QMutexLocker(self.main_window.api_mutex):
+                # MainWindowが保持する最新の情報を返す
+                return self.main_window.api_shared_state
+
+        @self.app.post("/api/glyph/image")
+        def post_glyph_image(payload: ImagePayload):
+            """現在のグリフの描画エリアに画像を送信する"""
+            try:
+                # Base64デコード
+                img_data = base64.b64decode(payload.image_base64)
+                pixmap = QPixmap()
+                if pixmap.loadFromData(img_data):
+                    # GUIスレッドに安全にPixmapを渡すためにシグナルを発行
+                    self.image_received.emit(pixmap)
+                    return {"status": "success", "message": "Image sent to canvas."}
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid image data.")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+
+        @self.app.post("/api/glyph/reference_image")
+        def post_reference_image(payload: ImagePayload):
+            """現在のグリフの下書きとして画像を送信する"""
+            try:
+                img_data = base64.b64decode(payload.image_base64)
+                pixmap = QPixmap()
+                if pixmap.loadFromData(img_data):
+                    self.reference_image_received.emit(pixmap)
+                    return {"status": "success", "message": "Image sent as reference."}
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid image data.")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+
+    def run(self):
+        """スレッド開始時にuvicornサーバーを起動する"""
+        # "127.0.0.1"はローカルホストを意味し、自分のPCからしかアクセスできない
+        # reload=False にするのが本番環境では重要
+        uvicorn.run(self.app, host="127.0.0.1", port=8756, log_level="info")
+
+    def stop(self):
+        # uvicornは直接的な停止メソッドを提供しないため、スレッドの終了に任せる
+        # アプリケーション終了時に自動的に終了される
+        if self.isRunning():
+            self.terminate()
+            self.wait()
+
 
 
 def qpixmap_to_cv_np(pixmap: QPixmap) -> np.ndarray:
@@ -4428,6 +4508,17 @@ class MainWindow(QMainWindow):
 
 
 
+        # スレッド間で共有するデータと、それを保護するミューテックス
+        self.api_shared_state = {}
+        self.api_mutex = QMutex()
+        
+        # APIサーバースレッドを起動
+        self.api_thread = ApiServerThread(self)
+        self.api_thread.image_received.connect(self._handle_api_image_received)
+        self.api_thread.reference_image_received.connect(self._handle_api_reference_image_received)
+        self.api_thread.start()
+
+
 
 
         self.drawing_editor_widget = DrawingEditorWidget()
@@ -4521,6 +4612,90 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._kv_initial_display_setup) 
         QTimer.singleShot(100, self._update_bookmark_button_state)
         self.drawing_editor_widget.update_history_buttons_state(False, False)
+
+
+
+
+
+    
+    @Slot(QPixmap)
+    def _handle_api_image_received(self, pixmap: QPixmap):
+        """API経由で受信した画像をキャンバスに適用する"""
+        canvas = self.drawing_editor_widget.canvas
+        if not canvas.current_glyph_character:
+            self.statusBar().showMessage("グリフが選択されていないため、画像を受信できませんでした。", 3000)
+            return
+
+        target_size = canvas.image_size
+        scaled_image = pixmap.toImage().scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        
+        final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
+        final_image.fill(QColor(Qt.white))
+        painter = QPainter(final_image)
+        x_offset = (target_size.width() - scaled_image.width()) // 2
+        y_offset = (target_size.height() - scaled_image.height()) // 2
+        painter.drawImage(x_offset, y_offset, scaled_image)
+        painter.end()
+
+        canvas.image = QPixmap.fromImage(final_image)
+        canvas._save_state_to_undo_stack()
+        canvas.glyph_modified_signal.emit(
+            canvas.current_glyph_character, 
+            canvas.image.copy(), 
+            canvas.editing_vrt2_glyph,
+            canvas.editing_pua_glyph
+        )
+        canvas.update()
+        self.statusBar().showMessage("API経由で画像を受信しました。", 2000)
+
+    @Slot(QPixmap)
+    def _handle_api_reference_image_received(self, pixmap: QPixmap):
+        """API経由で受信した画像を下書きに適用する"""
+        canvas = self.drawing_editor_widget.canvas
+        if not canvas.current_glyph_character:
+            self.statusBar().showMessage("グリフが選択されていないため、下書き画像を受信できませんでした。", 3000)
+            return
+
+        self.drawing_editor_widget.reference_image_selected_signal.emit(
+            canvas.current_glyph_character, pixmap.copy(), canvas.editing_vrt2_glyph
+        )
+
+
+
+
+
+    def _update_api_shared_state(self, character: Optional[str], is_vrt2: bool, is_pua: bool):
+        """スレッド間で共有する現在のグリフ情報を更新する"""
+        info_data = {
+            "character": None,
+            "unicode_value": None,
+            "hex_value": None,
+            "is_vrt2": False,
+            "is_pua": False,
+            "timestamp": time.time()
+        }
+
+        if character:
+            info_data.update({
+                "character": character,
+                "is_vrt2": is_vrt2,
+                "is_pua": is_pua
+            })
+            if character != '.notdef' and len(character) == 1:
+                try:
+                    unicode_val = ord(character)
+                    info_data["unicode_value"] = unicode_val
+                    info_data["hex_value"] = hex(unicode_val)
+                except TypeError:
+                    pass
+        
+        # ミューテックスで保護しながら共有データを更新
+        with QMutexLocker(self.api_mutex):
+            self.api_shared_state = info_data
+
+
+
+
 
 
 
@@ -5477,6 +5652,9 @@ class MainWindow(QMainWindow):
     def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False, is_pua_edit_mode: bool = False):
         if self._project_loading_in_progress: return 
 
+        # グリフが切り替わるたびに共有データを呼び出す
+        self._update_api_shared_state(character, is_vrt2_edit_mode, is_pua_edit_mode)
+
         if self.drawing_editor_widget.mirror_checkbox.isChecked():
             # チェックボックスのシグナルが発動しないようにブロックしながら状態を変更
             self.drawing_editor_widget.mirror_checkbox.blockSignals(True)
@@ -6355,6 +6533,12 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No: event.ignore(); return
         reply = QMessageBox.question(self, '確認', "アプリケーションを終了しますか？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
+
+            self._update_api_shared_state(None, False, False)
+            # APIスレッドを停止
+            self.api_thread.stop()
+
+
             if not self._project_loading_in_progress and self.current_project_path and \
                self.drawing_editor_widget.canvas.current_glyph_character and not self.drawing_editor_widget.canvas.editing_vrt2_glyph: 
                 current_char = self.drawing_editor_widget.canvas.current_glyph_character
