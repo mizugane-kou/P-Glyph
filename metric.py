@@ -415,7 +415,7 @@ class MetricsViewerWindow(QMainWindow):
         self._on_line_spacing_changed(self._line_spacing_slider.value())
         
         if not self._text_input.toPlainText():
-            self._text_input.setText("いろはにほへとちりぬるを\nわかよたれそつねならむ\nうゐのおくやまけふこえて\nあさきゆめみしゑひもせすん")
+            self._text_input.setText("the quick brown fox jumps over the lazy dog.\n\nTHE QUICK BROWN FOX JUMPS OVER THE LAZY DOG.\n \nあらさじと　うちかへすらし　をやまだの　なはしろみづに　ぬれてつくるあ　めもはるに　ゆきまもあをく　なりにけり　いまこそのべに　わかなつみてめ　つくばやま　さけるさくらの　にほひをぞ　いりてをらねど　よそながらみつ　ちぐさにも　ほころぶはなの　しげきかな　いづらあをやぎ　ぬひしいとすぢ")
         
         self._update_display()
         
