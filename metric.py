@@ -36,8 +36,8 @@ class MetricsDBManager:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def load_glyph_image_and_advance(self, character: str) -> Optional[Tuple[QPixmap, int, str]]:
-        """【変更】last_modifiedタイムスタンプも返すように修正"""
+    def load_glyph_image_and_advance(self, character: str) -> Optional[Tuple[Optional[QPixmap], int, str]]:
+        """画像がなくてもレコードがあればadvanceとlast_modifiedを返すように修正"""
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
@@ -48,13 +48,15 @@ class MetricsDBManager:
             except TypeError: pass
             
             table = "pua_glyphs" if is_pua else "glyphs"
-            # 【変更】last_modifiedカラムを追加
             cursor.execute(f"SELECT image_data, advance_width, last_modified FROM {table} WHERE character = ?", (character,))
             row = cursor.fetchone()
 
-            if row and row['image_data']:
-                pixmap = QPixmap()
-                pixmap.loadFromData(row['image_data'])
+            if row:
+                pixmap = None
+                if row['image_data']:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(row['image_data'])
+                
                 advance_width = row['advance_width'] if row['advance_width'] is not None else EM_SQUARE_UNITS
                 last_modified = row['last_modified'] if row['last_modified'] else ""
                 return pixmap, advance_width, last_modified
@@ -66,7 +68,7 @@ class MetricsDBManager:
             conn.close()
 
     def get_current_timestamps(self, characters: List[str]) -> Dict[str, str]:
-        """【追加】指定された文字リストの現在のlast_modifiedタイムスタンプを一括で取得する"""
+        """指定された文字リストの現在のlast_modifiedタイムスタンプを一括で取得する"""
         if not characters:
             return {}
         
@@ -76,13 +78,11 @@ class MetricsDBManager:
         try:
             placeholders = ','.join('?' for _ in characters)
             
-            # 標準グリフをチェック
             query = f"SELECT character, last_modified FROM glyphs WHERE character IN ({placeholders})"
             cursor.execute(query, characters)
             for row in cursor.fetchall():
                 timestamps[row['character']] = row['last_modified']
             
-            # PUAグリフをチェック
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
             if cursor.fetchone():
                 query_pua = f"SELECT character, last_modified FROM pua_glyphs WHERE character IN ({placeholders})"
@@ -103,7 +103,7 @@ class MetricsDisplayWidget(QWidget):
         self._db_manager = db_manager
         self._text_to_display: str = ""
         self._scale_factor: float = 0.25
-        self._glyph_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._glyph_cache: Dict[str, Dict[str, Any]] = {}
         
         self._show_advance_guide: bool = True
         self._auto_wrap_text: bool = False
@@ -155,23 +155,25 @@ class MetricsDisplayWidget(QWidget):
             self.update()
 
     def check_and_refresh_visible_glyphs(self):
-        """【追加】表示中グリフの更新をDBに問い合わせて、変更があれば再描画する"""
+        """表示中グリフの更新をDBに問い合わせて、変更があれば再描画する。画像が新規追加された場合も検知。"""
         visible_chars = list(set(c for c in self._text_to_display if c != '\n'))
         if not visible_chars:
             return
 
         current_timestamps_from_db = self._db_manager.get_current_timestamps(visible_chars)
-        
         changed_chars = []
-        for char, db_timestamp in current_timestamps_from_db.items():
-            if char in self._glyph_cache and self._glyph_cache[char] is not None:
-                cached_timestamp = self._glyph_cache[char].get("last_modified")
-                if cached_timestamp != db_timestamp:
-                    changed_chars.append(char)
+
+        for char in visible_chars:
+            db_timestamp = current_timestamps_from_db.get(char, "")
+            cached_data = self._glyph_cache.get(char)
+            
+            if not cached_data or cached_data.get("last_modified") != db_timestamp:
+                changed_chars.append(char)
 
         if changed_chars:
-            print(f"  > Invalidating cache for: {', '.join(changed_chars)}")
-            self.invalidate_specific_glyphs(changed_chars)
+            unique_changed_chars = sorted(list(set(changed_chars)))
+            print(f"  > Invalidating cache for: {', '.join(unique_changed_chars)}")
+            self.invalidate_specific_glyphs(unique_changed_chars)
 
     def invalidate_specific_glyphs(self, characters: List[str]):
         needs_redraw = False
@@ -188,9 +190,9 @@ class MetricsDisplayWidget(QWidget):
 
     def _get_pixel_advance(self, char: str) -> float:
         cached_data = self._glyph_cache.get(char)
-        if cached_data and 'advance' in cached_data:
-            return (cached_data['advance'] / EM_SQUARE_UNITS) * CANVAS_IMAGE_WIDTH
-        return (EM_SQUARE_UNITS / 2 / EM_SQUARE_UNITS) * CANVAS_IMAGE_WIDTH
+        if cached_data:
+            return (cached_data.get('advance', EM_SQUARE_UNITS) / EM_SQUARE_UNITS) * CANVAS_IMAGE_WIDTH
+        return (EM_SQUARE_UNITS / EM_SQUARE_UNITS) * CANVAS_IMAGE_WIDTH
 
     def _get_char_total_width(self, char: str) -> float:
         advance_width = self._get_pixel_advance(char) * self._scale_factor
@@ -198,24 +200,33 @@ class MetricsDisplayWidget(QWidget):
         return advance_width + scaled_spacing
 
     def _update_glyph_cache(self):
+        """画像なしでもタイムスタンプ等をキャッシュする"""
         unique_chars = set(self._text_to_display.replace('\n', ''))
         for char in unique_chars:
             if char not in self._glyph_cache:
                 loaded_data = self._db_manager.load_glyph_image_and_advance(char)
                 if loaded_data:
-                    # 【変更】タイムスタンプも受け取る
                     pixmap, advance, last_modified = loaded_data
-                    qimage = pixmap.toImage()
-                    qimage.invertPixels(QImage.InvertMode.InvertRgb)
-                    inverted_pixmap = QPixmap.fromImage(qimage)
+                    
+                    normal_pixmap, inverted_pixmap = None, None
+                    if pixmap:
+                        normal_pixmap = pixmap
+                        qimage = pixmap.toImage()
+                        qimage.invertPixels(QImage.InvertMode.InvertRgb)
+                        inverted_pixmap = QPixmap.fromImage(qimage)
+
                     self._glyph_cache[char] = {
-                        "normal": pixmap, 
+                        "normal": normal_pixmap, 
                         "inverted": inverted_pixmap, 
                         "advance": advance,
-                        "last_modified": last_modified # 【変更】タイムスタンプをキャッシュに保存
+                        "last_modified": last_modified
                     }
                 else:
-                    self._glyph_cache[char] = None
+                    self._glyph_cache[char] = {
+                        "normal": None, "inverted": None,
+                        "advance": EM_SQUARE_UNITS,
+                        "last_modified": ""
+                    }
 
     def _recalculate_and_update_geometry(self):
         margin_size = (CANVAS_IMAGE_HEIGHT * self._scale_factor) * 0.5
@@ -289,6 +300,7 @@ class MetricsDisplayWidget(QWidget):
         painter.end()
 
     def _paint_line(self, painter: QPainter, line_to_draw: str, start_x: float, start_y: float, line_height: float):
+        """【変更】文字間隔 > 0 の場合、左側にもガイドを描画するように変更"""
         x_cursor = start_x
         scaled_spacing = (self._character_spacing / EM_SQUARE_UNITS) * CANVAS_IMAGE_WIDTH * self._scale_factor
         
@@ -296,8 +308,11 @@ class MetricsDisplayWidget(QWidget):
             pixel_advance = self._get_pixel_advance(char)
             scaled_width = pixel_advance * self._scale_factor
             cached_data = self._glyph_cache.get(char)
+            
+            pixmap_key = "inverted" if self._is_inverted else "normal"
+            pixmap = cached_data.get(pixmap_key) if cached_data else None
 
-            if not cached_data:
+            if not pixmap:
                 if self._is_inverted:
                     painter.setPen(QPen(Qt.GlobalColor.magenta))
                     painter.setBrush(QColor(80, 0, 80))
@@ -305,22 +320,39 @@ class MetricsDisplayWidget(QWidget):
                     painter.setPen(QPen(Qt.GlobalColor.red))
                     painter.setBrush(QColor(255, 200, 200))
                 painter.drawRect(QRectF(x_cursor, start_y, scaled_width, line_height))
+                
+                # ガイド描画（未定義グリフにも適用）
+                if self._show_advance_guide:
+                    guide_color = Qt.GlobalColor.cyan if self._is_inverted else Qt.GlobalColor.blue
+                    pen = QPen(guide_color, 1, Qt.PenStyle.DashLine)
+                    painter.setPen(pen)
+                    if self._character_spacing > 0:
+                        painter.drawLine(int(x_cursor), int(start_y), int(x_cursor), int(start_y + line_height))
+                    right_line_x = int(x_cursor + scaled_width)
+                    painter.drawLine(right_line_x, int(start_y), right_line_x, int(start_y + line_height))
+
                 x_cursor += scaled_width + scaled_spacing
                 continue
 
-            pixmap_key = "inverted" if self._is_inverted else "normal"
-            pixmap = cached_data[pixmap_key]
-            
             source_rect = QRectF(0, 0, pixel_advance, CANVAS_IMAGE_HEIGHT)
             dest_rect = QRectF(x_cursor, start_y, scaled_width, line_height)
             painter.drawPixmap(dest_rect, pixmap, source_rect)
 
+            # --- ガイド描画ロジック ---
             if self._show_advance_guide:
                 guide_color = Qt.GlobalColor.cyan if self._is_inverted else Qt.GlobalColor.blue
                 pen = QPen(guide_color, 1, Qt.PenStyle.DashLine)
                 painter.setPen(pen)
-                line_x = int(x_cursor + scaled_width)
-                painter.drawLine(line_x, int(start_y), line_x, int(start_y + line_height))
+
+                # 【変更ここから】文字間隔 > 0 の場合、左側（描画開始位置）にもガイドを描画
+                if self._character_spacing > 0:
+                    left_line_x = int(x_cursor)
+                    painter.drawLine(left_line_x, int(start_y), left_line_x, int(start_y + line_height))
+
+                # 右側のガイド（文字送り幅の位置）は常に表示
+                right_line_x = int(x_cursor + scaled_width)
+                painter.drawLine(right_line_x, int(start_y), right_line_x, int(start_y + line_height))
+                # 【変更ここまで】
             
             x_cursor += scaled_width + scaled_spacing
 
@@ -419,14 +451,13 @@ class MetricsViewerWindow(QMainWindow):
         
         self._update_display()
         
-        # 【変更】タイマーの接続先を単純なトリガーに変更
         self._db_watcher_timer = QTimer(self)
         self._db_watcher_timer.timeout.connect(self._trigger_glyph_check)
         self._db_watcher_timer.start(2000)
         
     def _trigger_glyph_check(self):
-        """【変更】2秒ごとに表示ウィジェットに更新チェックを依頼する"""
-        if self.isVisible(): # ウィンドウが表示されている場合のみチェック
+        """2秒ごとに表示ウィジェットに更新チェックを依頼する"""
+        if self.isVisible():
             self._display_widget.check_and_refresh_visible_glyphs()
 
     def text_input_key_press(self, event):
