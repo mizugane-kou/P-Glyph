@@ -1096,7 +1096,7 @@ class SaveAdvanceWidthWorker(QRunnable):
             conn = sqlite3.connect(self.db_path, timeout=5.0)
             cursor = conn.cursor()
             table = "pua_glyphs" if self.is_pua_glyph else "glyphs"
-            cursor.execute(f"UPDATE {table} SET advance_width = ? WHERE character = ?", (self.advance_width, self.character))
+            cursor.execute(f"UPDATE {table} SET advance_width = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (self.advance_width, self.character))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -1219,8 +1219,31 @@ class LoadProjectWorker(QRunnable):
                 character TEXT PRIMARY KEY, unicode_val INTEGER UNIQUE, image_data BLOB,
                 reference_image_data BLOB, advance_width INTEGER DEFAULT 1000,
                 last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP )""")
-            conn.commit(); conn.close()
+            conn.commit()
 
+            # 既存のプロジェクトで last_modified が NULL の場合に現在時刻を埋める
+            self.signals.load_progress.emit(1, "プロジェクト互換性更新中...")
+            try:
+                # 'glyphs' テーブルを更新
+                cursor.execute("UPDATE glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
+                
+                # 'vrt2_glyphs' テーブルを更新
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vrt2_glyphs'")
+                if cursor.fetchone():
+                    cursor.execute("UPDATE vrt2_glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
+                
+                # 'pua_glyphs' テーブルを更新
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
+                if cursor.fetchone():
+                    cursor.execute("UPDATE pua_glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
+                
+                conn.commit()
+            except Exception as e:
+                # この処理は互換性のためのもので、失敗しても致命的ではないため、エラーログを出力するに留める
+                print(f"Warning: Failed to update null last_modified fields for compatibility. Reason: {e}")
+                conn.rollback()
+
+            conn.close()
 
             self.signals.load_progress.emit(0, "基本設定を読み込み中...")
             char_set_list_raw = db_manager.get_project_character_set() 
@@ -1442,8 +1465,8 @@ class DatabaseManager:
         
         empty_image_bytes = self._create_empty_image_data()
         cursor.execute("""
-            INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width, last_modified)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, ('.notdef', -1, empty_image_bytes, DEFAULT_ADVANCE_WIDTH)) 
 
         whitespace_chars_to_initialize = [' ', '　', '\t'] 
@@ -1455,18 +1478,17 @@ class DatabaseManager:
             try:
                 unicode_val = ord(char_val)
                 cursor.execute("""
-                    INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width)
-                    VALUES (?, ?, ?, ?)
+                    INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width, last_modified)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (char_val, unicode_val, image_data_for_char, DEFAULT_ADVANCE_WIDTH))
             except TypeError: pass 
 
         for char_val in nr_vrt2_chars:
             if len(char_val) == 1: 
-                 cursor.execute("INSERT OR IGNORE INTO vrt2_glyphs (character) VALUES (?)", (char_val,))
+                 cursor.execute("INSERT OR IGNORE INTO vrt2_glyphs (character, last_modified) VALUES (?, CURRENT_TIMESTAMP)", (char_val,))
         
         self._save_default_gui_settings(cursor) 
         conn.commit(); conn.close()
-
 
     def _save_default_gui_settings(self, cursor: sqlite3.Cursor):
         defaults = {
@@ -1530,14 +1552,14 @@ class DatabaseManager:
 
             for char_to_add in new_chars_set - db_chars:
                 if is_main_set:
-                    cursor.execute("INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width) VALUES (?, ?, ?, ?)",
+                    cursor.execute("INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width, last_modified) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
                                    (char_to_add, ord(char_to_add), empty_image_bytes_for_new_main_glyphs, DEFAULT_ADVANCE_WIDTH))
                 elif updates_vrt2_table: 
                     cursor.execute("SELECT 1 FROM glyphs WHERE character = ?", (char_to_add,))
                     if not cursor.fetchone(): 
-                         cursor.execute("INSERT OR IGNORE INTO glyphs (character, unicode_val, advance_width) VALUES (?, ?, ?)",
+                         cursor.execute("INSERT OR IGNORE INTO glyphs (character, unicode_val, advance_width, last_modified) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
                                    (char_to_add, ord(char_to_add), DEFAULT_ADVANCE_WIDTH))
-                    cursor.execute("INSERT OR IGNORE INTO vrt2_glyphs (character) VALUES (?)", (char_to_add,))
+                    cursor.execute("INSERT OR IGNORE INTO vrt2_glyphs (character, last_modified) VALUES (?, CURRENT_TIMESTAMP)", (char_to_add,))
 
             for char_to_remove in db_chars - new_chars_set:
                 if char_to_remove == '.notdef' and is_main_set: continue 
@@ -1633,7 +1655,7 @@ class DatabaseManager:
     def save_glyph_advance_width(self, character: str, advance_width: int): 
         if not self.db_path: return
         conn = self._get_connection(); cursor = conn.cursor()
-        cursor.execute("UPDATE glyphs SET advance_width = ? WHERE character = ?", (advance_width, character))
+        cursor.execute("UPDATE glyphs SET advance_width = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (advance_width, character))
         conn.commit(); conn.close()
 
     def get_all_glyphs_with_preview_data(self) -> List[Tuple[str, Optional[bytes]]]:
@@ -1742,8 +1764,8 @@ class DatabaseManager:
                 if next_codepoint != -1:
                     char = chr(next_codepoint)
                     cursor.execute("""
-                        INSERT OR IGNORE INTO pua_glyphs (character, unicode_val, image_data, advance_width)
-                        VALUES (?, ?, ?, ?)
+                        INSERT OR IGNORE INTO pua_glyphs (character, unicode_val, image_data, advance_width, last_modified)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """, (char, next_codepoint, empty_image_bytes, DEFAULT_ADVANCE_WIDTH))
                     existing_codepoints.add(next_codepoint)
                     added_count += 1
@@ -6427,7 +6449,7 @@ class MainWindow(QMainWindow):
         try:
             for char_to_update in target_chars_list:
                 if char_to_update in self.project_glyph_chars_cache: 
-                    cursor.execute("UPDATE glyphs SET advance_width = ? WHERE character = ?", (new_adv_width, char_to_update))
+                    cursor.execute("UPDATE glyphs SET advance_width = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (new_adv_width, char_to_update))
                     if cursor.rowcount > 0: updated_count += 1
                 else: skipped_count += 1
             conn.commit()
