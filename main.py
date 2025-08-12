@@ -50,7 +50,12 @@ from PySide6.QtCore import (
     QCoreApplication
 )
 
-
+# metric.pyからメトリックビューアウィンドウをインポート
+try:
+    from metric import MetricsViewerWindow
+except ImportError:
+    # metric.py が同じディレクトリにない場合のエラーを回避
+    MetricsViewerWindow = None
 
 
 # --- Constants ---
@@ -4490,7 +4495,8 @@ class MainWindow(QMainWindow):
         self.current_project_path: Optional[str] = None
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(QThread.idealThreadCount())
-
+        # メトリックビューアウィンドウのインスタンスを保持する変数
+        self.metrics_viewer_window: Optional[MetricsViewerWindow] = None
         # 現在実行中のDBワーカ数を管理するカウンター
         self.active_db_workers = 0
         self.active_db_workers_mutex = QMutex() # カウンターへのアクセスを保護
@@ -5348,6 +5354,12 @@ class MainWindow(QMainWindow):
         self.batch_import_reference_images_action = QAction("下書きの一括読み込み...", self); self.batch_import_reference_images_action.triggered.connect(self.batch_import_reference_images)
         self.edit_menu.addAction(self.batch_import_reference_images_action)
 
+        # 「ウィンドウ」メニューの作成
+        self.window_menu = menu_bar.addMenu("&ウィンドウ")
+        self.open_metrics_viewer_action = QAction("メトリックビューア...", self)
+        self.open_metrics_viewer_action.triggered.connect(self.open_metrics_viewer)
+        self.window_menu.addAction(self.open_metrics_viewer_action)
+
     def _set_project_loading_state(self, loading: bool): 
         self._project_loading_in_progress = loading
         self.drawing_editor_widget.setEnabled(not loading and self.current_project_path is not None)
@@ -5367,8 +5379,6 @@ class MainWindow(QMainWindow):
         self._update_ui_for_project_state() 
 
 
-
-
     def _update_ui_for_project_state(self): 
         project_loaded_and_not_processing = self.current_project_path is not None and not self._project_loading_in_progress
         self.drawing_editor_widget.set_enabled_controls(project_loaded_and_not_processing)
@@ -5384,6 +5394,10 @@ class MainWindow(QMainWindow):
             )
         if self.batch_import_glyphs_action: self.batch_import_glyphs_action.setEnabled(project_loaded_and_not_processing)
         if self.batch_import_reference_images_action: self.batch_import_reference_images_action.setEnabled(project_loaded_and_not_processing)
+
+        if hasattr(self, 'open_metrics_viewer_action'):
+            self.open_metrics_viewer_action.setEnabled(project_loaded_and_not_processing)
+
         kv_data_ok = self._kanji_viewer_data_loaded_successfully and bool(self.kanji_viewer_font_combo and self.kanji_viewer_font_combo.count() > 0)
         kv_panel_enabled = kv_data_ok and not self._project_loading_in_progress 
         if self.kanji_viewer_panel_widget: self.kanji_viewer_panel_widget.setEnabled(kv_panel_enabled)
@@ -5434,6 +5448,14 @@ class MainWindow(QMainWindow):
                 if self.kanji_viewer_related_tabs: self.kanji_viewer_related_tabs.clear()
         self._update_bookmark_button_state() 
         self._update_history_navigation_buttons()
+
+
+
+
+
+
+
+
 
 
 
@@ -5488,6 +5510,35 @@ class MainWindow(QMainWindow):
             create_worker.signals.error.connect(self._on_project_create_error)
             create_worker.signals.finished.connect(self._check_and_finalize_loading_state_after_create) 
             self.thread_pool.start(create_worker)
+
+
+    @Slot()
+    def open_metrics_viewer(self):
+        """メトリックビューアウィンドウを開くスロット"""
+        if MetricsViewerWindow is None:
+            QMessageBox.critical(self, "エラー", "メトリックビューアのモジュール（metric.py）が見つかりません。")
+            return
+
+        if not self.current_project_path or not os.path.isfile(self.current_project_path):
+            QMessageBox.warning(self, "プロジェクト未選択", "メトリックビューアを開くには、まずプロジェクトを開いてください。")
+            return
+
+        # 既にウィンドウが開いている場合は、それをアクティブにして前面に表示
+        if self.metrics_viewer_window and self.metrics_viewer_window.isVisible():
+            self.metrics_viewer_window.activateWindow()
+            self.metrics_viewer_window.raise_()
+            return
+
+        try:
+            # 新しいメトリックビューアウィンドウを作成
+            self.metrics_viewer_window = MetricsViewerWindow(db_path=self.current_project_path)
+            self.metrics_viewer_window.show()
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "メトリックビューア起動エラー", f"メトリックビューアの起動中にエラーが発生しました:\n{e}\n\n{traceback.format_exc()}")
+
+
+
 
     @Slot()
     def _check_and_finalize_loading_state_after_create(self): pass 
@@ -6547,12 +6598,20 @@ class MainWindow(QMainWindow):
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_mode))
 
+
+
+
+
     def closeEvent(self, event: QEvent): 
         if self._project_loading_in_progress:
             reply = QMessageBox.question(self, '確認', "プロジェクトの読み込み処理が進行中です。強制終了しますか？\n（データが破損する可能性があります）", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.No: event.ignore(); return
         reply = QMessageBox.question(self, '確認', "アプリケーションを終了しますか？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
+
+            # メインウィンドウが閉じる際にメトリックビューアも閉じる
+            if self.metrics_viewer_window:
+                self.metrics_viewer_window.close()
 
             self._update_api_shared_state(None, False, False)
             # APIスレッドを停止
