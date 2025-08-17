@@ -147,11 +147,17 @@ PUA_MAX_COUNT = PUA_END_CODEPOINT - PUA_START_CODEPOINT + 1
 class ImagePayload(BaseModel):
     image_base64: str
 
+class GlyphSelectPayload(BaseModel):
+    character: str
+    is_vrt2: bool = False
+    is_pua: bool = False
+
 # --- FastAPIサーバーを動作させるためのスレッド ---
 class ApiServerThread(QThread):
     # 外部から画像を受け取った時にGUIスレッドに通知するためのシグナル
     image_received = Signal(QPixmap)
     reference_image_received = Signal(QPixmap)
+    glyph_change_requested = Signal(str, bool, bool)
 
     def __init__(self, main_window_instance, parent=None):
         super().__init__(parent)
@@ -198,6 +204,16 @@ class ApiServerThread(QThread):
                     raise HTTPException(status_code=400, detail="Invalid image data.")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+
+        @self.app.post("/api/glyph/select")
+        def select_glyph(payload: GlyphSelectPayload):
+            """編集対象のグリフを変更する"""
+            try:
+                # GUIスレッドにグリフ変更をリクエストするシグナルを発行
+                self.glyph_change_requested.emit(payload.character, payload.is_vrt2, payload.is_pua)
+                return {"status": "success", "message": f"Glyph change request for '{payload.character}' sent."}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing glyph selection: {e}")
 
     def run(self):
         """スレッド開始時にuvicornサーバーを起動する"""
@@ -3306,7 +3322,7 @@ class ImageLoaderSignals(QObject):
     load_failed = Signal(str)
 
 class ImageLoadWorker(QRunnable):
-    def __init__(self, db_path: str, character_key: str, is_vrt2: bool, is_pua: bool, db_manager: DatabaseManager):
+    def __init__(self, db_path: str, character_key: str, is_vrt2: bool, is_pua: bool, db_manager: DatabaseManager, mutex: QMutex): 
         super().__init__()
         self.db_path = db_path
         self.character_key = character_key
@@ -3314,11 +3330,14 @@ class ImageLoadWorker(QRunnable):
         self.is_pua = is_pua
         self.signals = ImageLoaderSignals()
         self.db_manager = db_manager
+        self._mutex = mutex
 
     @Slot()
     def run(self):
         try:
-            img_bytes = self.db_manager.load_glyph_image_bytes(self.character_key, self.is_vrt2, self.is_pua)
+            # DBアクセス全体をミューテックスで保護
+            with QMutexLocker(self._mutex):
+                img_bytes = self.db_manager.load_glyph_image_bytes(self.character_key, self.is_vrt2, self.is_pua)
 
             if img_bytes:
                 pixmap = QPixmap()
@@ -3327,14 +3346,17 @@ class ImageLoadWorker(QRunnable):
                     return
             self.signals.load_failed.emit(self.character_key)
         except Exception as e:
-            self.signals.load_failed.emit(self.character_key)
+            # より詳細なエラーレポート
+            import traceback
+            self.signals.load_failed.emit(f"Failed to load image for {self.character_key}: {e}\n{traceback.format_exc()}")
 
 class GlyphTableModel(QAbstractTableModel):
-    def __init__(self, db_manager: DatabaseManager, is_vrt2_tab: bool, is_pua_tab: bool, parent: Optional[QObject] = None):
+    def __init__(self, db_manager: DatabaseManager, is_vrt2_tab: bool, is_pua_tab: bool, mutex: QMutex, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._db_manager = db_manager
         self._is_vrt2_tab = is_vrt2_tab
         self._is_pua_tab = is_pua_tab
+        self._mutex = mutex
         
         self._glyph_metadata_all: List[Tuple[str, str, bool]] = []
         self._filtered_indices: List[int] = []
@@ -3421,7 +3443,9 @@ class GlyphTableModel(QAbstractTableModel):
     def _request_image_load(self, char_key: str):
         if not self._db_manager.db_path: return
         self._requested_to_load.add(char_key)
-        worker = ImageLoadWorker(self._db_manager.db_path, char_key, self._is_vrt2_tab, self._is_pua_tab, self._db_manager)
+
+        # ImageLoadWorkerに共有ミューテックスを渡す
+        worker = ImageLoadWorker(self._db_manager.db_path, char_key, self._is_vrt2_tab, self._is_pua_tab, self._db_manager, self._mutex)
         worker.signals.image_loaded.connect(self._on_image_loaded)
         worker.signals.load_failed.connect(self._on_image_load_failed)
         self.thread_pool.start(worker)
@@ -3715,9 +3739,11 @@ class GlyphGridWidget(QWidget):
     vrt2_glyph_selected_signal = Signal(str)
     pua_glyph_selected_signal = Signal(str)
 
-    def __init__(self, db_manager: DatabaseManager, parent: Optional[QWidget] = None):
+    def __init__(self, db_manager: DatabaseManager, db_mutex: QMutex, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._db_manager = db_manager
+        self._db_mutex = db_mutex 
+        
         self.non_rotated_vrt2_chars: Set[str] = set()
         self._is_selecting_programmatically = False
 
@@ -3752,19 +3778,19 @@ class GlyphGridWidget(QWidget):
         main_layout.addWidget(self.tab_widget, 1)
 
         self.std_glyph_view = QTableView()
-        self.std_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, is_pua_tab=False, parent=self)
+        self.std_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, is_pua_tab=False, mutex=self._db_mutex, parent=self)
         self.std_glyph_delegate = GlyphTableDelegate(self.std_glyph_view)
         self._setup_table_view(self.std_glyph_view, self.std_glyph_model, self.std_glyph_delegate)
         self.tab_widget.addTab(self.std_glyph_view, "標準グリフ")
 
         self.vrt2_glyph_view = QTableView()
-        self.vrt2_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=True, is_pua_tab=False, parent=self)
+        self.vrt2_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=True, is_pua_tab=False, mutex=self._db_mutex, parent=self) 
         self.vrt2_glyph_delegate = GlyphTableDelegate(self.vrt2_glyph_view)
         self._setup_table_view(self.vrt2_glyph_view, self.vrt2_glyph_model, self.vrt2_glyph_delegate)
         self.tab_widget.addTab(self.vrt2_glyph_view, "縦書きグリフ")
 
         self.pua_glyph_view = QTableView()
-        self.pua_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, is_pua_tab=True, parent=self)
+        self.pua_glyph_model = GlyphTableModel(self._db_manager, is_vrt2_tab=False, is_pua_tab=True, mutex=self._db_mutex, parent=self) 
         self.pua_glyph_delegate = GlyphTableDelegate(self.pua_glyph_view)
         self._setup_table_view(self.pua_glyph_view, self.pua_glyph_model, self.pua_glyph_delegate)
         self.tab_widget.addTab(self.pua_glyph_view, "私用領域グリフ")
@@ -4552,13 +4578,14 @@ class MainWindow(QMainWindow):
         self.api_thread = ApiServerThread(self)
         self.api_thread.image_received.connect(self._handle_api_image_received)
         self.api_thread.reference_image_received.connect(self._handle_api_reference_image_received)
+        self.api_thread.glyph_change_requested.connect(self.load_glyph_for_editing)
         self.api_thread.start()
 
 
 
 
         self.drawing_editor_widget = DrawingEditorWidget()
-        self.glyph_grid_widget = GlyphGridWidget(self.db_manager) 
+        self.glyph_grid_widget = GlyphGridWidget(self.db_manager, self.db_mutex) 
         self.properties_widget = PropertiesWidget()
         self.properties_widget.setFixedWidth(PROPERTIES_WIDTH)
 
@@ -5740,10 +5767,11 @@ class MainWindow(QMainWindow):
 
 
 
-    @Slot(str) 
-    @Slot(str, bool) 
+
+    @Slot(str)
+    @Slot(str, bool)
     def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False, is_pua_edit_mode: bool = False):
-        if self._project_loading_in_progress: return 
+        if self._project_loading_in_progress: return
 
         # グリフが切り替わるたびに共有データを呼び出す
         self._update_api_shared_state(character, is_vrt2_edit_mode, is_pua_edit_mode)
@@ -5770,6 +5798,7 @@ class MainWindow(QMainWindow):
             if current_canvas_char != character or \
                (current_canvas_char == character and is_vrt2_edit_mode != self.drawing_editor_widget.canvas.editing_vrt2_glyph):
                  if not self.drawing_editor_widget.canvas.editing_vrt2_glyph:
+                     # ここは既に_save_current_advance_width_sync内でミューテックスが保護されている
                      self._save_current_advance_width_sync(current_canvas_char, current_canvas_adv_width)
         
         if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
@@ -5794,15 +5823,17 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.canvas.setFocus() 
             return
         
-        adv_width = self.db_manager.load_glyph_advance_width(character, is_pua=is_pua_edit_mode)
-        pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
-        reference_pixmap = None
-        if is_pua_edit_mode:
-            reference_pixmap = self.db_manager.load_reference_image(character, is_pua=True)
-        elif is_vrt2_edit_mode:
-            reference_pixmap = self.db_manager.load_vrt2_glyph_reference_image(character)
-        else:
-            reference_pixmap = self.db_manager.load_reference_image(character, is_pua=False)
+        # 同期的なDB読み込みをミューテックスで保護する
+        with QMutexLocker(self.db_mutex):
+            adv_width = self.db_manager.load_glyph_advance_width(character, is_pua=is_pua_edit_mode)
+            pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
+            reference_pixmap = None
+            if is_pua_edit_mode:
+                reference_pixmap = self.db_manager.load_reference_image(character, is_pua=True)
+            elif is_vrt2_edit_mode:
+                reference_pixmap = self.db_manager.load_vrt2_glyph_reference_image(character)
+            else:
+                reference_pixmap = self.db_manager.load_reference_image(character, is_pua=False)
         
         self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
         self.drawing_editor_widget.set_enabled_controls(True)
@@ -5820,8 +5851,8 @@ class MainWindow(QMainWindow):
         self.drawing_editor_widget.delete_ref_button.setEnabled(editor_is_generally_enabled and reference_pixmap is not None)
         self.drawing_editor_widget.load_ref_button.setEnabled(editor_is_generally_enabled)
         if hasattr(self.drawing_editor_widget, 'glyph_to_ref_reset_button'):
-            current_glyph_has_content_on_canvas = self.drawing_editor_widget.canvas.image and not self.drawing_editor_widget.canvas.image.isNull() 
-            self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(editor_is_generally_enabled and current_glyph_has_content_on_canvas)
+             current_glyph_has_content_on_canvas = self.drawing_editor_widget.canvas.image and not self.drawing_editor_widget.canvas.image.isNull() 
+             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(editor_is_generally_enabled and current_glyph_has_content_on_canvas)
         
         self.delete_pua_glyph_action.setEnabled(is_pua_edit_mode)
 
@@ -5832,7 +5863,8 @@ class MainWindow(QMainWindow):
         if not self._is_navigating_history:
              self._update_history_navigation_buttons()
 
-        self.drawing_editor_widget.canvas.setFocus() 
+        self.drawing_editor_widget.canvas.setFocus()
+
 
 
 
@@ -6517,85 +6549,93 @@ class MainWindow(QMainWindow):
         if import_type == "reference" and not self.non_rotated_vrt2_chars: 
             self.non_rotated_vrt2_chars = set(self.db_manager.get_non_rotated_vrt2_character_set())
         
+
+
+
         processed_count = 0; skipped_filename_format = 0; skipped_unicode_conversion = 0
         skipped_char_not_in_project = 0; skipped_image_load_error = 0; db_update_errors = 0
         total_files = len(file_paths)
-        
+
         status_bar_message_prefix = "グリフ一括読み込み" if import_type == "glyph" else "下書き一括読み込み"
         self.statusBar().showMessage(f"{status_bar_message_prefix} を開始します ({total_files} ファイル from '{os.path.basename(selected_folder_path)}')...", 0); QApplication.processEvents()
-        
-        try: 
-            for idx, file_path_str in enumerate(file_paths):
-                file_path = Path(file_path_str)
-                self.statusBar().showMessage(f"処理中 ({idx+1}/{total_files}): {file_path.name}", 0); QApplication.processEvents()
-                stem = file_path.stem; is_vrt2_ref_candidate = False; hex_code = "" 
-                if import_type == "reference":
-                    match_vert = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
-                    if not match_vert:
-                         match_vert_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
-                         if match_vert_uplus: hex_code = match_vert_uplus.group(1); is_vrt2_ref_candidate = True
-                    else: hex_code = match_vert.group(1); is_vrt2_ref_candidate = True
-                if not is_vrt2_ref_candidate: 
-                    match = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
-                    if not match: 
-                        match_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
-                        if not match_uplus: skipped_filename_format += 1; continue
-                        hex_code = match_uplus.group(1)
-                    else: hex_code = match.group(1)
-                if not hex_code: skipped_filename_format += 1; continue
-                try: unicode_val = int(hex_code, 16); character = chr(unicode_val)
-                except (ValueError, OverflowError): skipped_unicode_conversion += 1; continue
-                target_is_nrvg_for_ref = False 
-                if import_type == "reference" and is_vrt2_ref_candidate:
-                    if character not in self.non_rotated_vrt2_chars: skipped_char_not_in_project +=1; continue
-                    target_is_nrvg_for_ref = True
-                elif character not in self.project_glyph_chars_cache and character != '.notdef': 
-                     skipped_char_not_in_project += 1; continue
-                
-                try: 
-                    qimage = QImage(file_path_str)
-                except Exception:
-                    skipped_image_load_error += 1; continue
 
-                if qimage.isNull(): skipped_image_load_error += 1; continue
-                
-                scaled_image = qimage.scaled(target_image_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                final_qimage = QImage(target_image_size, QImage.Format_ARGB32_Premultiplied); final_qimage.fill(QColor(Qt.white)) 
-                painter = QPainter(final_qimage)
-                x_offset = (target_image_size.width() - scaled_image.width()) // 2
-                y_offset = (target_image_size.height() - scaled_image.height()) // 2
-                painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
-                processed_pixmap = QPixmap.fromImage(final_qimage) 
-                byte_array = QByteArray(); buffer = QBuffer(byte_array)
-                buffer.open(QIODevice.WriteOnly); final_qimage.save(buffer, "PNG"); image_data_bytes = byte_array.data()
-                success = False
-                if import_type == "glyph": success = self.db_manager.update_glyph_image_data_bytes(character, image_data_bytes)
-                elif import_type == "reference":
-                    if target_is_nrvg_for_ref: success = self.db_manager.update_vrt2_glyph_reference_image_data_bytes(character, image_data_bytes)
-                    else: success = self.db_manager.update_glyph_reference_image_data_bytes(character, image_data_bytes)
-                if success:
-                    processed_count += 1
-                    if import_type == "glyph": 
-                        self.glyph_grid_widget.update_glyph_preview(character, processed_pixmap, is_vrt2_source=False)
-                    current_editor_char = self.drawing_editor_widget.canvas.current_glyph_character
-                    is_editor_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
-                    if character == current_editor_char:
-                        if import_type == "glyph" and not is_editor_vrt2_editing: 
-                            self.load_glyph_for_editing(character, is_vrt2_edit_mode=False) 
-                        elif import_type == "reference":
-                            if target_is_nrvg_for_ref and is_editor_vrt2_editing: 
-                                self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
-                                self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
-                            elif not target_is_nrvg_for_ref and not is_editor_vrt2_editing: 
-                                self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
-                                self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
-                else: db_update_errors +=1
-        finally:
-            self._batch_operation_in_progress = False 
-            self._save_current_editor_state_settings() 
+        try:
+            # データベース書き込みを伴う一括操作全体をミューテックスで保護する
+            with QMutexLocker(self.db_mutex): # <--- ここでミューテックスを取得
+                for idx, file_path_str in enumerate(file_paths):
+                    file_path = Path(file_path_str)
+                    self.statusBar().showMessage(f"処理中 ({idx+1}/{total_files}): {file_path.name}", 0); QApplication.processEvents()
+                    stem = file_path.stem; is_vrt2_ref_candidate = False; hex_code = ""
+                    if import_type == "reference":
+                        match_vert = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
+                        if not match_vert:
+                             match_vert_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})vert", stem, re.IGNORECASE)
+                             if match_uplus: hex_code = match_uplus.group(1); is_vrt2_ref_candidate = True
+                        else: hex_code = match_vert.group(1); is_vrt2_ref_candidate = True
+                    if not is_vrt2_ref_candidate:
+                        match = re.fullmatch(r"uni([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
+                        if not match:
+                            match_uplus = re.fullmatch(r"U\+([0-9A-Fa-f]{4,6})", stem, re.IGNORECASE)
+                            if not match_uplus: skipped_filename_format += 1; continue
+                            hex_code = match_uplus.group(1)
+                        else: hex_code = match.group(1)
+                    if not hex_code: skipped_filename_format += 1; continue
+                    try: unicode_val = int(hex_code, 16); character = chr(unicode_val)
+                    except (ValueError, OverflowError): skipped_unicode_conversion += 1; continue
+                    target_is_nrvg_for_ref = False
+                    if import_type == "reference" and is_vrt2_ref_candidate:
+                        if character not in self.non_rotated_vrt2_chars: skipped_char_not_in_project +=1; continue
+                        target_is_nrvg_for_ref = True
+                    elif character not in self.project_glyph_chars_cache and character != '.notdef':
+                         skipped_char_not_in_project += 1; continue
+
+                    try:
+                        qimage = QImage(file_path_str)
+                    except Exception:
+                        skipped_image_load_error += 1; continue
+
+                    if qimage.isNull(): skipped_image_load_error += 1; continue
+
+                    scaled_image = qimage.scaled(target_image_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    final_qimage = QImage(target_image_size, QImage.Format_ARGB32_Premultiplied); final_qimage.fill(QColor(Qt.white))
+                    painter = QPainter(final_qimage)
+                    x_offset = (target_image_size.width() - scaled_image.width()) // 2
+                    y_offset = (target_image_size.height() - scaled_image.height()) // 2
+                    painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
+                    processed_pixmap = QPixmap.fromImage(final_qimage)
+                    byte_array = QByteArray(); buffer = QBuffer(byte_array)
+                    buffer.open(QIODevice.WriteOnly); final_qimage.save(buffer, "PNG"); image_data_bytes = byte_array.data()
+                    success = False
+                    if import_type == "glyph": success = self.db_manager.update_glyph_image_data_bytes(character, image_data_bytes)
+                    elif import_type == "reference":
+                        if target_is_nrvg_for_ref: success = self.db_manager.update_vrt2_glyph_reference_image_data_bytes(character, image_data_bytes)
+                        else: success = self.db_manager.update_glyph_reference_image_data_bytes(character, image_data_bytes)
+                    if success:
+                        processed_count += 1
+                        if import_type == "glyph":
+                            self.glyph_grid_widget.update_glyph_preview(character, processed_pixmap, is_vrt2_source=False)
+                        current_editor_char = self.drawing_editor_widget.canvas.current_glyph_character
+                        is_editor_vrt2_editing = self.drawing_editor_widget.canvas.editing_vrt2_glyph
+                        if character == current_editor_char:
+                            if import_type == "glyph" and not is_editor_vrt2_editing:
+                                self.load_glyph_for_editing(character, is_vrt2_edit_mode=False)
+                            elif import_type == "reference":
+                                if target_is_nrvg_for_ref and is_editor_vrt2_editing:
+                                    self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
+                                    self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
+                                elif not target_is_nrvg_for_ref and not is_editor_vrt2_editing:
+                                    self.drawing_editor_widget.canvas.reference_image = processed_pixmap.copy()
+                                    self.drawing_editor_widget.canvas.update(); self.drawing_editor_widget.delete_ref_button.setEnabled(True)
+                    else: db_update_errors +=1
+        except Exception as e: # このtry-exceptブロックはミューテックス取得後に発生する可能性のあるエラーを捕捉
+            QMessageBox.critical(self, f"{dialog_title_prefix}一括読み込みエラー", f"一括読み込み処理中にエラーが発生しました: {e}")
+            db_update_errors += 1 # エラーとしてカウント
+        finally: # ミューテックスはwithブロックの終了時に自動的に解放されます
+            self._batch_operation_in_progress = False
+            self._save_current_editor_state_settings()
             if self.drawing_editor_widget.canvas.current_glyph_character:
                 self.drawing_editor_widget.canvas.setFocus()
-        
+
         self.statusBar().showMessage(f"{status_bar_message_prefix} 完了", 5000)
         summary_parts = [f"{processed_count} 件の画像を処理・保存しました。"]
         if skipped_filename_format > 0: summary_parts.append(f"{skipped_filename_format} 件: ファイル名形式エラー")
@@ -6604,8 +6644,9 @@ class MainWindow(QMainWindow):
         if skipped_image_load_error > 0: summary_parts.append(f"{skipped_image_load_error} 件: 画像読み込みエラー")
         if db_update_errors > 0: summary_parts.append(f"{db_update_errors} 件: DB更新エラー")
         QMessageBox.information(self, "一括読み込み結果", "\n".join(summary_parts))
-        if self.drawing_editor_widget.canvas.current_glyph_character: 
+        if self.drawing_editor_widget.canvas.current_glyph_character:
             self.drawing_editor_widget.canvas.setFocus()
+
 
 
 
