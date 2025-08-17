@@ -15,8 +15,12 @@ from PySide6.QtGui import (
     QPainter, QPixmap, QColor, QPen, QResizeEvent, QImage
 )
 from PySide6.QtCore import (
-    Qt, QRectF, QSize, QByteArray, QTimer
+    Qt, QRectF, QSize, QByteArray, QTimer, Signal, QPoint # SignalとQPointを追加
 )
+
+# P-GlyphのAPIクライアントからselect_glyph関数をインポート
+# 注: api_usage_sample.py が同じディレクトリにあるか、Pythonのパスが通っている必要があります。
+from api_usage_sample import select_glyph
 
 # --- 定数 ---
 CANVAS_IMAGE_WIDTH = 500
@@ -98,6 +102,10 @@ class MetricsDBManager:
 
 # --- グリフ表示ウィジェット ---
 class MetricsDisplayWidget(QWidget):
+    # クリックされたグリフの情報を伝えるためのシグナル
+    # 引数: character (str), is_pua (bool)
+    glyphClicked = Signal(str, bool) 
+
     def __init__(self, db_manager: MetricsDBManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._db_manager = db_manager
@@ -356,6 +364,63 @@ class MetricsDisplayWidget(QWidget):
             
             x_cursor += scaled_width + scaled_spacing
 
+    def mousePressEvent(self, event):
+        """マウスがクリックされたときに、クリックされたグリフを特定しシグナルを発行する"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            clicked_char_info = self._get_char_at_pixel_pos(event.pos())
+            if clicked_char_info:
+                char, is_pua = clicked_char_info
+                print(f"Clicked on character: '{char}' (PUA: {is_pua})")
+                self.glyphClicked.emit(char, is_pua)
+        super().mousePressEvent(event)
+
+    def _get_char_at_pixel_pos(self, pos: QPoint) -> Optional[Tuple[str, bool]]:
+        """
+        クリックされたピクセル座標に対応する文字を特定する
+        
+        このロジックは、paintEvent の描画ロジックと密接に関連しているため、
+        描画処理と同期して座標計算を行う必要があります。
+        """
+        margin_size = (CANVAS_IMAGE_HEIGHT * self._scale_factor) * 0.5
+        drawable_width = max(0, self.width() - margin_size * 2)
+        lines_to_draw = self._calculate_drawable_lines(drawable_width)
+        
+        scaled_line_height_with_spacing = int(CANVAS_IMAGE_HEIGHT * self._scale_factor * self._line_spacing_factor)
+        
+        y_cursor = margin_size
+
+        for line_text in lines_to_draw:
+            # 各行の描画領域を計算 (クリック位置がこの行内にあるかを確認するため)
+            line_height = scaled_line_height_with_spacing # paintEvent で使われるline_height
+            line_rect = QRectF(margin_size, y_cursor, drawable_width if self._auto_wrap_text else self.width() - margin_size * 2, line_height)
+            
+            if line_rect.contains(pos): # クリックが現在の行内にあるかチェック
+                x_cursor = margin_size
+                scaled_spacing = (self._character_spacing / EM_SQUARE_UNITS) * CANVAS_IMAGE_WIDTH * self._scale_factor
+                
+                for char in line_text:
+                    pixel_advance = self._get_pixel_advance(char)
+                    scaled_width = pixel_advance * self._scale_factor
+                    
+                    char_total_width = scaled_width + scaled_spacing # 文字の描画幅 + 文字間隔
+                    char_rect = QRectF(x_cursor, y_cursor, char_total_width, line_height)
+                    
+                    if char_rect.contains(pos): # クリックが現在の文字内にあるかチェック
+                        is_pua = False
+                        try:
+                            if 0xE000 <= ord(char) <= 0xF8FF: # PUA判定ロジック
+                                is_pua = True
+                        except TypeError: # char が単一文字でない場合など
+                            pass
+                        return char, is_pua
+                    
+                    x_cursor += char_total_width
+            
+            y_cursor += scaled_line_height_with_spacing
+        
+        return None # どの文字もクリックされなかった場合
+
+
 # --- メインウィンドウ ---
 class MetricsViewerWindow(QMainWindow):
     def __init__(self, db_path: str):
@@ -373,6 +438,9 @@ class MetricsViewerWindow(QMainWindow):
         main_layout = QHBoxLayout(central_widget)
 
         self._display_widget = MetricsDisplayWidget(self._db_manager)
+        # グリフクリックシグナルをスロットに接続
+        self._display_widget.glyphClicked.connect(self._on_glyph_clicked) 
+
         self._scroll_area = QScrollArea()
         self._scroll_area.setWidget(self._display_widget)
         self._scroll_area.setWidgetResizable(True) 
@@ -487,6 +555,16 @@ class MetricsViewerWindow(QMainWindow):
     def _on_line_spacing_changed(self, value: int):
         self._line_spacing_label.setText(f"行間: {value}%")
         self._display_widget.set_line_spacing(value / 100.0)
+
+    def _on_glyph_clicked(self, char: str, is_pua: bool):
+        """グリフがクリックされたときにP-Glyphでそのグリフを選択する"""
+        print(f"API経由でP-Glyphにグリフ '{char}' (PUA: {is_pua}) の選択をリクエスト中...")
+        # api_usage_sample.py からインポートした select_glyph 関数を呼び出す
+        # 現在のMetricビューアは縦書きの情報を持たないため、is_vrt2はFalseとする
+        select_glyph(char, is_vrt2=False, is_pua=is_pua)
+        # 成功/失敗のメッセージをQMessageBoxなどで表示することも可能です
+        # 例: QMessageBox.information(self, "グリフ選択", f"P-Glyphに'{char}'の選択をリクエストしました。")
+
 
     def _save_settings(self):
         settings = {
