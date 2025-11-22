@@ -5990,6 +5990,7 @@ class MainWindow(QMainWindow):
         
         original_chars = self._process_char_set_string(new_char_string)
         processed_chars = []
+        # ... (PUAチェックのロジックはそのまま) ...
         pua_chars_found = []
         for char in original_chars:
             try:
@@ -6010,9 +6011,11 @@ class MainWindow(QMainWindow):
             self.properties_widget.load_character_set("".join(processed_chars))
             
         try:
-            locker = QMutexLocker(self.db_mutex)
-            self.db_manager.update_project_character_set(processed_chars) 
-            
+            # 修正: withブロックを使って、DB更新処理の間だけロックを保持するように変更
+            with QMutexLocker(self.db_mutex):
+                self.db_manager.update_project_character_set(processed_chars) 
+            # ここでロックは解放されます
+
             self._set_project_loading_state(True) 
             self._clear_edit_history()
             self.glyph_grid_widget.clear_grid_and_models() 
@@ -6022,7 +6025,10 @@ class MainWindow(QMainWindow):
             worker.signals.error.connect(self._on_project_load_error)
             worker.signals.finished.connect(self._check_and_finalize_loading_state)
             self.thread_pool.start(worker)
-            QMessageBox.information(self, "文字セット更新", "プロジェクトの文字セットが更新されました。データ再読み込み中です。")
+            
+            # 修正: ブロックするQMessageBoxの代わりにステータスバーへメッセージを表示
+            self.statusBar().showMessage("プロジェクトの文字セットが更新されました。データ再読み込み中です...", 0)
+            
         except Exception as e: 
             QMessageBox.critical(self, "文字セット更新エラー", f"文字セットの更新に失敗しました: {e}")
             self._set_project_loading_state(False)
@@ -6033,8 +6039,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。"); return
         processed_chars = self._process_char_set_string(new_char_string)
         try:
-            locker = QMutexLocker(self.db_mutex)
-            self.db_manager.update_rotated_vrt2_character_set(processed_chars)
+            # 修正: ロック範囲を限定
+            with QMutexLocker(self.db_mutex):
+                self.db_manager.update_rotated_vrt2_character_set(processed_chars)
 
             self._set_project_loading_state(True)
             self._clear_edit_history()
@@ -6045,7 +6052,10 @@ class MainWindow(QMainWindow):
             worker.signals.error.connect(self._on_project_load_error)
             worker.signals.finished.connect(self._check_and_finalize_loading_state)
             self.thread_pool.start(worker)
-            QMessageBox.information(self, "縦書き文字セット更新", "回転縦書き文字セットが更新されました。データ再読み込み中です。")
+            
+            # 修正: ステータスバーに変更
+            self.statusBar().showMessage("回転縦書き文字セットが更新されました。データ再読み込み中です...", 0)
+            
         except Exception as e: 
             QMessageBox.critical(self, "縦書き文字セット更新エラー", f"セットの更新に失敗: {e}")
             self._set_project_loading_state(False)
@@ -6058,13 +6068,14 @@ class MainWindow(QMainWindow):
         new_nr_vrt2_set = set(processed_chars)
         
         try:
-            locker = QMutexLocker(self.db_mutex)
-            r_vrt2_set_from_db = set(self.db_manager.get_rotated_vrt2_character_set())
-            conflicts_resolved_r_vrt2 = list(r_vrt2_set_from_db - new_nr_vrt2_set)
-            
-            self.db_manager.update_non_rotated_vrt2_character_set(list(new_nr_vrt2_set))
-            if len(conflicts_resolved_r_vrt2) != len(r_vrt2_set_from_db): 
-                self.db_manager.update_rotated_vrt2_character_set(conflicts_resolved_r_vrt2)
+            # 修正: ロック範囲を限定
+            with QMutexLocker(self.db_mutex):
+                r_vrt2_set_from_db = set(self.db_manager.get_rotated_vrt2_character_set())
+                conflicts_resolved_r_vrt2 = list(r_vrt2_set_from_db - new_nr_vrt2_set)
+                
+                self.db_manager.update_non_rotated_vrt2_character_set(list(new_nr_vrt2_set))
+                if len(conflicts_resolved_r_vrt2) != len(r_vrt2_set_from_db): 
+                    self.db_manager.update_rotated_vrt2_character_set(conflicts_resolved_r_vrt2)
 
             self._set_project_loading_state(True)
             self._clear_edit_history()
@@ -6075,7 +6086,10 @@ class MainWindow(QMainWindow):
             worker.signals.error.connect(self._on_project_load_error)
             worker.signals.finished.connect(self._check_and_finalize_loading_state)
             self.thread_pool.start(worker)
-            QMessageBox.information(self, "非回転縦書き文字セット更新", "非回転縦書き文字セットが更新されました。データ再読み込み中です。")
+            
+            # 修正: ステータスバーに変更
+            self.statusBar().showMessage("非回転縦書き文字セットが更新されました。データ再読み込み中です...", 0)
+            
         except Exception as e: 
             QMessageBox.critical(self, "非回転縦書き文字セット更新エラー", f"セットの更新に失敗: {e}")
             self._set_project_loading_state(False)
