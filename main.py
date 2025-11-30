@@ -1001,12 +1001,13 @@ class SaveGlyphWorker(QRunnable):
         self.mutex = mutex
         self.signals = SaveGlyphWorkerSignals()
 
-
     @Slot()
     def run(self):
-        try:
-            locker = QMutexLocker(self.mutex)
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.2
 
+        try:
+            # データの準備はロック不要なので先に行う
             byte_array = QByteArray()
             buffer = QBuffer(byte_array)
             buffer.open(QIODevice.WriteOnly)
@@ -1014,43 +1015,59 @@ class SaveGlyphWorker(QRunnable):
             qimage.save(buffer, "PNG")
             image_data = byte_array.data()
 
-            conn = None
-            try:
-                # タイムアウトを延長し、WALモードを有効にする
-                conn = sqlite3.connect(self.db_path, timeout=10.0)
-                conn.execute("PRAGMA journal_mode=WAL;")
-                cursor = conn.cursor()
+            for attempt in range(MAX_RETRIES):
+                conn = None
+                try:
+                    # 修正: DB操作の瞬間だけロックする (withブロックを抜けるとロック解除される)
+                    with QMutexLocker(self.mutex):
+                        conn = sqlite3.connect(self.db_path, timeout=20.0)
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        conn.execute("PRAGMA synchronous=NORMAL;")
+                        cursor = conn.cursor()
 
-                if self.is_pua_glyph:
-                    table = "pua_glyphs"
-                    cursor.execute(f"""
-                        UPDATE {table}
-                        SET image_data = ?, last_modified = CURRENT_TIMESTAMP
-                        WHERE character = ?
-                    """, (image_data, self.character))
-                elif self.is_vrt2_glyph:
-                    table = "vrt2_glyphs"
-                    cursor.execute(f"""
-                        INSERT OR REPLACE INTO {table} (character, image_data, last_modified)
-                        VALUES (?, ?, CURRENT_TIMESTAMP)
-                    """, (self.character, image_data))
-                else:
-                    table = "glyphs"
-                    cursor.execute(f"""
-                        UPDATE {table}
-                        SET image_data = ?, last_modified = CURRENT_TIMESTAMP
-                        WHERE character = ?
-                    """, (image_data, self.character))
+                        if self.is_pua_glyph:
+                            table = "pua_glyphs"
+                            cursor.execute(f"""
+                                UPDATE {table}
+                                SET image_data = ?, last_modified = CURRENT_TIMESTAMP
+                                WHERE character = ?
+                            """, (image_data, self.character))
+                        elif self.is_vrt2_glyph:
+                            table = "vrt2_glyphs"
+                            cursor.execute(f"""
+                                INSERT OR REPLACE INTO {table} (character, image_data, last_modified)
+                                VALUES (?, ?, CURRENT_TIMESTAMP)
+                            """, (self.character, image_data))
+                        else:
+                            table = "glyphs"
+                            cursor.execute(f"""
+                                UPDATE {table}
+                                SET image_data = ?, last_modified = CURRENT_TIMESTAMP
+                                WHERE character = ?
+                            """, (image_data, self.character))
 
-                if cursor.rowcount == 0 and not self.is_vrt2_glyph:
-                     pass
+                        conn.commit()
+                    
+                    # 成功したらループを抜ける
+                    self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph)
+                    break
 
-                conn.commit()
-                self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph)
-
-            finally:
-                if conn:
-                    conn.close()
+                except sqlite3.OperationalError as e:
+                    # ここに来た時点で withブロックを抜けているのでロックは解除されている
+                    err_msg = str(e).lower()
+                    if ("locked" in err_msg or "readonly" in err_msg) and attempt < MAX_RETRIES - 1:
+                        if conn:
+                            try: conn.close()
+                            except: pass
+                        # ロックを手放した状態でスリープする（ここが重要）
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        raise e
+                finally:
+                    if conn:
+                        try: conn.close()
+                        except: pass
 
         except Exception as e:
             import traceback
@@ -1062,34 +1079,59 @@ class SaveGlyphWorker(QRunnable):
             self.signals.finished.emit()
 
 
-
 class SaveGuiStateWorker(QRunnable):
     def __init__(self, db_path: str, key: str, value: str, mutex: QMutex):
         super().__init__()
         self.db_path = db_path
         self.key = key
-        self.value = str(value) # Ensure value is string
+        self.value = str(value) 
         self.mutex = mutex
         self.signals = WorkerBaseSignals()
 
     @Slot()
     def run(self):
-        try:
-            locker = QMutexLocker(self.mutex)
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.2
 
+        try:
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save GUI setting '{self.key}': DB path not set.")
                 return
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO project_settings (key, value) VALUES (?, ?)", (self.key, self.value))
-            conn.commit()
-            conn.close()
+            
+            for attempt in range(MAX_RETRIES):
+                conn = None
+                try:
+                    # 修正: DB操作の瞬間だけロックする
+                    with QMutexLocker(self.mutex):
+                        conn = sqlite3.connect(self.db_path, timeout=20.0)
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        conn.execute("PRAGMA synchronous=NORMAL;")
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT OR REPLACE INTO project_settings (key, value) VALUES (?, ?)", (self.key, self.value))
+                        conn.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    err_msg = str(e).lower()
+                    if ("locked" in err_msg or "readonly" in err_msg) and attempt < MAX_RETRIES - 1:
+                        if conn:
+                            try: conn.close()
+                            except: pass
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        raise e
+                finally:
+                    if conn:
+                        try: conn.close()
+                        except: pass
+
         except Exception as e:
             import traceback
             self.signals.error.emit(f"Error saving GUI setting '{self.key}': {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
+
+
 
 class SaveAdvanceWidthWorker(QRunnable):
     def __init__(self, db_path: str, character: str, advance_width: int, is_pua_glyph: bool, mutex: QMutex):
@@ -1103,23 +1145,50 @@ class SaveAdvanceWidthWorker(QRunnable):
 
     @Slot()
     def run(self):
-        try:
-            locker = QMutexLocker(self.mutex)
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.2
 
+        try:
             if not self.db_path:
                 self.signals.error.emit(f"Cannot save advance width for '{self.character}': DB path not set.")
                 return
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
-            cursor = conn.cursor()
-            table = "pua_glyphs" if self.is_pua_glyph else "glyphs"
-            cursor.execute(f"UPDATE {table} SET advance_width = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (self.advance_width, self.character))
-            conn.commit()
-            conn.close()
+
+            for attempt in range(MAX_RETRIES):
+                conn = None
+                try:
+                    # 修正: DB操作の瞬間だけロックする
+                    with QMutexLocker(self.mutex):
+                        conn = sqlite3.connect(self.db_path, timeout=20.0)
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        conn.execute("PRAGMA synchronous=NORMAL;")
+                        cursor = conn.cursor()
+                        
+                        table = "pua_glyphs" if self.is_pua_glyph else "glyphs"
+                        cursor.execute(f"UPDATE {table} SET advance_width = ?, last_modified = CURRENT_TIMESTAMP WHERE character = ?", (self.advance_width, self.character))
+                        conn.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    err_msg = str(e).lower()
+                    if ("locked" in err_msg or "readonly" in err_msg) and attempt < MAX_RETRIES - 1:
+                        if conn:
+                            try: conn.close()
+                            except: pass
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        raise e
+                finally:
+                    if conn:
+                        try: conn.close()
+                        except: pass
+
         except Exception as e:
             import traceback
             self.signals.error.emit(f"Error saving advance width for '{self.character}': {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
+
+
 
 class SaveReferenceImageWorkerSignals(WorkerBaseSignals):
     result = Signal(str, QPixmap, bool) # char, pixmap_or_None, is_vrt2
@@ -1139,9 +1208,10 @@ class SaveReferenceImageWorker(QRunnable):
 
     @Slot()
     def run(self):
-        try:
-            locker = QMutexLocker(self.mutex)
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.2
 
+        try:
             image_data: Optional[bytes] = None
             if self.pixmap:
                 byte_array = QByteArray()
@@ -1150,26 +1220,46 @@ class SaveReferenceImageWorker(QRunnable):
                 qimage = self.pixmap.toImage()
                 qimage.save(buffer, "PNG")
                 image_data = byte_array.data()
-            
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
-            cursor = conn.cursor()
 
-            if self.is_pua_glyph:
-                table = "pua_glyphs"
-            elif self.is_vrt2_glyph:
-                table = "vrt2_glyphs"
-            else:
-                table = "glyphs"
-            
-            cursor.execute(f"UPDATE {table} SET reference_image_data = ? WHERE character = ?", (image_data, self.character))
-            
-            if cursor.rowcount == 0:
-                conn.close()
-                return
+            for attempt in range(MAX_RETRIES):
+                conn = None
+                try:
+                    # 修正: DB操作の瞬間だけロックする
+                    with QMutexLocker(self.mutex):
+                        conn = sqlite3.connect(self.db_path, timeout=20.0)
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        conn.execute("PRAGMA synchronous=NORMAL;")
+                        cursor = conn.cursor()
 
-            conn.commit()
-            conn.close()
-            self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph) 
+                        if self.is_pua_glyph:
+                            table = "pua_glyphs"
+                        elif self.is_vrt2_glyph:
+                            table = "vrt2_glyphs"
+                        else:
+                            table = "glyphs"
+                        
+                        cursor.execute(f"UPDATE {table} SET reference_image_data = ? WHERE character = ?", (image_data, self.character))
+                        conn.commit()
+                    
+                    self.signals.result.emit(self.character, self.pixmap, self.is_vrt2_glyph or self.is_pua_glyph)
+                    break
+
+                except sqlite3.OperationalError as e:
+                    err_msg = str(e).lower()
+                    if ("locked" in err_msg or "readonly" in err_msg) and attempt < MAX_RETRIES - 1:
+                        if conn:
+                            try: conn.close()
+                            except: pass
+                        # ロックなしでスリープ
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        raise e
+                finally:
+                    if conn:
+                        try: conn.close()
+                        except: pass
+
         except Exception as e:
             import traceback
             if self.is_pua_glyph: err_type = "pua reference"
@@ -1178,6 +1268,8 @@ class SaveReferenceImageWorker(QRunnable):
             self.signals.error.emit(f"Error saving {err_type} image for '{self.character}': {e}\n{traceback.format_exc()}")
         finally:
             self.signals.finished.emit()
+
+
 
 
 # --- Worker for loading project data (Modified for batch loading) ---
@@ -1203,16 +1295,19 @@ class LoadProjectWorker(QRunnable):
         """For a list of characters, checks DB if image_data exists."""
         results = []
         if not char_list: return results
-        conn = db_manager._get_connection() 
-        cursor = conn.cursor()
-        if is_pua:
-            table = "pua_glyphs"
-        elif is_vrt2:
-            table = "vrt2_glyphs"
-        else:
-            table = "glyphs"
         
+        # DatabaseManager._get_connection() は使わず、ここで短命な接続を作るのが最も安全
+        conn = None
         try:
+            conn = sqlite3.connect(db_manager.db_path, timeout=20.0)
+            cursor = conn.cursor()
+            if is_pua:
+                table = "pua_glyphs"
+            elif is_vrt2:
+                table = "vrt2_glyphs"
+            else:
+                table = "glyphs"
+            
             for char_val in char_list:
                 cursor.execute(f"SELECT image_data IS NOT NULL FROM {table} WHERE character = ?", (char_val,))
                 row = cursor.fetchone()
@@ -1221,47 +1316,47 @@ class LoadProjectWorker(QRunnable):
         except sqlite3.OperationalError:
              return []
         finally:
-            conn.close()
+            if conn:
+                conn.close()
         return results
 
-# class LoadProjectWorker の run メソッドを以下のように変更
     @Slot()
     def run(self):
         try:
             db_manager = DatabaseManager(self.db_path)
-            # Compatibility: ensure pua_glyphs table exists
-            conn = db_manager._get_connection(); cursor = conn.cursor()
-            cursor.execute("""CREATE TABLE IF NOT EXISTS pua_glyphs (
-                character TEXT PRIMARY KEY, unicode_val INTEGER UNIQUE, image_data BLOB,
-                reference_image_data BLOB, advance_width INTEGER DEFAULT 1000,
-                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP )""")
-            conn.commit()
-
-            # 既存のプロジェクトで last_modified が NULL の場合に現在時刻を埋める
-            self.signals.load_progress.emit(1, "プロジェクト互換性更新中...")
+            
+            # 互換性チェック用の接続（確実に閉じる）
+            conn = None
             try:
-                # 'glyphs' テーブルを更新
-                cursor.execute("UPDATE glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
-                
-                # 'vrt2_glyphs' テーブルを更新
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vrt2_glyphs'")
-                if cursor.fetchone():
-                    cursor.execute("UPDATE vrt2_glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
-                
-                # 'pua_glyphs' テーブルを更新
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
-                if cursor.fetchone():
-                    cursor.execute("UPDATE pua_glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
-                
+                conn = sqlite3.connect(self.db_path, timeout=20.0)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
+                cursor.execute("""CREATE TABLE IF NOT EXISTS pua_glyphs (
+                    character TEXT PRIMARY KEY, unicode_val INTEGER UNIQUE, image_data BLOB,
+                    reference_image_data BLOB, advance_width INTEGER DEFAULT 1000,
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP )""")
                 conn.commit()
-            except Exception as e:
-                # この処理は互換性のためのもので、失敗しても致命的ではないため、エラーログを出力するに留める
-                print(f"Warning: Failed to update null last_modified fields for compatibility. Reason: {e}")
-                conn.rollback()
 
-            conn.close()
+                self.signals.load_progress.emit(1, "プロジェクト互換性更新中...")
+                try:
+                    cursor.execute("UPDATE glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
+                    
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vrt2_glyphs'")
+                    if cursor.fetchone():
+                        cursor.execute("UPDATE vrt2_glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
+                    
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
+                    if cursor.fetchone():
+                        cursor.execute("UPDATE pua_glyphs SET last_modified = CURRENT_TIMESTAMP WHERE last_modified IS NULL")
+                    conn.commit()
+                except Exception as e:
+                    print(f"Warning: Failed to update null last_modified fields for compatibility. Reason: {e}")
+                    conn.rollback()
+            finally:
+                if conn: conn.close()
 
             self.signals.load_progress.emit(0, "基本設定を読み込み中...")
+            # db_managerのメソッドは内部でconnect/closeを行うので安全
             char_set_list_raw = db_manager.get_project_character_set() 
             r_vrt2_list_raw = db_manager.get_rotated_vrt2_character_set()
             nr_vrt2_list_raw = db_manager.get_non_rotated_vrt2_character_set()
@@ -1287,7 +1382,6 @@ class LoadProjectWorker(QRunnable):
             pua_glyphs_raw_data = db_manager.get_all_pua_glyphs_with_preview_data()
             pua_list_with_img_info = [(char, img_bytes is not None) for char, img_bytes in pua_glyphs_raw_data]
 
-
             self.signals.load_progress.emit(60, "GUI設定を読み込み中...")
             font_name = db_manager.load_gui_setting(SETTING_FONT_NAME, DEFAULT_FONT_NAME)
             font_ascii_name = db_manager.load_gui_setting(SETTING_FONT_ASCII_NAME, DEFAULT_FONT_ASCII_NAME)
@@ -1304,19 +1398,14 @@ class LoadProjectWorker(QRunnable):
             guideline_v_str = db_manager.load_gui_setting(SETTING_GUIDELINE_V, "")
 
             loaded_brush_width_str = db_manager.load_gui_setting(SETTING_PEN_WIDTH, str(DEFAULT_PEN_WIDTH))
-            try:
-                loaded_brush_width_val = int(loaded_brush_width_str)
-            except ValueError:
-                loaded_brush_width_val = DEFAULT_PEN_WIDTH
+            try: loaded_brush_width_val = int(loaded_brush_width_str)
+            except ValueError: loaded_brush_width_val = DEFAULT_PEN_WIDTH
 
             loaded_eraser_width_str = db_manager.load_gui_setting(SETTING_ERASER_WIDTH)
             if loaded_eraser_width_str is not None:
-                try:
-                    loaded_eraser_width_val = int(loaded_eraser_width_str)
-                except ValueError:
-                    loaded_eraser_width_val = loaded_brush_width_val
-            else:
-                loaded_eraser_width_val = loaded_brush_width_val
+                try: loaded_eraser_width_val = int(loaded_eraser_width_str)
+                except ValueError: loaded_eraser_width_val = loaded_brush_width_val
+            else: loaded_eraser_width_val = loaded_brush_width_val
             
             gui_settings = {
                 SETTING_PEN_WIDTH: str(loaded_brush_width_val),
@@ -1411,9 +1500,12 @@ class DatabaseManager:
     def _get_connection(self):
         if not self.db_path:
             raise ConnectionError("Database path not set.")
-        # タイムアウトを設定し、WALモードを有効にする
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        # タイムアウトを20.0秒に延長
+        conn = sqlite3.connect(self.db_path, timeout=20.0)
+        # 読み込み専用の接続でもWALモード設定は安全（影響は無視されるか、WALモードを維持する）
         conn.execute("PRAGMA journal_mode=WAL;")
+        # 基本はSynchronous=NORMAL推奨（破損リスクは極小だが速度向上・ロック軽減効果大）
+        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -2022,7 +2114,12 @@ class Canvas(QWidget):
         path = QPainterPath(); n = len(points)
         if n == 0: return path
         path.moveTo(points[0])
-        if n == 1: path.lineTo(points[0]); return path
+        
+
+        if n == 1:
+            path.lineTo(points[0].x() + 0.1, points[0].y())
+            return path
+            
         for i in range(n - 1):
             p1 = points[i]; p2 = points[i+1]
             p0 = points[i-1] if i > 0 else p1
@@ -2325,6 +2422,7 @@ class Canvas(QWidget):
 
             logical_pos = self._map_view_point_to_logical_point(event.position())
             if not self.stroke_points or (logical_pos - self.stroke_points[-1]).manhattanLength() >= 1.0:
+
                 self.stroke_points.append(logical_pos)
                 self._rebuild_current_path_from_stroke_points(finalize=False)
             return
@@ -2345,9 +2443,7 @@ class Canvas(QWidget):
 
             elif self.drawing:
                 if self.stroke_points:
-                    if len(self.stroke_points) == 1 and self.stroke_points[0] == logical_pos_on_release: 
-                        self.stroke_points.append(logical_pos_on_release) 
-                    elif not self.stroke_points or (logical_pos_on_release - self.stroke_points[-1]).manhattanLength() >= 0.1:
+                    if (logical_pos_on_release - self.stroke_points[-1]).manhattanLength() >= 0.1:
                         self.stroke_points.append(logical_pos_on_release)
                     
                     self._rebuild_current_path_from_stroke_points(finalize=True)
