@@ -27,16 +27,22 @@ install.batをダブルクリックで実行すると実行環境の構築とラ
 
 また、このソフトウェアは以下の外部ライブラリに依存しています。
 
-| ライブラリ        | ライセンス          |
-| ------------ | -------------- |
-| PySide6      | LGPL v3        |
-| Pillow       | PILライセンス（MIT系） |
-| numpy        | BSD            |
-| scikit-image | BSD            |
-| scipy        | BSD            |
-| svgwrite     | MIT            |
-| fontTools    | MIT            |
-| ufoLib2      | MIT            |
+| ライブラリ | ライセンス |
+| :--- | :--- |
+| PySide6 | LGPL v3 |
+| Pillow | HPND (MIT系) |
+| numpy | BSD |
+| scikit-image | BSD |
+| scipy | BSD |
+| opencv-python | Apache 2.0 |
+| Shapely | BSD |
+| svgwrite | MIT |
+| fontTools | MIT |
+| ufoLib2 | Apache 2.0 |
+| FastAPI | MIT |
+| Uvicorn | BSD |
+| Pydantic | MIT |
+| Requests | Apache 2.0 |
 
 これらのライブラリの詳細なライセンスについては、それぞれの公式リポジトリをご参照ください。
 
