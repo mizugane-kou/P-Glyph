@@ -1918,6 +1918,51 @@ class DatabaseManager:
             conn.close()
 
 
+    def get_all_written_characters(self) -> List[str]:
+            """画像データ(image_data)がNULLでない全ての文字を取得する"""
+            if not self.db_path: return []
+            
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            written_chars = set()
+
+            try:
+                # 標準グリフ
+                cursor.execute("SELECT character FROM glyphs WHERE image_data IS NOT NULL")
+                for row in cursor.fetchall():
+                    # .notdef は除外したい場合はここで check (今回は含める)
+                    # 画像が白紙(初期状態)かどうかの厳密なチェックは重くなるため、DB上のNULLチェックのみとする
+                    written_chars.add(row['character'])
+
+                # 縦書きグリフ (vrt2)
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vrt2_glyphs'")
+                if cursor.fetchone():
+                    cursor.execute("SELECT character FROM vrt2_glyphs WHERE image_data IS NOT NULL")
+                    for row in cursor.fetchall():
+                        written_chars.add(row['character'])
+
+                # 私用領域グリフ (PUA)
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pua_glyphs'")
+                if cursor.fetchone():
+                    cursor.execute("SELECT character FROM pua_glyphs WHERE image_data IS NOT NULL")
+                    for row in cursor.fetchall():
+                        written_chars.add(row['character'])
+
+            except Exception as e:
+                print(f"Error fetching written chars: {e}")
+            finally:
+                conn.close()
+
+            # ソート: 通常の文字(長さ1)はコードポイント順、それ以外(.notdef等)は文字列順
+            # .notdef等は特殊なのでリストの先頭または末尾に来るように調整
+            def sort_key(char):
+                if len(char) == 1:
+                    return (0, ord(char))
+                return (1, char)
+
+            return sorted(list(written_chars), key=sort_key)
+
+
 
 class Canvas(QWidget):
     brush_width_changed = Signal(int)
@@ -4590,6 +4635,43 @@ class AddPuaDialog(QDialog):
 
 
 
+class WrittenGlyphsDialog(QDialog):
+    def __init__(self, char_list: List[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("書き込み済みグリフ一覧")
+        self.resize(500, 400)
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(f"画像データが存在するグリフ ({len(char_list)}文字):")
+        layout.addWidget(info_label)
+
+        # テキストエリア
+        self.text_edit = QTextEdit()
+        # 文字リストを結合して表示 (例: あいうえお...)
+        # .notdef はリストの最後に表示されるようにソートされている前提
+        joined_text = "".join(char_list)
+        self.text_edit.setPlainText(joined_text)
+        self.text_edit.setReadOnly(True)
+        layout.addWidget(self.text_edit)
+
+        # ボタンエリア
+        button_layout = QHBoxLayout()
+        
+        self.copy_button = QPushButton("テキストをコピー")
+        self.copy_button.clicked.connect(self.copy_to_clipboard)
+        button_layout.addWidget(self.copy_button)
+
+        self.close_button = QPushButton("閉じる")
+        self.close_button.clicked.connect(self.accept)
+        button_layout.addWidget(self.close_button)
+
+        layout.addLayout(button_layout)
+
+    def copy_to_clipboard(self):
+        text = self.text_edit.toPlainText()
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "コピー完了", "クリップボードにコピーしました。")
+
 
 
 
@@ -4924,6 +5006,21 @@ class MainWindow(QMainWindow):
 
         if canvas.current_glyph_character:
             canvas.setFocus()
+
+
+    def show_written_glyphs_dialog(self):
+            if not self.current_project_path or self._project_loading_in_progress:
+                QMessageBox.warning(self, "エラー", "プロジェクトが開かれていないか、処理中です。")
+                return
+
+            chars = self.db_manager.get_all_written_characters()
+
+            if not chars:
+                QMessageBox.information(self, "情報", "書き込み済みのグリフはありません。")
+                return
+
+            dialog = WrittenGlyphsDialog(chars, self)
+            dialog.exec()
 
 
     def _update_history_navigation_buttons(self):
@@ -5494,6 +5591,11 @@ class MainWindow(QMainWindow):
         self.delete_pua_glyph_action.triggered.connect(self.delete_current_pua_glyph)
         self.edit_menu.addAction(self.delete_pua_glyph_action)
         self.edit_menu.addSeparator()
+
+        self.show_written_glyphs_action = QAction("書き込み済みグリフ一覧の取得...", self)
+        self.show_written_glyphs_action.triggered.connect(self.show_written_glyphs_dialog)
+        self.edit_menu.addAction(self.show_written_glyphs_action)
+
         self.batch_import_glyphs_action = QAction("グリフの一括読み込み...", self); self.batch_import_glyphs_action.triggered.connect(self.batch_import_glyphs)
         self.edit_menu.addAction(self.batch_import_glyphs_action)
         self.batch_import_reference_images_action = QAction("下書きの一括読み込み...", self); self.batch_import_reference_images_action.triggered.connect(self.batch_import_reference_images)
@@ -5537,6 +5639,8 @@ class MainWindow(QMainWindow):
                 project_loaded_and_not_processing and 
                 self.drawing_editor_widget.canvas.editing_pua_glyph
             )
+        if hasattr(self, 'show_written_glyphs_action'):
+            self.show_written_glyphs_action.setEnabled(project_loaded_and_not_processing)
         if self.batch_import_glyphs_action: self.batch_import_glyphs_action.setEnabled(project_loaded_and_not_processing)
         if self.batch_import_reference_images_action: self.batch_import_reference_images_action.setEnabled(project_loaded_and_not_processing)
 
