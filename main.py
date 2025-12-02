@@ -1656,10 +1656,13 @@ class DatabaseManager:
             db_chars_query_result = cursor.fetchall()
             db_chars = {row['character'] for row in db_chars_query_result if not (is_main_set and row['character'] == '.notdef')}
             new_chars_set = set(valid_characters)
-            empty_image_bytes_for_new_main_glyphs = self._create_empty_image_data() if is_main_set else None
+            
+            # 【変更点】ここを None にすることで、新規追加時は「画像なし（未書き込み）」状態にする
+            empty_image_bytes_for_new_main_glyphs = None 
 
             for char_to_add in new_chars_set - db_chars:
                 if is_main_set:
+                    # image_data に None (NULL) を挿入
                     cursor.execute("INSERT OR IGNORE INTO glyphs (character, unicode_val, image_data, advance_width, last_modified) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
                                    (char_to_add, ord(char_to_add), empty_image_bytes_for_new_main_glyphs, DEFAULT_ADVANCE_WIDTH))
                 elif updates_vrt2_table: 
@@ -4040,11 +4043,32 @@ class GlyphGridWidget(QWidget):
             self.glyph_count_label.setText("-/-")
 
     def _on_filter_changed(self, checked: bool):
+
+        current_view = self.current_active_view
+        current_model = current_view.model()
+        current_char_key: Optional[str] = None
+        
+        current_idx = current_view.currentIndex()
+        if current_idx.isValid() and isinstance(current_model, GlyphTableModel):
+            current_char_key = current_model.data(current_idx, Qt.UserRole)
+
+
         self.std_glyph_model.set_filter_written_only(checked)
         self.vrt2_glyph_model.set_filter_written_only(checked)
         self.pua_glyph_model.set_filter_written_only(checked)
         
-        self._try_to_restore_selection_or_select_first(self.current_active_view)
+
+        restored = False
+        if current_char_key:
+
+            if current_model.get_flat_index_of_char_key(current_char_key) is not None:
+                self._select_char_in_view(current_char_key, current_view, current_model)
+                restored = True
+        
+
+        if not restored:
+            self._try_to_restore_selection_or_select_first(current_view)
+
         self._update_glyph_count_label()
 
 
@@ -5461,31 +5485,70 @@ class MainWindow(QMainWindow):
             related_kanji_font = QFont(font_family_from_worker) 
             related_kanji_font.setPixelSize(font_px_size)
 
+        # ダークモード判定
+        bg_lightness = self.palette().color(QPalette.Window).lightness()
+        is_dark_mode = bg_lightness < 128
+
+        # ソートと分類のためのヘルパー関数
+        def get_char_sort_key(c):
+            # 優先順位: 1.プロジェクト内 (0) か プロジェクト外 (1) か
+            #          2. 文字コード (ord(c))
+            in_project = c in self.project_glyph_chars_cache
+            return (0 if in_project else 1, ord(c))
+
+        def get_char_display_style(c):
+            # 状態に応じたスタイルシート（色）を返す
+            in_project = c in self.project_glyph_chars_cache
+            
+            if not in_project:
+                # プロジェクトに存在しない (登録外)
+                color = "#4d4d4d" if is_dark_mode else "#C0C0C0"
+                return f"color: {color};"
+            
+            # プロジェクトに存在する -> 書き込み済みか確認
+            is_written = self.glyph_grid_widget.std_glyph_model.is_glyph_written(c) or \
+                         (c in self.non_rotated_vrt2_chars and self.glyph_grid_widget.vrt2_glyph_model.is_glyph_written(c))
+            
+            if is_written:
+                # 通常表示 (書き込み済み)
+                color = "#ffffff" if is_dark_mode else "black"
+                return f"color: {color};"
+            else:
+                # 少しグレーアウト (未書き込み)
+                color = "#9c9c9c" if is_dark_mode else "#707070"
+                return f"color: {color};"
+
         sorted_radicals = sorted(effective_results_dict.keys())
         for radical in sorted_radicals:
             kanji_list = effective_results_dict[radical]
             if not kanji_list: continue
+
+            # ソート適用
+            kanji_list.sort(key=get_char_sort_key)
+
             any_tabs_added = True; tab_content_widget = QWidget()
             tab_content_widget.setStyleSheet(self.related_kanji_label_style) 
             tab_layout = QGridLayout(tab_content_widget)
             tab_layout.setSpacing(5); tab_layout.setContentsMargins(5, 5, 5, 5)
             row, col = 0, 0
             for kanji_char_to_display in kanji_list:
-                kanji_label: QLabel 
+                
+                is_vrt2_source_for_label = False 
+                glyph_pixmap_for_label: Optional[QPixmap] = None
 
                 if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
                     glyph_pixmap_tuple = self.temp_written_kv_pixmaps.get(kanji_char_to_display)
-                    
-                    is_vrt2_source_for_label = False 
-                    glyph_pixmap_for_label: Optional[QPixmap] = None
-
                     if glyph_pixmap_tuple:
                         glyph_pixmap_for_label, is_vrt2_source_for_label = glyph_pixmap_tuple
-                    
-                    current_label = ClickableKanjiLabel(kanji_char_to_display, is_vrt2_source_for_label)
-                    current_label.clicked_with_info.connect(self._on_kv_related_glyph_clicked)
-                    kanji_label = current_label 
+                
+                # ClickableKanjiLabelを使用
+                kanji_label = ClickableKanjiLabel(kanji_char_to_display, is_vrt2_source_for_label)
+                kanji_label.clicked_with_info.connect(self._on_kv_related_glyph_clicked)
 
+                kanji_label.setFixedSize(item_side_length, item_side_length)
+                kanji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
                     if glyph_pixmap_for_label and not glyph_pixmap_for_label.isNull():
                         scaled_pixmap = glyph_pixmap_for_label.scaled(preview_display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         kanji_label.setPixmap(scaled_pixmap)
@@ -5495,12 +5558,12 @@ class MainWindow(QMainWindow):
                         font_for_fallback.setPixelSize(max(10, int(item_side_length * 0.6)))
                         kanji_label.setFont(font_for_fallback)
                 else: 
-                    kanji_label = QLabel() 
-                    kanji_label.setFont(related_kanji_font)
-                    kanji_label.setText(kanji_char_to_display)
-                
-                kanji_label.setFixedSize(item_side_length, item_side_length)
-                kanji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    # 外部フォント表示モード (KV_MODE_FONT_DISPLAY)
+                    self._kv_set_label_font_and_text(kanji_label, kanji_char_to_display, font_family_from_worker, kanji_label.rect(), 0.9)
+                    
+                    # 状態に応じた色を適用
+                    style_sheet = get_char_display_style(kanji_char_to_display)
+                    kanji_label.setStyleSheet(f"border: none; background: transparent; {style_sheet}")
                 
                 tab_layout.addWidget(kanji_label, row, col)
                 col += 1
@@ -5544,17 +5607,58 @@ class MainWindow(QMainWindow):
         if self._project_loading_in_progress or not self.current_project_path:
             return
         
-        target_model = self.glyph_grid_widget.vrt2_glyph_model if is_vrt2_glyph else self.glyph_grid_widget.std_glyph_model
+        # 【変更点】プロジェクトに含まれているかチェック
+        # project_glyph_chars_cache は標準グリフセットのキャッシュ
+        is_in_project = char_key in self.project_glyph_chars_cache
         
-        if target_model.get_flat_index_of_char_key(char_key) is None:
-            QMessageBox.information(self, "情報", 
-                                    f"グリフ「{char_key}」は現在グリッドリストに表示されていません。\n"
-                                    "「書き込み済みグリフのみ表示」フィルタなどが影響している可能性があります。")
+        # 既にプロジェクトにある場合、またはVRT2として明示的にクリックされた場合(VRT2は別管理)は既存の処理
+        target_model = None
+        if is_vrt2_glyph:
+             target_model = self.glyph_grid_widget.vrt2_glyph_model
+        else:
+             target_model = self.glyph_grid_widget.std_glyph_model
+
+        # モデル内に存在するかチェック
+        if target_model.get_flat_index_of_char_key(char_key) is not None:
+            self.load_glyph_for_editing(char_key, is_vrt2_edit_mode=is_vrt2_glyph)
+            return
+
+        # プロジェクトに存在しない場合、追加するか確認する
+        # （注: VRT2グリフとしてクリックされたがモデルにない場合は、VRT2セットへの追加が必要ですが、
+        #   ここでは関連漢字リスト（標準グリフ想定）からのクリックを主眼に、標準セットへの追加を行います）
+        if not is_in_project and not is_vrt2_glyph:
+            reply = QMessageBox.question(
+                self, 
+                "グリフの追加",
+                f"文字「{char_key}」はプロジェクトに含まれていません。\nプロジェクトに追加しますか？",
+                QMessageBox.Yes | QMessageBox.No, 
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:
+                # 現在の文字セットを取得して追加
+                current_char_list = self.db_manager.get_project_character_set()
+                if char_key not in current_char_list:
+                    current_char_list.append(char_key)
+                    # 文字コード順にソート（.notdef等は特別扱いが必要だが、get_project_character_setで整列されている前提＋単純追加）
+                    # DatabaseManager側で整列されるが、ここでも軽く整列
+                    current_char_list.sort(key=ord)
+                    
+                    # 文字列に変換して更新メソッドを呼ぶ
+                    new_char_string = "".join(current_char_list)
+                    self.update_project_character_set(new_char_string)
+            
+            # キャンバスにフォーカスを戻す
             if self.drawing_editor_widget.canvas.current_glyph_character: 
                 self.drawing_editor_widget.canvas.setFocus()
             return
 
-        self.load_glyph_for_editing(char_key, is_vrt2_edit_mode=is_vrt2_glyph)
+        # プロジェクトにあるはずなのに表示されていない場合（フィルタリング等）
+        QMessageBox.information(self, "情報", 
+                                f"グリフ「{char_key}」は現在グリッドリストに表示されていません。\n"
+                                "「書き込み済みグリフのみ表示」フィルタなどが影響している可能性があります。")
+        if self.drawing_editor_widget.canvas.current_glyph_character: 
+            self.drawing_editor_widget.canvas.setFocus()
 
 
     @Slot(int, str)
