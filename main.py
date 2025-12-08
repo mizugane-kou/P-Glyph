@@ -5610,7 +5610,7 @@ class MainWindow(QMainWindow):
 
 
 
-# --- MainWindow._trigger_kanji_viewer_update_for_current_glyph を置換 ---
+
 
     def _trigger_kanji_viewer_update_for_current_glyph(self, current_char: str): 
         if self._project_loading_in_progress: return 
@@ -5655,42 +5655,35 @@ class MainWindow(QMainWindow):
         font_px_size_for_related = max(1, int(ideal_item_width_for_3_cols * 0.7))
         font_px_size_for_related = min(font_px_size_for_related, 50); font_px_size_for_related = max(font_px_size_for_related, 16)
 
-        # キャッシュヒットチェック (キャッシュは結果辞書しか持っていないため、画像データは別途必要だが
-        # 高速移動時はキャッシュより「最新の描画」が優先されるため、一旦キャッシュ処理はシンプルに)
+        # 【修正】キャッシュヒットチェック
+        # モードに関わらずキャッシュがあれば使用する (画像ロードは後で非同期で行われるため)
         if current_char in self._related_kanji_search_cache:
-            # キャッシュがあっても画像データがない場合は再取得させる手もあるが、
-            # とりあえず検索結果（辞書）があればそれを使い、画像は後でロード... 
-            # としたいところだが、今回は「ワーカーで一括ロード」に変えるため、
-            # WRITTENモードの場合はキャッシュを使わずワーカーに投げ直すほうが
-            # 「メインスレッドでのDBアクセス」を確実に防げるため、安全策をとる。
-            # フォント表示モードならキャッシュを使ってOK。
-            if self.kv_display_mode != MainWindow.KV_MODE_WRITTEN_GLYPHS:
-                cached_result = self._related_kanji_search_cache[current_char]
-                QTimer.singleShot(0, lambda: self._handle_kv_related_kanji_result(
-                    -1, cached_result, font_family_for_main_display, font_px_size_for_related, current_char, {}
-                ))
-                return
+            cached_result = self._related_kanji_search_cache[current_char]
+            
+            # ラムダ内の引数を修正（{}を削除し、正しい5引数にする）
+            QTimer.singleShot(0, lambda: self._handle_kv_related_kanji_result(
+                -1, cached_result, font_family_for_main_display, font_px_size_for_related, current_char
+            ))
+            return
 
+        # キャッシュになければワーカー起動
         with QMutexLocker(self._worker_management_mutex):
             self.current_related_kanji_process_id += 1; process_id = self.current_related_kanji_process_id
             if self.related_kanji_worker and self.related_kanji_worker.isRunning(): self.related_kanji_worker.cancel() 
              
             effective_font_family_for_worker = font_family_for_main_display 
             
-            # 変更: db_path と kv_display_mode を渡す
             new_worker = RelatedKanjiWorker(
                 process_id, current_char, 
                 self.kanji_radicals_data, self.radical_to_kanji_data, 
                 effective_font_family_for_worker, font_px_size_for_related, 
-                self.current_project_path, self.kv_display_mode, # <--- 追加引数
+                self.current_project_path, self.kv_display_mode, 
                 self
             )
             new_worker.result_ready.connect(self._handle_kv_related_kanji_result)
             new_worker.error_occurred.connect(self._handle_kv_worker_error)
             new_worker.finished.connect(self._on_kv_worker_finished); new_worker.finished.connect(new_worker.deleteLater)
             self.related_kanji_worker = new_worker; self.related_kanji_worker.start()
-
-
 
 
 
