@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QTabBar, QStyle, QStyleOptionTab, QSpacerItem, 
     QTabWidget, QAbstractButton, QMenu,
     QTableView, QAbstractItemView, QStyledItemDelegate, QStyleOptionViewItem,
-    QStyleOptionFrame
+    QStyleOptionFrame, QListView  
 )
 from PySide6.QtGui import (
     QPainter, QPen, QMouseEvent, QColor, QPixmap,
@@ -47,7 +47,7 @@ from PySide6.QtCore import (
     QIODevice, QByteArray, QRunnable, QThreadPool, Slot, QObject, QProcess, QTimer, 
     QRect, QMutex, QMutexLocker, QEvent, QThread,
     QAbstractTableModel, QModelIndex, QItemSelectionModel,
-    QCoreApplication
+    QCoreApplication, QAbstractListModel 
 )
 
 # metric.pyからメトリックビューアウィンドウをインポート
@@ -936,7 +936,7 @@ class VerticalTabBar(QTabBar):
                     current_y += self.char_height
             painter.restore()
 
-# --- カスタムタブウィジェット (変更なし) ---
+# --- カスタムタブウィジェット---
 class VerticalTabWidget(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -944,12 +944,19 @@ class VerticalTabWidget(QTabWidget):
         self.setTabBar(custom_tab_bar)
         self.setTabPosition(QTabWidget.TabPosition.West)
 
-# --- 関連漢字データを準備するワーカースレッド (変更なし) ---
+
+
+
+# --- RelatedKanjiWorker クラスを置換 ---
+
 class RelatedKanjiWorker(QThread):
-    result_ready = Signal(int, dict, str, int)
+    # process_id, results_dict, font_family, font_size, target_char
+    # found_image_data_map は削除（後で個別にロードするため）
+    result_ready = Signal(int, dict, str, int, str)
     error_occurred = Signal(int, str)
 
-    def __init__(self, process_id, input_char, kanji_data, radical_data, font_family, font_pixel_size, parent=None):
+    def __init__(self, process_id, input_char, kanji_data, radical_data, font_family, font_pixel_size, 
+                 db_path, kv_mode, parent=None):
         super().__init__(parent)
         self.process_id = process_id
         self.input_char = input_char
@@ -957,27 +964,43 @@ class RelatedKanjiWorker(QThread):
         self.radical_data = radical_data
         self.font_family = font_family
         self.font_pixel_size = font_pixel_size
+        self.db_path = db_path
+        self.kv_mode = kv_mode
         self._is_cancelled_flag = False
         self.mutex = QMutex()
 
     def run(self):
         try:
+            # 1. 関連漢字の計算 (CPUバウンド)
             results_dict = find_kanji_by_shared_radical_per_radical(
                 self.input_char, self.kanji_data, self.radical_data
             )
+            
             with QMutexLocker(self.mutex):
-                if self._is_cancelled_flag:
-                    return
-            self.result_ready.emit(self.process_id, results_dict, self.font_family, self.font_pixel_size)
+                if self._is_cancelled_flag: return
+
+            # ここでの画像一括読み込み処理は廃止。
+            # 代わりに、MainWindow側で「書き込み済みかどうか」の判定だけは行う必要があるが、
+            # それはMainWindowの既存のモデル情報（written_chars）を使えばDBアクセスなしで可能。
+            # したがって、ここでは純粋に検索結果だけを返す。
+
+            self.result_ready.emit(
+                self.process_id, 
+                results_dict, 
+                self.font_family, 
+                self.font_pixel_size, 
+                self.input_char
+            )
+            
         except Exception as e:
             with QMutexLocker(self.mutex):
-                if self._is_cancelled_flag:
-                    return
+                if self._is_cancelled_flag: return
             self.error_occurred.emit(self.process_id, str(e))
 
     def cancel(self):
         with QMutexLocker(self.mutex):
             self._is_cancelled_flag = True
+
 
 
 # --- Asynchronous Workers (SaveGlyphWorker, SaveGuiStateWorker, SaveAdvanceWidthWorker, SaveReferenceImageWorker は変更なし) ---
@@ -4727,6 +4750,229 @@ class ClickableKanjiLabel(QLabel):
 
 
 
+# --- KanjiListModel クラスを置換 ---
+
+class KanjiListModel(QAbstractListModel):
+    """関連漢字リストを管理。画像はオンデマンドでリクエストする。"""
+    def __init__(self, 
+                 kanji_list: List[Tuple[str, bool]], # (char, is_vrt2) のリスト
+                 project_chars: Set[str], 
+                 image_cache: Dict[str, QPixmap],    # MainWindowのキャッシュへの参照
+                 request_image_callback,             # 画像ロード要求用の関数
+                 font_family: str = "",
+                 is_written_mode: bool = False,
+                 parent=None):
+        super().__init__(parent)
+        self._kanji_list = kanji_list
+        self._project_chars = project_chars
+        self._image_cache = image_cache
+        self._request_image_callback = request_image_callback
+        self._font_family = font_family
+        self._is_written_mode = is_written_mode
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._kanji_list)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._kanji_list)):
+            return None
+        
+        char, is_vrt2 = self._kanji_list[index.row()]
+        
+        if role == Qt.DisplayRole:
+            return char
+        
+        elif role == Qt.ToolTipRole:
+            tooltip = f"グリフ「{char}」を編集"
+            if is_vrt2:
+                tooltip += " (縦書きグリフ)"
+            elif char not in self._project_chars:
+                tooltip = f"文字「{char}」はプロジェクト未登録です\nクリックして追加"
+            return tooltip
+        
+        elif role == Qt.UserRole:
+            # キャッシュから画像を取得
+            pixmap = None
+            if self._is_written_mode:
+                if char in self._image_cache:
+                    pixmap = self._image_cache[char]
+                else:
+                    # キャッシュになければロードをリクエスト（非同期）
+                    # 既にリクエスト済みかはMainWindow側で制御してもらう
+                    self._request_image_callback(char, is_vrt2)
+            
+            return {
+                "char": char,
+                "in_project": char in self._project_chars,
+                "pixmap": pixmap,
+                "is_vrt2": is_vrt2,
+                "font_family": self._font_family,
+                "is_written_mode": self._is_written_mode
+            }
+        
+        return None
+    
+    def refresh_row(self, char: str):
+        """指定された文字の行を再描画する"""
+        for i, (c, _) in enumerate(self._kanji_list):
+            if c == char:
+                idx = self.index(i)
+                self.dataChanged.emit(idx, idx, [Qt.UserRole])
+                break
+
+
+
+
+
+
+class KanjiListDelegate(QStyledItemDelegate):
+    """関連漢字リストの各アイテムを描画するデリゲート"""
+    def __init__(self, item_size: int, font_size: int, is_dark_mode: bool, parent=None):
+        super().__init__(parent)
+        self.item_size = item_size
+        self.font_size = font_size
+        self.is_dark_mode = is_dark_mode
+        self.padding = 4
+
+    def sizeHint(self, option, index):
+        return QSize(self.item_size, self.item_size)
+
+    def paint(self, painter, option, index):
+        painter.save()
+        
+        # データ取得
+        data = index.data(Qt.UserRole)
+        if not data:
+            painter.restore()
+            return
+
+        char = data["char"]
+        in_project = data["in_project"]
+        pixmap = data["pixmap"]
+        is_written_mode = data["is_written_mode"]
+        font_family = data["font_family"]
+
+        rect = option.rect
+        
+        # 背景描画（ホバー/選択時のハイライト）
+        if option.state & QStyle.State_MouseOver or option.state & QStyle.State_Selected:
+            bg_color = option.palette.color(QPalette.Highlight)
+            if not (option.state & QStyle.State_Selected):
+                bg_color = bg_color.lighter(150)
+            painter.fillRect(rect, bg_color)
+        
+        # コンテンツ領域
+        content_rect = rect.adjusted(self.padding, self.padding, -self.padding, -self.padding)
+        
+        # 描画色の決定
+        text_color = option.palette.color(QPalette.Text)
+        if not in_project:
+            text_color = QColor("#9c9c9c") if self.is_dark_mode else QColor("#707070")
+        elif not pixmap and not is_written_mode:
+            # プロジェクトにあるが画像がない（フォント表示モード時）
+            # 通常色だが、少し区別してもよい
+            pass
+        
+        if option.state & QStyle.State_Selected:
+            text_color = option.palette.color(QPalette.HighlightedText)
+
+        # 描画（画像 または テキスト）
+        if is_written_mode and pixmap and not pixmap.isNull():
+            scaled_pixmap = pixmap.scaled(content_rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = content_rect.left() + (content_rect.width() - scaled_pixmap.width()) // 2
+            y = content_rect.top() + (content_rect.height() - scaled_pixmap.height()) // 2
+            painter.drawPixmap(x, y, scaled_pixmap)
+        else:
+            # テキスト描画
+            painter.setPen(text_color)
+            font = QFont(font_family if font_family else painter.font().family())
+            font.setPixelSize(self.font_size)
+            painter.setFont(font)
+            painter.drawText(rect, Qt.AlignCenter, char)
+
+        painter.restore()
+
+
+
+class AsyncGlyphLoaderSignals(QObject):
+    # result: (character, pixmap, ref_pixmap, advance_width, is_vrt2, is_pua, generation_id)
+    result_ready = Signal(str, object, object, int, bool, bool, int)
+    error_occurred = Signal(str)
+
+class AsyncGlyphLoader(QRunnable):
+    def __init__(self, db_path: str, character: str, is_vrt2: bool, is_pua: bool, generation_id: int):
+        super().__init__()
+        self.db_path = db_path
+        self.character = character
+        self.is_vrt2 = is_vrt2
+        self.is_pua = is_pua
+        self.generation_id = generation_id
+        self.signals = AsyncGlyphLoaderSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            # スレッド内で独自の接続を使用するため、DatabaseManagerを一時的にインスタンス化
+            # (既存の DatabaseManager クラスを利用)
+            db = DatabaseManager(self.db_path)
+            
+            # 各種データのロード
+            adv_width = db.load_glyph_advance_width(self.character, is_pua=self.is_pua)
+            pixmap = db.load_glyph_image(self.character, is_vrt2=self.is_vrt2, is_pua=self.is_pua)
+            
+            reference_pixmap = None
+            if self.is_pua:
+                reference_pixmap = db.load_reference_image(self.character, is_pua=True)
+            elif self.is_vrt2:
+                reference_pixmap = db.load_vrt2_glyph_reference_image(self.character)
+            else:
+                reference_pixmap = db.load_reference_image(self.character, is_pua=False)
+            
+            self.signals.result_ready.emit(
+                self.character, pixmap, reference_pixmap, adv_width, 
+                self.is_vrt2, self.is_pua, self.generation_id
+            )
+            
+        except Exception as e:
+            self.signals.error_occurred.emit(str(e))
+
+
+
+
+
+
+class KVImageLoadSignals(QObject):
+    image_loaded = Signal(str, QPixmap, bool) # char, pixmap, is_vrt2
+
+class KVImageLoadWorker(QRunnable):
+    """Kanji Viewer用に単一のグリフ画像を読み込むワーカ"""
+    def __init__(self, db_path: str, char: str, is_vrt2: bool):
+        super().__init__()
+        self.db_path = db_path
+        self.char = char
+        self.is_vrt2 = is_vrt2
+        self.signals = KVImageLoadSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            db = DatabaseManager(self.db_path)
+            # 画像バイト列を取得
+            img_bytes = db.load_glyph_image_bytes(self.char, is_vrt2=self.is_vrt2)
+            
+            pixmap = QPixmap()
+            if img_bytes:
+                pixmap.loadFromData(img_bytes)
+            
+            # 読み込み成功・失敗に関わらずシグナルを送る（失敗時はnull pixmap）
+            # これにより、失敗した場合も「読み込み済み」として扱い、再リクエストを防ぐ
+            self.signals.image_loaded.emit(self.char, pixmap, self.is_vrt2)
+            
+        except Exception:
+            # エラー時は空のPixmapを返す
+            self.signals.image_loaded.emit(self.char, QPixmap(), self.is_vrt2)
+
+
 
 class MainWindow(QMainWindow):
     KV_MODE_FONT_DISPLAY = 0
@@ -4759,7 +5005,16 @@ class MainWindow(QMainWindow):
 
         self.non_rotated_vrt2_chars: set[str] = set()
         self.project_glyph_chars_cache: Set[str] = set() 
-        
+
+        self._related_kanji_search_cache: Dict[str, Dict[str, List[str]]] = {}
+
+        self._current_load_generation = 0
+
+        # キー: 文字列 (char), 値: QPixmap
+        self._kv_image_cache: Dict[str, QPixmap] = {}
+        # 現在ロード中の文字を記録して重複リクエストを防ぐ
+        self._kv_requested_images: Set[str] = set()
+
         self.export_process: Optional[QProcess] = None
         self.original_export_button_state: bool = False 
         
@@ -4841,6 +5096,10 @@ class MainWindow(QMainWindow):
         self._kv_deferred_update_timer = QTimer(self)
         self._kv_deferred_update_timer.setSingleShot(True)
         self._kv_deferred_update_timer.timeout.connect(self._process_deferred_kv_update)
+
+        self._history_debounce_timer = QTimer(self)
+        self._history_debounce_timer.setSingleShot(True)
+        self._history_debounce_timer.timeout.connect(self._perform_deferred_history_navigation)
 
         if self.kanji_viewer_font_combo:
             self.kanji_viewer_font_combo.currentTextChanged.connect(self._handle_kv_font_combo_changed)
@@ -5055,6 +5314,9 @@ class MainWindow(QMainWindow):
         can_go_forward = self.current_history_index < len(self.edit_history) - 1
         self.drawing_editor_widget.update_history_buttons_state(can_go_back, can_go_forward)
 
+
+
+# 履歴移動はシンプルにこれでOK
     @Slot()
     def _navigate_edit_history_back(self):
         if self._project_loading_in_progress or not self.current_project_path: return
@@ -5064,13 +5326,13 @@ class MainWindow(QMainWindow):
             
             self._is_navigating_history = True
             try:
+                # 直接呼ぶ (非同期化されているのでブロックしない)
                 self.load_glyph_for_editing(char, is_vrt2_edit_mode=is_vrt2, is_pua_edit_mode=is_pua)
             finally:
                 self._is_navigating_history = False
             
+            # 【修正】履歴移動後にボタンの状態を更新する
             self._update_history_navigation_buttons()
-            if self.drawing_editor_widget.canvas.current_glyph_character:
-                self.drawing_editor_widget.canvas.setFocus()
 
 
     @Slot()
@@ -5086,10 +5348,30 @@ class MainWindow(QMainWindow):
             finally:
                 self._is_navigating_history = False
 
+            # 【修正】履歴移動後にボタンの状態を更新する
             self._update_history_navigation_buttons()
+
+
+
+    @Slot()
+    def _perform_deferred_history_navigation(self):
+        """履歴移動の連打が止まった後に実行される実際のロード処理"""
+        if not self.current_project_path or self._project_loading_in_progress: return
+        
+        # 範囲チェック
+        if 0 <= self.current_history_index < len(self.edit_history):
+            char, is_vrt2, is_pua = self.edit_history[self.current_history_index]
+            
+            # 履歴ナビゲーション中フラグを立てて、このロードが履歴に追加されないようにする
+            self._is_navigating_history = True
+            try:
+                self.load_glyph_for_editing(char, is_vrt2_edit_mode=is_vrt2, is_pua_edit_mode=is_pua)
+            finally:
+                self._is_navigating_history = False
+            
+            # フォーカスを戻す
             if self.drawing_editor_widget.canvas.current_glyph_character:
                 self.drawing_editor_widget.canvas.setFocus()
-
 
     def _add_to_edit_history(self, character: str, is_vrt2: bool, is_pua: bool):
         if self._is_navigating_history: 
@@ -5325,6 +5607,11 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.canvas.setFocus()
 
 
+
+
+
+# --- MainWindow._trigger_kanji_viewer_update_for_current_glyph を置換 ---
+
     def _trigger_kanji_viewer_update_for_current_glyph(self, current_char: str): 
         if self._project_loading_in_progress: return 
         if not self.kanji_viewer_display_label or not self.kanji_viewer_related_tabs or not self.kanji_viewer_font_combo: return 
@@ -5358,19 +5645,46 @@ class MainWindow(QMainWindow):
                     no_data_label = QLabel("関連漢字データが\n読み込まれていません。"); no_data_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                     self.kanji_viewer_related_tabs.addTab(no_data_label, "情報")
             return
+
+        # フォントサイズ等の計算
+        tab_bar_instance = self.kanji_viewer_related_tabs.tabBar()
+        tab_bar_width = tab_bar_instance.tab_fixed_width if hasattr(tab_bar_instance, 'tab_fixed_width') else 60
+        content_area_width = self.kanji_viewer_related_tabs.width() - tab_bar_width - 20 
+        if content_area_width <= 0: content_area_width = 250
+        ideal_item_width_for_3_cols = content_area_width / 3 - 10 
+        font_px_size_for_related = max(1, int(ideal_item_width_for_3_cols * 0.7))
+        font_px_size_for_related = min(font_px_size_for_related, 50); font_px_size_for_related = max(font_px_size_for_related, 16)
+
+        # キャッシュヒットチェック (キャッシュは結果辞書しか持っていないため、画像データは別途必要だが
+        # 高速移動時はキャッシュより「最新の描画」が優先されるため、一旦キャッシュ処理はシンプルに)
+        if current_char in self._related_kanji_search_cache:
+            # キャッシュがあっても画像データがない場合は再取得させる手もあるが、
+            # とりあえず検索結果（辞書）があればそれを使い、画像は後でロード... 
+            # としたいところだが、今回は「ワーカーで一括ロード」に変えるため、
+            # WRITTENモードの場合はキャッシュを使わずワーカーに投げ直すほうが
+            # 「メインスレッドでのDBアクセス」を確実に防げるため、安全策をとる。
+            # フォント表示モードならキャッシュを使ってOK。
+            if self.kv_display_mode != MainWindow.KV_MODE_WRITTEN_GLYPHS:
+                cached_result = self._related_kanji_search_cache[current_char]
+                QTimer.singleShot(0, lambda: self._handle_kv_related_kanji_result(
+                    -1, cached_result, font_family_for_main_display, font_px_size_for_related, current_char, {}
+                ))
+                return
+
         with QMutexLocker(self._worker_management_mutex):
             self.current_related_kanji_process_id += 1; process_id = self.current_related_kanji_process_id
             if self.related_kanji_worker and self.related_kanji_worker.isRunning(): self.related_kanji_worker.cancel() 
-            tab_bar_instance = self.kanji_viewer_related_tabs.tabBar()
-            tab_bar_width = tab_bar_instance.tab_fixed_width if hasattr(tab_bar_instance, 'tab_fixed_width') else 60
-            content_area_width = self.kanji_viewer_related_tabs.width() - tab_bar_width - 20 
-            if content_area_width <= 0: content_area_width = self.kanji_viewer_panel_widget.width() - tab_bar_width - 30 if self.kanji_viewer_panel_widget else 250 - tab_bar_width - 30
-            if content_area_width <= 0: content_area_width = 250
-            ideal_item_width_for_3_cols = content_area_width / 3 - 10 
-            font_px_size_for_related = max(1, int(ideal_item_width_for_3_cols * 0.7)) 
-            font_px_size_for_related = min(font_px_size_for_related, 50); font_px_size_for_related = max(font_px_size_for_related, 16) 
+             
             effective_font_family_for_worker = font_family_for_main_display 
-            new_worker = RelatedKanjiWorker(process_id, current_char, self.kanji_radicals_data, self.radical_to_kanji_data, effective_font_family_for_worker, font_px_size_for_related, self)
+            
+            # 変更: db_path と kv_display_mode を渡す
+            new_worker = RelatedKanjiWorker(
+                process_id, current_char, 
+                self.kanji_radicals_data, self.radical_to_kanji_data, 
+                effective_font_family_for_worker, font_px_size_for_related, 
+                self.current_project_path, self.kv_display_mode, # <--- 追加引数
+                self
+            )
             new_worker.result_ready.connect(self._handle_kv_related_kanji_result)
             new_worker.error_occurred.connect(self._handle_kv_worker_error)
             new_worker.finished.connect(self._on_kv_worker_finished); new_worker.finished.connect(new_worker.deleteLater)
@@ -5378,13 +5692,29 @@ class MainWindow(QMainWindow):
 
 
 
-    @Slot(int, dict, str, int)
-    def _handle_kv_related_kanji_result(self, process_id: int, results_dict: dict, font_family_from_worker: str, font_px_size: int):
-        with QMutexLocker(self._worker_management_mutex):
-            if process_id != self.current_related_kanji_process_id:
-                return
+
+
+
+
+    @Slot(int, dict, str, int, str)
+    def _handle_kv_related_kanji_result(self, process_id: int, results_dict: dict, font_family_from_worker: str, font_px_size: int, target_char: str):
+        # process_idチェック
+        if process_id != -1:
+            with QMutexLocker(self._worker_management_mutex):
+                if process_id != self.current_related_kanji_process_id:
+                    return
+
+        # Stale Check
+        current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
+        if current_canvas_char != target_char:
+            return
+
         if not self.kanji_viewer_related_tabs:
             return
+
+        # 結果キャッシュ保存
+        if target_char and process_id != -1: 
+            self._related_kanji_search_cache[target_char] = results_dict
 
         current_tab_text_before_clear = ""
         current_tab_idx = self.kanji_viewer_related_tabs.currentIndex()
@@ -5392,213 +5722,180 @@ class MainWindow(QMainWindow):
             current_tab_text_before_clear = self.kanji_viewer_related_tabs.tabText(current_tab_idx)
         
         self.kanji_viewer_related_tabs.clear()
-        self.temp_written_kv_pixmaps.clear() 
-
-        char_for_msg_display = self.drawing_editor_widget.canvas.current_glyph_character
-        if not char_for_msg_display: 
-            if self.related_kanji_worker and self.related_kanji_worker.input_char:
-                char_for_msg_display = self.related_kanji_worker.input_char
-            else:
-                char_for_msg_display = "選択文字"
-
-        effective_results_dict = results_dict
         
-        if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
-            if not self.current_project_path: 
-                no_project_label = QLabel("プロジェクトがロードされていません。")
-                no_project_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.kanji_viewer_related_tabs.addTab(no_project_label, "エラー")
-                return
+        # ※ ここでキャッシュをクリアしない（永続化するため）
+        # self.temp_written_kv_pixmaps.clear() <--- 削除
 
-            filtered_dict = {}
-            for radical, kanji_list in results_dict.items():
-                written_kanji_in_list = []
-                for k_char in kanji_list:
-                    is_written_as_std = False
-                    is_written_as_vrt2 = False
-                    pixmap_to_store: Optional[QPixmap] = None
+        char_for_msg_display = target_char
+        effective_results_dict = {} # 構造変更: {radical: [(char, is_vrt2), ...]}
 
-                    if self.glyph_grid_widget.std_glyph_model.is_glyph_written(k_char):
-                        is_written_as_std = True
-                        if k_char in self.glyph_grid_widget.std_glyph_model._pixmap_cache:
-                            pixmap_to_store = self.glyph_grid_widget.std_glyph_model._pixmap_cache[k_char]
-                        else: 
-                            pixmap_to_store = self.db_manager.load_glyph_image(k_char, is_vrt2=False)
-                    
-                    elif k_char in self.non_rotated_vrt2_chars and \
-                         self.glyph_grid_widget.vrt2_glyph_model.is_glyph_written(k_char):
-                        is_written_as_vrt2 = True
-                        if k_char in self.glyph_grid_widget.vrt2_glyph_model._pixmap_cache:
-                            pixmap_to_store = self.glyph_grid_widget.vrt2_glyph_model._pixmap_cache[k_char]
-                        else: 
-                            pixmap_to_store = self.db_manager.load_glyph_image(k_char, is_vrt2=True)
-                    
-                    if is_written_as_std or is_written_as_vrt2:
-                        written_kanji_in_list.append(k_char)
-                        if pixmap_to_store and k_char not in self.temp_written_kv_pixmaps:
-                             self.temp_written_kv_pixmaps[k_char] = (pixmap_to_store.copy(), is_written_as_vrt2)
-                
-                if written_kanji_in_list:
-                    filtered_dict[radical] = sorted(list(set(written_kanji_in_list))) 
+        # --- リスト構築処理 ---
+        # 画像ロードは行わず、モデルが必要とする「文字と種類のリスト」だけを作る
+        
+        for radical, kanji_list in results_dict.items():
+            processed_list = [] # List of (char, is_vrt2)
             
-            effective_results_dict = filtered_dict
-            if not effective_results_dict: 
-                 msg_text = f"「{char_for_msg_display}」に関連する書き込み済みグリフは\n見つかりませんでした。" 
-                 no_results_label = QLabel(msg_text)
-                 no_results_label.setAlignment(Qt.AlignmentFlag.AlignCenter); no_results_label.setWordWrap(True)
-                 container_widget = QWidget(); layout = QVBoxLayout(container_widget)
-                 layout.addWidget(no_results_label); layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                 self.kanji_viewer_related_tabs.addTab(container_widget, "") 
-                 return
+            if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
+                if not self.current_project_path: continue
+                
+                # メモリ上の情報だけでフィルタリング (高速)
+                for k_char in kanji_list:
+                    is_written_std = self.glyph_grid_widget.std_glyph_model.is_glyph_written(k_char)
+                    is_written_vrt = (k_char in self.non_rotated_vrt2_chars and 
+                                      self.glyph_grid_widget.vrt2_glyph_model.is_glyph_written(k_char))
+                    
+                    if is_written_std:
+                        processed_list.append((k_char, False))
+                    elif is_written_vrt:
+                        processed_list.append((k_char, True))
+            else:
+                # フォント表示モードなら全て追加
+                for k_char in kanji_list:
+                    processed_list.append((k_char, False)) # is_vrt2は一旦False
 
+            if processed_list:
+                effective_results_dict[radical] = processed_list
+
+        # --- 結果なしの場合の表示 ---
         if not effective_results_dict:
-            msg_text = f"「{char_for_msg_display}」の構成部首データがないか、\n関連する漢字が見つかりませんでした。"
-            if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS: 
-                 msg_text = f"「{char_for_msg_display}」に関連する書き込み済みグリフは\n見つかりませんでした。"
-            elif self.kanji_radicals_data and char_for_msg_display in self.kanji_radicals_data and \
-                 not self.kanji_radicals_data.get(char_for_msg_display): 
-                msg_text = f"「{char_for_msg_display}」には構成部首が登録されていません。"
-            elif self.kanji_radicals_data and char_for_msg_display not in self.kanji_radicals_data:
-                 msg_text = f"「{char_for_msg_display}」のデータがありません。"
+            msg_text = ""
+            if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
+                 msg_text = f"「{char_for_msg_display}」に関連する書き込み済みグリフは\n見つかりませんでした。" 
+            else:
+                 msg_text = f"関連する漢字が見つかりませんでした。"
+                 
             no_results_label = QLabel(msg_text)
             no_results_label.setAlignment(Qt.AlignmentFlag.AlignCenter); no_results_label.setWordWrap(True)
             container_widget = QWidget(); layout = QVBoxLayout(container_widget)
             layout.addWidget(no_results_label); layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.kanji_viewer_related_tabs.addTab(container_widget, "")
+            self.kanji_viewer_related_tabs.addTab(container_widget, "") 
             return
 
-        tab_bar_instance = self.kanji_viewer_related_tabs.tabBar()
-        tab_bar_width = tab_bar_instance.tab_fixed_width if hasattr(tab_bar_instance, 'tab_fixed_width') else 60
-        content_area_width = self.kanji_viewer_related_tabs.width() - tab_bar_width - \
-                             self.kanji_viewer_related_tabs.contentsMargins().left() - \
-                             self.kanji_viewer_related_tabs.contentsMargins().right() - 10 
-        if content_area_width <= 0: content_area_width = self.kanji_viewer_panel_widget.width() - tab_bar_width - 30 if self.kanji_viewer_panel_widget else 250 - tab_bar_width -30
-        if content_area_width <= 0: content_area_width = 250
+        # --- QListViewの構築 ---
         item_side_length = font_px_size + 12 
         item_side_length = max(item_side_length, 36); item_side_length = min(item_side_length, 80) 
-        preview_display_size = QSize(item_side_length - 4, item_side_length - 4) 
-        MAX_COLS = max(1, content_area_width // (item_side_length + 5)) 
-        any_tabs_added = False; new_selected_index_to_restore = -1
-        
-        related_kanji_font: QFont 
-        if self.kv_display_mode == MainWindow.KV_MODE_FONT_DISPLAY:
-            related_kanji_font = QFont(font_family_from_worker) 
-            related_kanji_font.setPixelSize(font_px_size)
-
-        # ダークモード判定
         bg_lightness = self.palette().color(QPalette.Window).lightness()
         is_dark_mode = bg_lightness < 128
 
-        # ソートと分類のためのヘルパー関数
-        def get_char_sort_key(c):
-            # 優先順位: 1.プロジェクト内 (0) か プロジェクト外 (1) か
-            #          2. 文字コード (ord(c))
-            in_project = c in self.project_glyph_chars_cache
-            return (0 if in_project else 1, ord(c))
-
-        def get_char_display_style(c):
-            # 状態に応じたスタイルシート（色）を返す
-            in_project = c in self.project_glyph_chars_cache
-            
-            if not in_project:
-                # プロジェクトに存在しない (登録外)
-                color = "#4d4d4d" if is_dark_mode else "#C0C0C0"
-                return f"color: {color};"
-            
-            # プロジェクトに存在する -> 書き込み済みか確認
-            is_written = self.glyph_grid_widget.std_glyph_model.is_glyph_written(c) or \
-                         (c in self.non_rotated_vrt2_chars and self.glyph_grid_widget.vrt2_glyph_model.is_glyph_written(c))
-            
-            if is_written:
-                # 通常表示 (書き込み済み)
-                color = "#ffffff" if is_dark_mode else "black"
-                return f"color: {color};"
-            else:
-                # 少しグレーアウト (未書き込み)
-                color = "#9c9c9c" if is_dark_mode else "#707070"
-                return f"color: {color};"
+        # ソートキー: プロジェクト内かどうか > 文字コード
+        def get_sort_key(item):
+            char, _ = item
+            in_project = char in self.project_glyph_chars_cache
+            return (0 if in_project else 1, ord(char))
 
         sorted_radicals = sorted(effective_results_dict.keys())
+        new_selected_index_to_restore = -1
+
         for radical in sorted_radicals:
-            kanji_list = effective_results_dict[radical]
-            if not kanji_list: continue
+            kanji_list_tuples = effective_results_dict[radical]
+            if not kanji_list_tuples: continue
 
-            # ソート適用
-            kanji_list.sort(key=get_char_sort_key)
+            # ソート
+            kanji_list_tuples.sort(key=get_sort_key)
 
-            any_tabs_added = True; tab_content_widget = QWidget()
-            tab_content_widget.setStyleSheet(self.related_kanji_label_style) 
-            tab_layout = QGridLayout(tab_content_widget)
-            tab_layout.setSpacing(5); tab_layout.setContentsMargins(5, 5, 5, 5)
-            row, col = 0, 0
-            for kanji_char_to_display in kanji_list:
-                
-                is_vrt2_source_for_label = False 
-                glyph_pixmap_for_label: Optional[QPixmap] = None
-
-                if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
-                    glyph_pixmap_tuple = self.temp_written_kv_pixmaps.get(kanji_char_to_display)
-                    if glyph_pixmap_tuple:
-                        glyph_pixmap_for_label, is_vrt2_source_for_label = glyph_pixmap_tuple
-                
-                # ClickableKanjiLabelを使用
-                kanji_label = ClickableKanjiLabel(kanji_char_to_display, is_vrt2_source_for_label)
-                kanji_label.clicked_with_info.connect(self._on_kv_related_glyph_clicked)
-
-                kanji_label.setFixedSize(item_side_length, item_side_length)
-                kanji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
-                    if glyph_pixmap_for_label and not glyph_pixmap_for_label.isNull():
-                        scaled_pixmap = glyph_pixmap_for_label.scaled(preview_display_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        kanji_label.setPixmap(scaled_pixmap)
-                    else: 
-                        kanji_label.setText(kanji_char_to_display) 
-                        font_for_fallback = QFont(self.font().family()) 
-                        font_for_fallback.setPixelSize(max(10, int(item_side_length * 0.6)))
-                        kanji_label.setFont(font_for_fallback)
-                else: 
-                    # 外部フォント表示モード (KV_MODE_FONT_DISPLAY)
-                    self._kv_set_label_font_and_text(kanji_label, kanji_char_to_display, font_family_from_worker, kanji_label.rect(), 0.9)
-                    
-                    # 状態に応じた色を適用
-                    style_sheet = get_char_display_style(kanji_char_to_display)
-                    kanji_label.setStyleSheet(f"border: none; background: transparent; {style_sheet}")
-                
-                tab_layout.addWidget(kanji_label, row, col)
-                col += 1
-                if col >= MAX_COLS: col = 0; row += 1
+            list_view = QListView()
+            list_view.setViewMode(QListView.IconMode)
+            list_view.setResizeMode(QListView.Adjust)
+            list_view.setUniformItemSizes(True)
+            list_view.setSpacing(2)
+            list_view.setWrapping(True)
+            list_view.setFrameShape(QFrame.NoFrame)
             
-            if col > 0 and col < MAX_COLS :
-                for c_fill in range(col, MAX_COLS):
-                    spacer_item = QSpacerItem(item_side_length, item_side_length, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-                    tab_layout.addItem(spacer_item, row, c_fill)
-            tab_layout.setRowStretch(row + 1, 1); tab_layout.setColumnStretch(MAX_COLS, 1) 
-            scroll_area = QScrollArea(); scroll_area.setWidgetResizable(True); scroll_area.setWidget(tab_content_widget)
-            scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded); scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            # モデル作成
+            # 画像キャッシュへの参照と、ロード要求用メソッドを渡す
+            model = KanjiListModel(
+                kanji_list=kanji_list_tuples,
+                project_chars=self.project_glyph_chars_cache,
+                image_cache=self._kv_image_cache,       # キャッシュ参照
+                request_image_callback=self.request_kv_image_load, # コールバック
+                font_family=font_family_from_worker,
+                is_written_mode=(self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS),
+                parent=list_view
+            )
             
-            def refocus_editor():
-                if self.drawing_editor_widget.canvas.current_glyph_character:
-                    self.drawing_editor_widget.canvas.setFocus()
-
-            scroll_area.verticalScrollBar().actionTriggered.connect(refocus_editor)
-            scroll_area.horizontalScrollBar().actionTriggered.connect(refocus_editor)
-
-            tab_idx = self.kanji_viewer_related_tabs.addTab(scroll_area, radical)
-            if radical == current_tab_text_before_clear: new_selected_index_to_restore = tab_idx
-
-        if not any_tabs_added and effective_results_dict:
-            no_results_label = QLabel(f"「{char_for_msg_display}」の各構成部首を共有する\n他の漢字は見つかりませんでした。")
-            if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
-                 no_results_label.setText(f"「{char_for_msg_display}」の各構成部首を共有する\n書き込み済みグリフは見つかりませんでした。")
-            no_results_label.setAlignment(Qt.AlignmentFlag.AlignCenter); no_results_label.setWordWrap(True)
-            container_widget = QWidget(); layout = QVBoxLayout(container_widget); layout.addWidget(no_results_label); layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.kanji_viewer_related_tabs.addTab(container_widget, "")
+            delegate = KanjiListDelegate(
+                item_size=item_side_length,
+                font_size=font_px_size,
+                is_dark_mode=is_dark_mode,
+                parent=list_view
+            )
             
+            list_view.setModel(model)
+            list_view.setItemDelegate(delegate)
+            list_view.clicked.connect(self._on_kv_related_glyph_clicked_listview)
+
+            tab_idx = self.kanji_viewer_related_tabs.addTab(list_view, radical)
+            if radical == current_tab_text_before_clear: 
+                new_selected_index_to_restore = tab_idx
+
         if new_selected_index_to_restore != -1: self.kanji_viewer_related_tabs.setCurrentIndex(new_selected_index_to_restore)
         elif self.kanji_viewer_related_tabs.count() > 0: self.kanji_viewer_related_tabs.setCurrentIndex(0)
+
+
+
+
+
+
+
+
+    def request_kv_image_load(self, char: str, is_vrt2: bool):
+        """Kanji Viewerから呼ばれる画像ロード要求"""
+        if not self.current_project_path: return
         
-        self.temp_written_kv_pixmaps.clear()
+        # 既にロード中またはロード済みなら何もしない
+        # (ロード済みの場合はキャッシュにあるはずだが、念のため)
+        if char in self._kv_requested_images or char in self._kv_image_cache:
+            return
+
+        self._kv_requested_images.add(char)
+        
+        # 非同期ワーカを起動
+        worker = KVImageLoadWorker(self.current_project_path, char, is_vrt2)
+        worker.signals.image_loaded.connect(self._on_kv_image_loaded)
+        self.thread_pool.start(worker)
+
+    @Slot(str, QPixmap, bool)
+    def _on_kv_image_loaded(self, char: str, pixmap: QPixmap, is_vrt2: bool):
+        """画像ロード完了時のコールバック"""
+        
+        # リクエスト済みセットから削除（再リクエスト可能にするためだが、キャッシュにあれば再リクエストはされない）
+        if char in self._kv_requested_images:
+            self._kv_requested_images.remove(char)
+        
+        # キャッシュに保存 (失敗時はnull pixmapが入る)
+        self._kv_image_cache[char] = pixmap
+
+        # タブ内の全てのリストビューのモデルに対して更新を通知
+        # (どのタブにその文字が含まれているか探索するのはコストがかかるため、
+        #  表示されているタブのモデルのみ、あるいは全モデルに通知を送る)
+        if self.kanji_viewer_related_tabs:
+            count = self.kanji_viewer_related_tabs.count()
+            for i in range(count):
+                list_view = self.kanji_viewer_related_tabs.widget(i)
+                if isinstance(list_view, QListView):
+                    model = list_view.model()
+                    if isinstance(model, KanjiListModel):
+                        # その文字が含まれていれば更新をかける
+                        model.refresh_row(char)
+
+
+
+
+
+    @Slot(QModelIndex)
+    def _on_kv_related_glyph_clicked_listview(self, index: QModelIndex):
+        if not index.isValid(): return
+        
+        # モデルからデータを取得
+        data = index.data(Qt.UserRole)
+        if not data: return
+        
+        char_key = data["char"]
+        is_vrt2_glyph = data["is_vrt2"]
+        
+        # 既存のロジックを再利用
+        self._on_kv_related_glyph_clicked(char_key, is_vrt2_glyph)
+
 
 
 
@@ -6077,43 +6374,35 @@ class MainWindow(QMainWindow):
     def load_glyph_for_editing(self, character: str, is_vrt2_edit_mode: bool = False, is_pua_edit_mode: bool = False):
         if self._project_loading_in_progress: return
 
-        # グリフが切り替わるたびに共有データを呼び出す
+        # 1. 世代IDを更新
+        self._current_load_generation += 1
+        current_gen = self._current_load_generation
+
+        # 2. 共有ステートの更新 (API用)
         self._update_api_shared_state(character, is_vrt2_edit_mode, is_pua_edit_mode)
 
+        # 3. GUI設定のミラーモード解除
         if self.drawing_editor_widget.mirror_checkbox.isChecked():
-            # チェックボックスのシグナルが発動しないようにブロックしながら状態を変更
             self.drawing_editor_widget.mirror_checkbox.blockSignals(True)
             self.drawing_editor_widget.mirror_checkbox.setChecked(False)
             self.drawing_editor_widget.mirror_checkbox.blockSignals(False)
-            
-            # Canvasの状態を更新
             self.drawing_editor_widget.canvas.set_mirror_mode(False)
-            
-            # 設定を非同期で保存
             self.save_gui_setting_async(SETTING_MIRROR_MODE, "False")
 
-        current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
-        current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value() 
-        
+        # 4. 編集履歴への追加
         if character and not self._is_navigating_history and not self._batch_operation_in_progress:
             self._add_to_edit_history(character, is_vrt2_edit_mode, is_pua_edit_mode)
         
+        # 5. 直前の編集内容の保存
+        current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
+        current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value()
         if current_canvas_char and not self._batch_operation_in_progress: 
             if current_canvas_char != character or \
                (current_canvas_char == character and is_vrt2_edit_mode != self.drawing_editor_widget.canvas.editing_vrt2_glyph):
                  if not self.drawing_editor_widget.canvas.editing_vrt2_glyph:
-                     # ここは既に_save_current_advance_width_sync内でミューテックスが保護されている
                      self._save_current_advance_width_sync(current_canvas_char, current_canvas_adv_width)
-        
-        if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
-            with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = character 
-            self._kv_deferred_update_timer.start(self._kv_update_delay_ms) 
-        elif self.kanji_viewer_display_label : 
-            self.kanji_viewer_display_label.setText(character if character else ""); self.kanji_viewer_display_label.setFont(QFont()) 
-            if self.kanji_viewer_related_tabs: self.kanji_viewer_related_tabs.clear()
-            if self._kv_deferred_update_timer.isActive(): self._kv_deferred_update_timer.stop()
-            with QMutexLocker(self._worker_management_mutex): self._kv_char_to_update = None
-        
+
+        # 6. 空文字(選択解除)の場合
         if not self.current_project_path or not character: 
             adv_width = DEFAULT_ADVANCE_WIDTH
             self.drawing_editor_widget.canvas.load_glyph("", None, None, adv_width, is_vrt2=False, is_pua=False)
@@ -6124,53 +6413,90 @@ class MainWindow(QMainWindow):
             self.drawing_editor_widget.update_vrt2_controls(False, False)
             if not self._is_navigating_history:
                 self._update_history_navigation_buttons()
-            self.drawing_editor_widget.canvas.setFocus() 
             return
-        
-        # 同期的なDB読み込みをミューテックスで保護する
-        with QMutexLocker(self.db_mutex):
-            adv_width = self.db_manager.load_glyph_advance_width(character, is_pua=is_pua_edit_mode)
-            pixmap = self.db_manager.load_glyph_image(character, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
-            reference_pixmap = None
-            if is_pua_edit_mode:
-                reference_pixmap = self.db_manager.load_reference_image(character, is_pua=True)
-            elif is_vrt2_edit_mode:
-                reference_pixmap = self.db_manager.load_vrt2_glyph_reference_image(character)
-            else:
-                reference_pixmap = self.db_manager.load_reference_image(character, is_pua=False)
-        
-        self.drawing_editor_widget.canvas.load_glyph(character, pixmap, reference_pixmap, adv_width, is_vrt2=is_vrt2_edit_mode, is_pua=is_pua_edit_mode)
-        self.drawing_editor_widget.set_enabled_controls(True)
-        
-        self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode, is_pua_source=is_pua_edit_mode) 
-        
+
+        # 7. 即時UIフィードバック
         self.drawing_editor_widget.update_unicode_display(character)
-        self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
+        self.glyph_grid_widget.set_active_glyph(character, is_vrt2_source=is_vrt2_edit_mode, is_pua_source=is_pua_edit_mode)
         
         is_char_in_nr_vrt2_set = character in self.non_rotated_vrt2_chars
         self.drawing_editor_widget.update_vrt2_controls(is_char_in_nr_vrt2_set, is_editing_vrt2=is_vrt2_edit_mode)
+        
+        if not self._is_navigating_history:
+             self._update_history_navigation_buttons()
+
+        # 8. 非同期ローダー起動
+        loader = AsyncGlyphLoader(
+            self.current_project_path, 
+            character, 
+            is_vrt2_edit_mode, 
+            is_pua_edit_mode, 
+            current_gen
+        )
+        loader.signals.result_ready.connect(self._on_glyph_loaded_async)
+        self.thread_pool.start(loader)
+
+        # 9. Kanji Viewer の更新トリガー (ほぼ即時実行に変更)
+        if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
+            with QMutexLocker(self._worker_management_mutex): 
+                self._kv_char_to_update = character
+            
+            # 既存のタイマーを停止して再起動（デバウンス効果）
+            # ただし間隔は 10ms なので体感は即時
+            if self._kv_deferred_update_timer.isActive():
+                self._kv_deferred_update_timer.stop()
+            self._kv_deferred_update_timer.start(self._kv_update_delay_ms)
+            
+        elif self.kanji_viewer_display_label: 
+            self.kanji_viewer_display_label.setText(character if character else "")
+            self.kanji_viewer_display_label.setFont(QFont()) 
+            if self.kanji_viewer_related_tabs: 
+                self.kanji_viewer_related_tabs.clear()
+            if self._kv_deferred_update_timer.isActive(): 
+                self._kv_deferred_update_timer.stop()
+            with QMutexLocker(self._worker_management_mutex): 
+                self._kv_char_to_update = None
+
+
+
+
+    @Slot(str, object, object, int, bool, bool, int)
+    def _on_glyph_loaded_async(self, character, pixmap, ref_pixmap, adv_width, is_vrt2, is_pua, gen_id):
+        # 世代チェック: 現在のIDと一致しない（＝古い）場合は無視する
+        if gen_id != self._current_load_generation:
+            return
+
+        # ここまで来たら、このデータは「最新」なのでキャンバスに適用する
+        self.drawing_editor_widget.canvas.load_glyph(
+            character, pixmap, ref_pixmap, adv_width, is_vrt2=is_vrt2, is_pua=is_pua
+        )
+        
+        # コントロールの有効化
+        self.drawing_editor_widget.set_enabled_controls(True)
+        self.drawing_editor_widget._update_adv_width_ui_no_signal(adv_width)
+
+        # 追加のボタン状態更新
+        is_char_in_nr_vrt2_set = character in self.non_rotated_vrt2_chars
         editor_is_generally_enabled = self.drawing_editor_widget.pen_button.isEnabled()
+        
         self.drawing_editor_widget.vrt2_toggle_button.setEnabled(editor_is_generally_enabled and is_char_in_nr_vrt2_set)
         self.drawing_editor_widget.transfer_to_vrt2_button.setEnabled(editor_is_generally_enabled and is_char_in_nr_vrt2_set)
-        self.drawing_editor_widget.delete_ref_button.setEnabled(editor_is_generally_enabled and reference_pixmap is not None)
+        self.drawing_editor_widget.delete_ref_button.setEnabled(editor_is_generally_enabled and ref_pixmap is not None)
         self.drawing_editor_widget.load_ref_button.setEnabled(editor_is_generally_enabled)
+        
         if hasattr(self.drawing_editor_widget, 'glyph_to_ref_reset_button'):
              current_glyph_has_content_on_canvas = self.drawing_editor_widget.canvas.image and not self.drawing_editor_widget.canvas.image.isNull() 
              self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(editor_is_generally_enabled and current_glyph_has_content_on_canvas)
         
-        self.delete_pua_glyph_action.setEnabled(is_pua_edit_mode)
+        self.delete_pua_glyph_action.setEnabled(is_pua)
 
+        # 最後に設定保存（非同期）
         if character and not self._project_loading_in_progress and not self._batch_operation_in_progress:
             self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH, character)
-            self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2_edit_mode))
+            self.save_gui_setting_async(SETTING_LAST_ACTIVE_GLYPH_IS_VRT2, str(is_vrt2))
 
-        if not self._is_navigating_history:
-             self._update_history_navigation_buttons()
-
+        # フォーカスセット
         self.drawing_editor_widget.canvas.setFocus()
-
-
-
 
     @Slot(str, QPixmap, bool, bool)
     def handle_glyph_modification_from_canvas(self, character: str, pixmap: QPixmap, is_vrt2: bool, is_pua: bool): 
