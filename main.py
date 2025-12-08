@@ -4821,7 +4821,9 @@ class KanjiListModel(QAbstractListModel):
                 self.dataChanged.emit(idx, idx, [Qt.UserRole])
                 break
 
-
+    def mark_as_written(self, char: str):
+        """指定された文字を書き込み済みとしてマークする"""
+        self._written_chars.add(char)
 
 
 
@@ -6540,6 +6542,9 @@ class MainWindow(QMainWindow):
             can_enable_button = self.drawing_editor_widget.pen_button.isEnabled() and has_content
             self.drawing_editor_widget.glyph_to_ref_reset_button.setEnabled(can_enable_button)
 
+
+
+
     @Slot(str, QPixmap, bool)
     def on_glyph_save_success(self, character: str, saved_pixmap: QPixmap, is_vrt2_or_pua: bool): 
         if self._project_loading_in_progress: return 
@@ -6554,6 +6559,24 @@ class MainWindow(QMainWindow):
             
             is_vrt2 = is_vrt2_or_pua and not is_pua
             self.glyph_grid_widget.update_glyph_preview(character, saved_pixmap, is_vrt2_source=is_vrt2, is_pua_source=is_pua)
+            
+            # 1. 画像キャッシュを最新の保存内容で上書きする
+            self._kv_image_cache[character] = saved_pixmap
+
+            # 2. 現在表示されている関連漢字タブ内のモデルに更新を通知する
+            if self.kanji_viewer_related_tabs:
+                count = self.kanji_viewer_related_tabs.count()
+                for i in range(count):
+                    list_view = self.kanji_viewer_related_tabs.widget(i)
+                    if isinstance(list_view, QListView):
+                        model = list_view.model()
+                        if isinstance(model, KanjiListModel):
+                            # 書き込み済みフラグを立てる（未書き込み→書き込み済みへの色変化対応）
+                            model.mark_as_written(character)
+                            # 該当するセルの再描画をトリガー（キャッシュから新しい画像を読み直させる）
+                            model.refresh_row(character)
+
+
 
     @Slot(str)
     def on_glyph_save_error(self, error_message: str): 
