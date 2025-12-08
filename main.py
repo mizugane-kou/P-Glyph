@@ -4750,13 +4750,14 @@ class ClickableKanjiLabel(QLabel):
 
 
 
-# --- KanjiListModel クラスを置換 ---
+
 
 class KanjiListModel(QAbstractListModel):
     """関連漢字リストを管理。画像はオンデマンドでリクエストする。"""
     def __init__(self, 
                  kanji_list: List[Tuple[str, bool]], # (char, is_vrt2) のリスト
                  project_chars: Set[str], 
+                 written_chars: Set[str],            # <--- 追加: 書き込み済み文字のセット
                  image_cache: Dict[str, QPixmap],    # MainWindowのキャッシュへの参照
                  request_image_callback,             # 画像ロード要求用の関数
                  font_family: str = "",
@@ -4765,6 +4766,7 @@ class KanjiListModel(QAbstractListModel):
         super().__init__(parent)
         self._kanji_list = kanji_list
         self._project_chars = project_chars
+        self._written_chars = written_chars          # <--- 保存
         self._image_cache = image_cache
         self._request_image_callback = request_image_callback
         self._font_family = font_family
@@ -4797,13 +4799,12 @@ class KanjiListModel(QAbstractListModel):
                 if char in self._image_cache:
                     pixmap = self._image_cache[char]
                 else:
-                    # キャッシュになければロードをリクエスト（非同期）
-                    # 既にリクエスト済みかはMainWindow側で制御してもらう
                     self._request_image_callback(char, is_vrt2)
             
             return {
                 "char": char,
                 "in_project": char in self._project_chars,
+                "is_written": char in self._written_chars, # <--- 追加: 書き込み済みフラグ
                 "pixmap": pixmap,
                 "is_vrt2": is_vrt2,
                 "font_family": self._font_family,
@@ -4819,7 +4820,6 @@ class KanjiListModel(QAbstractListModel):
                 idx = self.index(i)
                 self.dataChanged.emit(idx, idx, [Qt.UserRole])
                 break
-
 
 
 
@@ -4848,6 +4848,7 @@ class KanjiListDelegate(QStyledItemDelegate):
 
         char = data["char"]
         in_project = data["in_project"]
+        is_written = data["is_written"] # <--- 取得
         pixmap = data["pixmap"]
         is_written_mode = data["is_written_mode"]
         font_family = data["font_family"]
@@ -4864,15 +4865,23 @@ class KanjiListDelegate(QStyledItemDelegate):
         # コンテンツ領域
         content_rect = rect.adjusted(self.padding, self.padding, -self.padding, -self.padding)
         
-        # 描画色の決定
+        # 描画色の決定（ここを修正）
         text_color = option.palette.color(QPalette.Text)
-        if not in_project:
-            text_color = QColor("#9c9c9c") if self.is_dark_mode else QColor("#707070")
-        elif not pixmap and not is_written_mode:
-            # プロジェクトにあるが画像がない（フォント表示モード時）
-            # 通常色だが、少し区別してもよい
-            pass
         
+        if not in_project:
+            # プロジェクト未登録: 一番薄いグレー
+            text_color = QColor("#4b4b4b") if self.is_dark_mode else QColor("#CDCDCD")
+        elif not is_written:
+            # 登録済みだが未書き込み: 少し薄いグレー
+            text_color = QColor("#9c9c9c") if self.is_dark_mode else QColor("#595959")
+        else:
+            # 書き込み済み: 通常色（白または黒）
+            if self.is_dark_mode:
+                text_color = QColor("#ffffff")
+            else:
+                text_color = QColor("black")
+        
+        # 選択時は常に見やすい色（白など）
         if option.state & QStyle.State_Selected:
             text_color = option.palette.color(QPalette.HighlightedText)
 
@@ -5430,7 +5439,7 @@ class MainWindow(QMainWindow):
 
     def _init_ui_for_kanji_viewer_panel(self):
         self.kanji_viewer_panel_widget = QWidget()
-        self.kanji_viewer_panel_widget.setFixedWidth(350)
+        self.kanji_viewer_panel_widget.setFixedWidth(330)
         self.kanji_viewer_panel_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         panel_layout = QVBoxLayout(self.kanji_viewer_panel_widget); panel_layout.setContentsMargins(5,5,5,5)
         font_selection_layout = QHBoxLayout(); font_selection_layout.addWidget(QLabel("参照:"))
@@ -5689,6 +5698,8 @@ class MainWindow(QMainWindow):
 
 
 
+
+
     @Slot(int, dict, str, int, str)
     def _handle_kv_related_kanji_result(self, process_id: int, results_dict: dict, font_family_from_worker: str, font_px_size: int, target_char: str):
         # process_idチェック
@@ -5716,22 +5727,20 @@ class MainWindow(QMainWindow):
         
         self.kanji_viewer_related_tabs.clear()
         
-        # ※ ここでキャッシュをクリアしない（永続化するため）
-        # self.temp_written_kv_pixmaps.clear() <--- 削除
-
         char_for_msg_display = target_char
-        effective_results_dict = {} # 構造変更: {radical: [(char, is_vrt2), ...]}
+        effective_results_dict = {} 
 
-        # --- リスト構築処理 ---
-        # 画像ロードは行わず、モデルが必要とする「文字と種類のリスト」だけを作る
+        # 表示対象となる全ての文字のセットを作成（書き込み判定を一括で行うため）
+        all_target_chars = set()
         
+        # リスト構築処理
         for radical, kanji_list in results_dict.items():
             processed_list = [] # List of (char, is_vrt2)
             
+            # 書き込み済みモードの場合はフィルタリング
             if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
                 if not self.current_project_path: continue
                 
-                # メモリ上の情報だけでフィルタリング (高速)
                 for k_char in kanji_list:
                     is_written_std = self.glyph_grid_widget.std_glyph_model.is_glyph_written(k_char)
                     is_written_vrt = (k_char in self.non_rotated_vrt2_chars and 
@@ -5739,17 +5748,34 @@ class MainWindow(QMainWindow):
                     
                     if is_written_std:
                         processed_list.append((k_char, False))
+                        all_target_chars.add(k_char)
                     elif is_written_vrt:
                         processed_list.append((k_char, True))
+                        all_target_chars.add(k_char)
             else:
                 # フォント表示モードなら全て追加
                 for k_char in kanji_list:
-                    processed_list.append((k_char, False)) # is_vrt2は一旦False
+                    processed_list.append((k_char, False))
+                    all_target_chars.add(k_char)
 
             if processed_list:
                 effective_results_dict[radical] = processed_list
 
-        # --- 結果なしの場合の表示 ---
+        # 書き込み済み文字セットの作成（色分け用）
+        written_chars_set = set()
+        if self.current_project_path:
+            for char in all_target_chars:
+                is_written = False
+                if self.glyph_grid_widget.std_glyph_model.is_glyph_written(char):
+                    is_written = True
+                elif char in self.non_rotated_vrt2_chars and \
+                     self.glyph_grid_widget.vrt2_glyph_model.is_glyph_written(char):
+                    is_written = True
+                
+                if is_written:
+                    written_chars_set.add(char)
+
+        # 結果なしの場合の表示
         if not effective_results_dict:
             msg_text = ""
             if self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS:
@@ -5764,13 +5790,12 @@ class MainWindow(QMainWindow):
             self.kanji_viewer_related_tabs.addTab(container_widget, "") 
             return
 
-        # --- QListViewの構築 ---
+        # QListViewの構築
         item_side_length = font_px_size + 12 
         item_side_length = max(item_side_length, 36); item_side_length = min(item_side_length, 80) 
         bg_lightness = self.palette().color(QPalette.Window).lightness()
         is_dark_mode = bg_lightness < 128
 
-        # ソートキー: プロジェクト内かどうか > 文字コード
         def get_sort_key(item):
             char, _ = item
             in_project = char in self.project_glyph_chars_cache
@@ -5783,7 +5808,9 @@ class MainWindow(QMainWindow):
             kanji_list_tuples = effective_results_dict[radical]
             if not kanji_list_tuples: continue
 
-            # ソート
+            # 重いUI構築の直前にもう一度チェック
+            if self.drawing_editor_widget.canvas.current_glyph_character != target_char: return
+
             kanji_list_tuples.sort(key=get_sort_key)
 
             list_view = QListView()
@@ -5794,13 +5821,13 @@ class MainWindow(QMainWindow):
             list_view.setWrapping(True)
             list_view.setFrameShape(QFrame.NoFrame)
             
-            # モデル作成
-            # 画像キャッシュへの参照と、ロード要求用メソッドを渡す
+            # モデル作成 (written_chars_set を渡す)
             model = KanjiListModel(
                 kanji_list=kanji_list_tuples,
                 project_chars=self.project_glyph_chars_cache,
-                image_cache=self._kv_image_cache,       # キャッシュ参照
-                request_image_callback=self.request_kv_image_load, # コールバック
+                written_chars=written_chars_set,    # <--- 追加
+                image_cache=self._kv_image_cache,
+                request_image_callback=self.request_kv_image_load,
                 font_family=font_family_from_worker,
                 is_written_mode=(self.kv_display_mode == MainWindow.KV_MODE_WRITTEN_GLYPHS),
                 parent=list_view
@@ -5823,8 +5850,6 @@ class MainWindow(QMainWindow):
 
         if new_selected_index_to_restore != -1: self.kanji_viewer_related_tabs.setCurrentIndex(new_selected_index_to_restore)
         elif self.kanji_viewer_related_tabs.count() > 0: self.kanji_viewer_related_tabs.setCurrentIndex(0)
-
-
 
 
 
