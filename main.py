@@ -1990,6 +1990,9 @@ class DatabaseManager:
 
 
 
+
+
+
 class Canvas(QWidget):
     brush_width_changed = Signal(int)
     eraser_width_changed = Signal(int)
@@ -2030,6 +2033,39 @@ class Canvas(QWidget):
         self.last_stroke_end_point: Optional[QPointF] = None 
         self.straight_line_preview_active = False
 
+        # ---  保存遅延(Debounce)用タイマー ---
+        self._save_debounce_timer = QTimer(self)
+        self._save_debounce_timer.setSingleShot(True)
+        self._save_debounce_timer.setInterval(800) # 800ms 遅延させる
+        self._save_debounce_timer.timeout.connect(self._on_save_timer_timeout)
+
+    # ---  DB保存リクエストメソッド ---
+    def request_db_save(self):
+        """変更があったことを通知し、保存タイマーをリスタートする"""
+        if self.current_glyph_character:
+            self._save_debounce_timer.start()
+
+    # ---  保留中の保存を強制実行 ---
+    def force_save_pending_changes(self):
+        """グリフ切り替え時などに、タイマー待ちの保存を即時実行する"""
+        if self._save_debounce_timer.isActive():
+            self._save_debounce_timer.stop()
+            self._on_save_timer_timeout()
+
+    # ---  タイマー発火時の処理 ---
+    def _on_save_timer_timeout(self):
+        """実際にシグナルを発行してDB保存を行う"""
+        if self.current_glyph_character:
+            self.glyph_modified_signal.emit(
+                self.current_glyph_character,
+                self.image.copy(),
+                self.editing_vrt2_glyph,
+                self.editing_pua_glyph
+            )
+
+
+
+
     def _reset_straight_line_mode(self):
         self.straight_line_preview_active = False
         self.current_path = QPainterPath() 
@@ -2048,7 +2084,12 @@ class Canvas(QWidget):
             self.current_glyph_advance_width = width
             self.glyph_advance_width_changed.emit(width); self.update()
 
+
+
     def load_glyph(self, character: str, pixmap: Optional[QPixmap], reference_pixmap: Optional[QPixmap], advance_width: int, is_vrt2: bool = False, is_pua: bool = False):
+        # --- 追加: グリフ切り替え前に前の変更を確実に保存する ---
+        self.force_save_pending_changes()
+
         self._reset_straight_line_mode() 
         self.last_stroke_end_point = None 
         self.current_glyph_character = character
@@ -2082,7 +2123,9 @@ class Canvas(QWidget):
             self._reset_straight_line_mode()
             popped_state = self.undo_stack.pop(); self.redo_stack.append(popped_state)
             self.image = self.undo_stack[-1].copy(); self.update(); self._emit_undo_redo_state()
-            if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
+            if self.current_glyph_character: 
+                # --- 変更: 直接emitせずリクエストメソッドを呼ぶ ---
+                self.request_db_save()
 
     def redo(self):
         if self.redo_stack:
@@ -2090,7 +2133,9 @@ class Canvas(QWidget):
             self._reset_straight_line_mode()
             popped_state = self.redo_stack.pop(); self.undo_stack.append(popped_state)
             self.image = popped_state.copy(); self.update(); self._emit_undo_redo_state()
-            if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
+            if self.current_glyph_character: 
+                # --- 変更: 直接emitせずリクエストメソッドを呼ぶ ---
+                self.request_db_save()
 
     def set_brush_width(self, width: int):
         self.brush_width = max(1, width) 
@@ -2498,6 +2543,7 @@ class Canvas(QWidget):
                 self._rebuild_current_path_from_stroke_points(finalize=False)
             return
 
+
     def mouseReleaseEvent(self, event: QMouseEvent):
         if not self.current_glyph_character: return
         
@@ -2524,7 +2570,8 @@ class Canvas(QWidget):
                         image_painter.end()
                         self._save_state_to_undo_stack()
                         if self.current_glyph_character: 
-                            self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
+                            # ---  直接emitせずリクエストメソッドを呼ぶ ---
+                            self.request_db_save()
                         
                         if self.stroke_points:
                              self.last_stroke_end_point = self.stroke_points[-1]
@@ -2541,7 +2588,9 @@ class Canvas(QWidget):
                 if self.move_mode: self.setCursor(Qt.OpenHandCursor)
                 else: self.unsetCursor()
                 self._save_state_to_undo_stack()
-                if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
+                if self.current_glyph_character: 
+                    # ---  直接emitせずリクエストメソッドを呼ぶ ---
+                    self.request_db_save()
                 self.update()
             return
         
@@ -2598,7 +2647,9 @@ class Canvas(QWidget):
                 painter.drawImage(x_offset, y_offset, scaled_image); painter.end()
                 self.image = QPixmap.fromImage(final_image)
                 self._save_state_to_undo_stack()
-                if self.current_glyph_character: self.glyph_modified_signal.emit(self.current_glyph_character, self.image.copy(), self.editing_vrt2_glyph, self.editing_pua_glyph)
+                if self.current_glyph_character: 
+                    # ---  直接emitせずリクエストメソッドを呼ぶ ---
+                    self.request_db_save()
                 self.last_stroke_end_point = None 
                 self._reset_straight_line_mode()
                 self.update(); event.acceptProposedAction()
@@ -2846,6 +2897,8 @@ class DrawingEditorWidget(QWidget):
 
 
 
+
+
     def paste_from_clipboard(self):
         if not self.canvas.current_glyph_character:
             QMessageBox.warning(self, "グリフ未選択", "グリフが選択されていません。画像をペーストできません。")
@@ -2868,16 +2921,11 @@ class DrawingEditorWidget(QWidget):
                 # クリップボードの画像が透過情報を持っているかチェック
                 has_transparency = qimage_from_clipboard.hasAlphaChannel()
 
-
                 # ペースト先の画像を準備
                 if has_transparency:
-                    # 透過画像の場合：現在のキャンバス画像をベースにする
-                    # QPixmapからQImageに変換してPainterで描画できるようにする
                     base_image = self.canvas.image.toImage()
-                    # 念のため、フォーマットを合わせておく
                     final_image = base_image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
                 else:
-                    # 不透明画像の場合：白紙の画像をベースにする
                     final_image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
                     final_image.fill(QColor(Qt.white))
 
@@ -2886,7 +2934,6 @@ class DrawingEditorWidget(QWidget):
                 
                 # Painterを使って画像を合成
                 painter = QPainter(final_image)
-                # デフォルトの合成モード（SourceOver）がアルファブレンドを行う
                 painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
                 
                 # 画像を中央に配置するためのオフセット計算
@@ -2901,12 +2948,9 @@ class DrawingEditorWidget(QWidget):
                 self.canvas.image = QPixmap.fromImage(final_image)
                 self.canvas._save_state_to_undo_stack() 
                 if self.canvas.current_glyph_character: 
-                    self.canvas.glyph_modified_signal.emit(
-                        self.canvas.current_glyph_character,
-                        self.canvas.image.copy(),
-                        self.canvas.editing_vrt2_glyph,
-                        self.canvas.editing_pua_glyph
-                    )
+                    # --- 変更: 直接emitせずリクエストメソッドを呼ぶ ---
+                    self.canvas.request_db_save()
+
                 self.canvas.update()
                 
                 status_message = "画像をレイヤーとしてペーストしました。" if has_transparency else "画像をペーストしました。"
@@ -2917,6 +2961,8 @@ class DrawingEditorWidget(QWidget):
         else:
             QMessageBox.information(self, "ペースト不可", "クリップボードに画像データがありません。")
         self.canvas.setFocus()
+
+
 
 
 
@@ -3220,6 +3266,7 @@ class DrawingEditorWidget(QWidget):
 
 
 
+
     def _execute_smoothing_process(self):
         """実際の平滑化処理とワーカ投入を行う"""
         main_window = self.window()
@@ -3234,7 +3281,6 @@ class DrawingEditorWidget(QWidget):
             return
         
         try:
-            # ... (ここから先の平滑化のコアロジックは変更なし) ...
             current_pixmap = self.canvas.get_current_image()
             cv_image = qpixmap_to_cv_np(current_pixmap)
             processor = ContourProcessor(cv_image)
@@ -3250,13 +3296,8 @@ class DrawingEditorWidget(QWidget):
             self.canvas._save_state_to_undo_stack()
             self.canvas.update()
 
-            # MainWindowの保存ハンドラに処理を移譲する
-            self.canvas.glyph_modified_signal.emit(
-                self.canvas.current_glyph_character,
-                self.canvas.image.copy(),
-                self.canvas.editing_vrt2_glyph,
-                self.canvas.editing_pua_glyph
-            )
+            # --- 直接emitせずリクエストメソッドを呼ぶ ---
+            self.canvas.request_db_save()
 
             if main_window.statusBar():
                 main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' を平滑化しました。", 3000)
@@ -3267,6 +3308,7 @@ class DrawingEditorWidget(QWidget):
             main_window.set_long_operation_state(False) # エラー時も必ずロックを解除
         finally:
             self.canvas.setFocus()
+
 
 
     def _handle_erode_button_clicked(self):
@@ -3299,22 +3341,11 @@ class DrawingEditorWidget(QWidget):
                 
             # 3. 輪郭収縮処理を実行
             try:
-                # グレースケールに変換
                 gray_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-                
-                # 白黒反転 (cv2.erodeは前景の白い領域を収縮させるため)
-                # 元画像が白背景(255)に黒文字(0)なので、反転して黒背景(0)に白文字(255)にする
                 inverted_image = cv2.bitwise_not(gray_image)
-
-                # 収縮処理に使用する3x3のカーネルを定義
                 kernel = np.ones((3, 3), np.uint8)
-
-                # 収縮処理を1回適用
                 eroded_image = cv2.erode(inverted_image, kernel, iterations=1)
-
-                # 再度反転して元の白黒に戻す
                 result_gray_image = cv2.bitwise_not(eroded_image)
-
             except Exception as e:
                 import traceback
                 QMessageBox.critical(self, "輪郭収縮処理エラー", f"輪郭収縮処理中にエラーが発生しました: {e}\n\n{traceback.format_exc()}")
@@ -3331,23 +3362,15 @@ class DrawingEditorWidget(QWidget):
             self.canvas._save_state_to_undo_stack()
             self.canvas.update()
 
-            # 6. データベース保存のためにシグナルを発行 (非同期保存完了後にUIが有効化される)
-            self.canvas.glyph_modified_signal.emit(
-                self.canvas.current_glyph_character,
-                self.canvas.image.copy(),
-                self.canvas.editing_vrt2_glyph,
-                self.canvas.editing_pua_glyph
-            )
+            # 6. データベース保存 --- 変更: 直接emitせずリクエストメソッドを呼ぶ ---
+            self.canvas.request_db_save()
             
             # 7. ステータスバーにメッセージを表示
             if main_window and hasattr(main_window, 'statusBar'):
                 main_window.statusBar().showMessage(f"グリフ '{self.canvas.current_glyph_character}' の輪郭を収縮しました。", 3000)
 
         finally:
-            # UIの有効化は非同期保存後に行われるため、ここではフォーカス設定のみ
             self.canvas.setFocus()
-
-
 
 
 
@@ -5157,6 +5180,7 @@ class MainWindow(QMainWindow):
 
 
     
+
     @Slot(QPixmap)
     def _handle_api_image_received(self, pixmap: QPixmap):
         """API経由で受信した画像をキャンバスに適用する"""
@@ -5178,14 +5202,16 @@ class MainWindow(QMainWindow):
 
         canvas.image = QPixmap.fromImage(final_image)
         canvas._save_state_to_undo_stack()
-        canvas.glyph_modified_signal.emit(
-            canvas.current_glyph_character, 
-            canvas.image.copy(), 
-            canvas.editing_vrt2_glyph,
-            canvas.editing_pua_glyph
-        )
+        
+        # --- 変更: 直接emitせずリクエストメソッドを呼ぶ ---
+        canvas.request_db_save()
+        
         canvas.update()
         self.statusBar().showMessage("API経由で画像を受信しました。", 2000)
+
+
+
+
 
     @Slot(QPixmap)
     def _handle_api_reference_image_received(self, pixmap: QPixmap):
@@ -6413,14 +6439,15 @@ class MainWindow(QMainWindow):
         if character and not self._is_navigating_history and not self._batch_operation_in_progress:
             self._add_to_edit_history(character, is_vrt2_edit_mode, is_pua_edit_mode)
         
-        # 5. 直前の編集内容の保存
+        # 5. 直前の編集内容の保存 (同期保存を非同期に変更)
         current_canvas_char = self.drawing_editor_widget.canvas.current_glyph_character
         current_canvas_adv_width = self.drawing_editor_widget.adv_width_spinbox.value()
         if current_canvas_char and not self._batch_operation_in_progress: 
             if current_canvas_char != character or \
                (current_canvas_char == character and is_vrt2_edit_mode != self.drawing_editor_widget.canvas.editing_vrt2_glyph):
                  if not self.drawing_editor_widget.canvas.editing_vrt2_glyph:
-                     self._save_current_advance_width_sync(current_canvas_char, current_canvas_adv_width)
+                     # --- 変更: 非同期保存メソッドを使用 ---
+                     self.save_glyph_advance_width_async(current_canvas_char, current_canvas_adv_width)
 
         # 6. 空文字(選択解除)の場合
         if not self.current_project_path or not character: 
@@ -6456,13 +6483,11 @@ class MainWindow(QMainWindow):
         loader.signals.result_ready.connect(self._on_glyph_loaded_async)
         self.thread_pool.start(loader)
 
-        # 9. Kanji Viewer の更新トリガー (ほぼ即時実行に変更)
+        # 9. Kanji Viewer の更新トリガー (変更なし)
         if self._kanji_viewer_data_loaded_successfully and character and len(character) == 1:
             with QMutexLocker(self._worker_management_mutex): 
                 self._kv_char_to_update = character
             
-            # 既存のタイマーを停止して再起動（デバウンス効果）
-            # ただし間隔は 10ms なので体感は即時
             if self._kv_deferred_update_timer.isActive():
                 self._kv_deferred_update_timer.stop()
             self._kv_deferred_update_timer.start(self._kv_update_delay_ms)
@@ -6476,6 +6501,7 @@ class MainWindow(QMainWindow):
                 self._kv_deferred_update_timer.stop()
             with QMutexLocker(self._worker_management_mutex): 
                 self._kv_char_to_update = None
+
 
 
 
@@ -7350,6 +7376,7 @@ class MainWindow(QMainWindow):
 
 
 
+
     def closeEvent(self, event: QEvent): 
         if self._project_loading_in_progress:
             reply = QMessageBox.question(self, '確認', "プロジェクトの読み込み処理が進行中です。強制終了しますか？\n（データが破損する可能性があります）", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -7357,26 +7384,31 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(self, '確認', "アプリケーションを終了しますか？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
 
-            # メインウィンドウが閉じる際にメトリックビューアも閉じる
             if self.metrics_viewer_window:
                 self.metrics_viewer_window.close()
 
             self._update_api_shared_state(None, False, False)
-            # APIスレッドを停止
             self.api_thread.stop()
 
-
+            # --- 変更: 同期保存を非同期に変更してスレッドプール待ち ---
             if not self._project_loading_in_progress and self.current_project_path and \
                self.drawing_editor_widget.canvas.current_glyph_character and not self.drawing_editor_widget.canvas.editing_vrt2_glyph: 
                 current_char = self.drawing_editor_widget.canvas.current_glyph_character
                 adv_width = self.drawing_editor_widget.adv_width_spinbox.value()
-                self._save_current_advance_width_sync(current_char, adv_width)
+                # 非同期メソッドを使用
+                self.save_glyph_advance_width_async(current_char, adv_width)
+            
+            # --- 追加: キャンバスの未保存変更を強制的にフラッシュ ---
+            self.drawing_editor_widget.canvas.force_save_pending_changes()
+
             if self._kv_deferred_update_timer and self._kv_deferred_update_timer.isActive(): self._kv_deferred_update_timer.stop()
             with QMutexLocker(self._worker_management_mutex):
                 if self.related_kanji_worker and self.related_kanji_worker.isRunning(): self.related_kanji_worker.cancel() 
             if self.export_process and self.export_process.state() != QProcess.NotRunning:
                 self.export_process.terminate() 
                 if not self.export_process.waitForFinished(3000): self.export_process.kill(); self.export_process.waitForFinished(1000) 
+            
+            # 全てのワーカ（保存処理含む）の完了を待機
             self.thread_pool.waitForDone(-1); event.accept()
         else: event.ignore()
 
