@@ -1702,24 +1702,49 @@ class DatabaseManager:
 
     def load_glyph_image(self, character: str, is_vrt2: bool = False, is_pua: bool = False) -> Optional[QPixmap]:
         if not self.db_path: return None
-        conn = self._get_connection(); cursor = conn.cursor()
-        if is_pua:
-            table = "pua_glyphs"
-        elif is_vrt2:
-            table = "vrt2_glyphs"
-        else:
-            table = "glyphs"
         
-        try:
-            cursor.execute(f"SELECT image_data FROM {table} WHERE character = ?", (character,))
-            row = cursor.fetchone()
-            if row and row['image_data']: 
-                pixmap = QPixmap(); pixmap.loadFromData(row['image_data']); return pixmap
-            return None
-        except sqlite3.OperationalError:
-            return None
-        finally:
-            conn.close()
+
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.1
+
+        for attempt in range(MAX_RETRIES):
+            conn = None
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                if is_pua:
+                    table = "pua_glyphs"
+                elif is_vrt2:
+                    table = "vrt2_glyphs"
+                else:
+                    table = "glyphs"
+                
+                cursor.execute(f"SELECT image_data FROM {table} WHERE character = ?", (character,))
+                row = cursor.fetchone()
+                
+                # 成功したら画像変換して返す
+                if row and row['image_data']: 
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(row['image_data'])
+                    return pixmap
+                return None
+
+            except sqlite3.OperationalError:
+                # ロックされている場合は少し待ってリトライ
+                if attempt < MAX_RETRIES - 1:
+                    if conn:
+                        try: conn.close()
+                        except: pass
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    # リトライ上限に達したらNoneを返す（ログに出しても良い）
+                    return None
+            finally:
+                if conn:
+                    try: conn.close()
+                    except: pass
+        return None
     
     def load_glyph_image_bytes(self, character: str, is_vrt2: bool = False, is_pua: bool = False) -> Optional[bytes]:
         if not self.db_path: return None
@@ -1742,28 +1767,78 @@ class DatabaseManager:
 
 
     def load_reference_image(self, character: str, is_pua: bool = False) -> Optional[QPixmap]:
-        if not self.db_path: return None
-        conn = self._get_connection(); cursor = conn.cursor()
-        table = "pua_glyphs" if is_pua else "glyphs"
-        try:
-            cursor.execute(f"SELECT reference_image_data FROM {table} WHERE character = ?", (character,))
-            row = cursor.fetchone()
-            if row and row['reference_image_data']: 
-                pixmap = QPixmap(); pixmap.loadFromData(row['reference_image_data']); return pixmap
+            if not self.db_path: return None
+            
+
+            MAX_RETRIES = 5
+            RETRY_DELAY = 0.1
+
+            for attempt in range(MAX_RETRIES):
+                conn = None
+                try:
+                    conn = self._get_connection()
+                    cursor = conn.cursor()
+                    table = "pua_glyphs" if is_pua else "glyphs"
+                    
+                    cursor.execute(f"SELECT reference_image_data FROM {table} WHERE character = ?", (character,))
+                    row = cursor.fetchone()
+                    
+                    if row and row['reference_image_data']: 
+                        pixmap = QPixmap()
+                        pixmap.loadFromData(row['reference_image_data'])
+                        return pixmap
+                    return None
+
+                except sqlite3.OperationalError:
+                    if attempt < MAX_RETRIES - 1:
+                        if conn:
+                            try: conn.close()
+                            except: pass
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        return None
+                finally:
+                    if conn:
+                        try: conn.close()
+                        except: pass
             return None
-        except sqlite3.OperationalError:
-            return None
-        finally:
-            conn.close()
-    
+        
     def load_vrt2_glyph_reference_image(self, character: str) -> Optional[QPixmap]:
-        if not self.db_path: return None
-        conn = self._get_connection(); cursor = conn.cursor()
-        cursor.execute("SELECT reference_image_data FROM vrt2_glyphs WHERE character = ?", (character,))
-        row = cursor.fetchone(); conn.close()
-        if row and row['reference_image_data']:
-            pixmap = QPixmap(); pixmap.loadFromData(row['reference_image_data']); return pixmap
-        return None
+            if not self.db_path: return None
+            
+
+            MAX_RETRIES = 5
+            RETRY_DELAY = 0.1
+
+            for attempt in range(MAX_RETRIES):
+                conn = None
+                try:
+                    conn = self._get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT reference_image_data FROM vrt2_glyphs WHERE character = ?", (character,))
+                    row = cursor.fetchone()
+                    
+                    if row and row['reference_image_data']:
+                        pixmap = QPixmap()
+                        pixmap.loadFromData(row['reference_image_data'])
+                        return pixmap
+                    return None
+                
+                except sqlite3.OperationalError:
+                    if attempt < MAX_RETRIES - 1:
+                        if conn:
+                            try: conn.close()
+                            except: pass
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        return None
+                finally:
+                    if conn:
+                        try: conn.close()
+                        except: pass
+            return None
 
     def save_vrt2_glyph_image(self, character: str, pixmap: QPixmap): 
         if not self.db_path: return
@@ -1775,16 +1850,36 @@ class DatabaseManager:
 
     def load_glyph_advance_width(self, character: str, is_pua: bool = False) -> int:
         if not self.db_path: return DEFAULT_ADVANCE_WIDTH
-        conn = self._get_connection(); cursor = conn.cursor()
-        table = "pua_glyphs" if is_pua else "glyphs"
-        try:
-            cursor.execute(f"SELECT advance_width FROM {table} WHERE character = ?", (character,))
-            row = cursor.fetchone()
-            return row['advance_width'] if row and row['advance_width'] is not None else DEFAULT_ADVANCE_WIDTH
-        except sqlite3.OperationalError:
-            return DEFAULT_ADVANCE_WIDTH
-        finally:
-            conn.close()
+
+
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.1
+
+        for attempt in range(MAX_RETRIES):
+            conn = None
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                table = "pua_glyphs" if is_pua else "glyphs"
+                
+                cursor.execute(f"SELECT advance_width FROM {table} WHERE character = ?", (character,))
+                row = cursor.fetchone()
+                return row['advance_width'] if row and row['advance_width'] is not None else DEFAULT_ADVANCE_WIDTH
+
+            except sqlite3.OperationalError:
+                if attempt < MAX_RETRIES - 1:
+                    if conn:
+                        try: conn.close()
+                        except: pass
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    return DEFAULT_ADVANCE_WIDTH
+            finally:
+                if conn:
+                    try: conn.close()
+                    except: pass
+        return DEFAULT_ADVANCE_WIDTH
 
     def save_glyph_advance_width(self, character: str, advance_width: int): 
         if not self.db_path: return
@@ -6481,6 +6576,9 @@ class MainWindow(QMainWindow):
             current_gen
         )
         loader.signals.result_ready.connect(self._on_glyph_loaded_async)
+        # エラー発生時に白紙にならないよう、エラーログを出すなどの対策用に接続
+        loader.signals.error_occurred.connect(lambda err: print(f"Load Error for {character}: {err}"))
+        
         self.thread_pool.start(loader)
 
         # 9. Kanji Viewer の更新トリガー (変更なし)
