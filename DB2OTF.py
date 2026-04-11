@@ -126,16 +126,8 @@ def smooth_contour_for_svg(contour, window_length=6, polyorder=3):
     y_coords = savgol_filter(contour[:, 0], window_length, polyorder)
     return np.column_stack([y_coords, x_coords])
 
-def compute_depth(polygon, all_polygons):
-    return sum(1 for other in all_polygons if other != polygon and other.contains(polygon))
 
-def polygon_to_path_data(polygon):
-    coords = list(polygon.exterior.coords)
-    d = f"M {coords[0][0]:.2f} {coords[0][1]:.2f}"
-    for x, y in coords[1:]:
-        d += f" L {x:.2f} {y:.2f}"
-    d += " Z"
-    return d
+
 
 def image_to_smooth_svg(image_pil: Image.Image, svg_path_str: str, image_width: int, image_height: int):
     if image_pil.mode != 'L':
@@ -176,24 +168,79 @@ def image_to_smooth_svg(image_pil: Image.Image, svg_path_str: str, image_width: 
         dwg.save()
         return
 
-    polygons = [Polygon(c) for c in simplified_contours]
-    
-    corrected_polygons = []
-    for poly in polygons:
-        depth = compute_depth(poly, polygons)
-        should_be_ccw = (depth % 2 == 0)
-        
-        if poly.exterior.is_ccw != should_be_ccw:
-            corrected_poly = Polygon(list(poly.exterior.coords)[::-1])
-            corrected_polygons.append(corrected_poly)
-        else:
-            corrected_polygons.append(poly)
 
-    path_data_list = [polygon_to_path_data(p) for p in corrected_polygons]
-    
+
+    # 抽出された輪郭からShapelyのPolygonを作成し、微小な自己交差を自動修復
+    valid_polygons = []
+    for c in simplified_contours:
+        poly = Polygon(c)
+        if not poly.is_valid:
+            poly = poly.buffer(0) # エラーの原因になる自己交差を修復
+        
+        if poly.geom_type == 'Polygon':
+            valid_polygons.append(poly)
+        elif poly.geom_type == 'MultiPolygon':
+            valid_polygons.extend(list(poly.geoms))
+        elif poly.geom_type == 'GeometryCollection':
+            for geom in poly.geoms:
+                if geom.geom_type == 'Polygon':
+                    valid_polygons.append(geom)
+
+    if not valid_polygons:
+        dwg.save()
+        return
+
+    # 面積の大きい順（降順）にソート。一番大きいものがベース(外周)になる
+    valid_polygons.sort(key=lambda p: p.area, reverse=True)
+
+    # ブーリアン演算(足し引き)で最終的な形状を構築
+    final_shape = valid_polygons[0]
+    for p in valid_polygons[1:]:
+        try:
+            intersection = final_shape.intersection(p)
+            # 交差している面積が50%以上なら「穴」とみなしてくり抜く
+            if intersection.area > p.area * 0.5:
+                final_shape = final_shape.difference(p)
+            else:
+                # 離れている場合は「独立したパーツ（濁点など）」として結合する
+                final_shape = final_shape.union(p)
+        except Exception:
+            continue
+
+    # 最終的な図形からSVGのパス文字列を生成
+    path_data_list = []
+    def extract_path(polygon):
+        # Shapelyが外側と内側(穴)のパスを描く向きを自動的に整えてくれます
+        if polygon.exterior is None: return
+        
+        # 外側の輪郭
+        coords = list(polygon.exterior.coords)
+        d = f"M {coords[0][0]:.2f} {coords[0][1]:.2f}"
+        for x, y in coords[1:]:
+            d += f" L {x:.2f} {y:.2f}"
+        d += " Z"
+        path_data_list.append(d)
+        
+        # 内側の穴
+        for interior in polygon.interiors:
+            coords = list(interior.coords)
+            d = f"M {coords[0][0]:.2f} {coords[0][1]:.2f}"
+            for x, y in coords[1:]:
+                d += f" L {x:.2f} {y:.2f}"
+            d += " Z"
+            path_data_list.append(d)
+
+    # 完成した図形からパスを抽出
+    if final_shape.geom_type == 'Polygon':
+        extract_path(final_shape)
+    elif final_shape.geom_type == 'MultiPolygon':
+        for poly in final_shape.geoms:
+            extract_path(poly)
+
     if path_data_list:
         final_path_d = " ".join(path_data_list)
-        dwg.add(dwg.path(d=final_path_d, fill='black', stroke='none'))
+        # fill-rule='nonzero' を指定することで、OTFフォント標準の穴あき規則に適合します
+        dwg.add(dwg.path(d=final_path_d, fill='black', stroke='none', fill_rule='nonzero'))
     
     dwg.save()
 
@@ -339,8 +386,8 @@ def set_font_names(font_path_str: str, family_name_display: str, family_name_asc
         name_table = font['name']
 
         # 日本語名とASCII名の両方のフルネームを生成
-        full_name_display = f"{family_name_display} {style_name}"
-        full_name_ascii = f"{family_name_ascii} {style_name}"
+        full_name_display = f"{family_name_display}"
+        full_name_ascii = f"{family_name_ascii}"
         
         # 設定する名前IDと、(日本語文字列, ASCII文字列)のタプルをマッピング
         names_to_set = {
@@ -394,12 +441,12 @@ def step3_build_otf_from_svgs(svg_source_dir: Path, db_helper: FontBuildDBHelper
     safe_style_name = re.sub(r'[^\w-]', '', font_style_name)
     if not safe_style_name: safe_style_name = "Regular"
     
-    ufo_dir_name = f"{safe_ascii_name}-{safe_style_name}.ufo"
-    intermediate_otf_file_name = f"{safe_ascii_name}-{safe_style_name}.otf"
+    ufo_dir_name = f"{safe_ascii_name}.ufo"
+    intermediate_otf_file_name = f"{safe_ascii_name}.otf"
 
     safe_display_family_name = re.sub(r'[\\/*?:"<>|]', '_', font_family_name_display)
     if not safe_display_family_name: safe_display_family_name = "UntitledFont"
-    final_otf_file_name = f"{safe_display_family_name}-{safe_style_name}.otf"
+    final_otf_file_name = f"{safe_display_family_name}.otf"
 
     ufo_path = ufo_output_dir_base / ufo_dir_name
     intermediate_otf_path = otf_final_dir / intermediate_otf_file_name
