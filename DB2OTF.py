@@ -93,6 +93,16 @@ class FontBuildDBHelper:
     def get_ascender_height(self) -> int:
         return DEFAULT_ASCENDER_HEIGHT
 
+    def get_project_character_set(self) -> set:
+        row = self._execute_query("SELECT value FROM project_settings WHERE key = 'character_set'")
+        chars = set(row[0]['value']) if row and row[0]['value'] else set()
+        chars.add('.notdef') # .notdef は必須グリフのため常に含める
+        return chars
+
+    def get_non_rotated_vrt2_chars(self) -> set:
+        row = self._execute_query("SELECT value FROM project_settings WHERE key = 'non_rotated_vrt2_chars'")
+        return set(row[0]['value']) if row and row[0]['value'] else set()
+
     def get_all_standard_glyphs_data(self) -> list:
         return self._execute_query("SELECT character, unicode_val, image_data, advance_width FROM glyphs WHERE image_data IS NOT NULL")
 
@@ -244,6 +254,7 @@ def image_to_smooth_svg(image_pil: Image.Image, svg_path_str: str, image_width: 
     
     dwg.save()
 
+
 # --- フォントビルドステップ ---
 def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Path):
     print("\nステップ1: DBからグリフ画像をエクスポート中...")
@@ -251,9 +262,18 @@ def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Pa
         shutil.rmtree(img_output_dir)
     img_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 出力対象とする有効な文字セットを取得
+    valid_std_chars = db_helper.get_project_character_set()
+    valid_nr_vrt2_chars = db_helper.get_non_rotated_vrt2_chars()
+
     print("  標準グリフをエクスポート...")
     std_glyphs = db_helper.get_all_standard_glyphs_data()
+    exported_std_count = 0
     for char_str, unicode_val_db, image_data, _ in std_glyphs:
+        # 文字セットに含まれていない場合はスキップ
+        if char_str not in valid_std_chars:
+            continue
+            
         if char_str == ".notdef":
             img_name = "_notdef.png"
         elif unicode_val_db is not None and unicode_val_db != -1 :
@@ -267,9 +287,10 @@ def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Pa
         try:
             with open(img_path, "wb") as f:
                 f.write(image_data)
+            exported_std_count += 1
         except IOError as e:
             print(f"    エラー: {img_name} の保存に失敗 - {e}")
-    print(f"  {len(std_glyphs)}個の標準グリフ画像をエクスポートしました。")
+    print(f"  {exported_std_count}個の標準グリフ画像をエクスポートしました。")
 
     print("  回転vrt2グリフをエクスポート...")
     rotated_chars = db_helper.get_rotated_vrt2_chars()
@@ -298,16 +319,22 @@ def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Pa
 
     print("  非回転vrt2グリフをエクスポート...")
     nr_vrt2_glyphs = db_helper.get_all_non_rotated_vrt2_glyphs_data()
+    exported_nr_count = 0
     for char_str_nr, image_data_nr in nr_vrt2_glyphs:
+        # 縦書き文字セットに含まれていない場合はスキップ
+        if char_str_nr not in valid_nr_vrt2_chars:
+            continue
+            
         unicode_val_nr = ord(char_str_nr)
         img_name_nr = f"uni{unicode_val_nr:04X}.vert.png"
         img_path_nr = img_output_dir / img_name_nr
         try:
             with open(img_path_nr, "wb") as f:
                 f.write(image_data_nr)
+            exported_nr_count += 1
         except IOError as e:
             print(f"    エラー: {img_name_nr} (nrot) の保存に失敗 - {e}")
-    print(f"  {len(nr_vrt2_glyphs)}個の非回転vrt2グリフ画像をエクスポートしました。")
+    print(f"  {exported_nr_count}個の非回転vrt2グリフ画像をエクスポートしました。")
 
     print("  私用領域(PUA)グリフをエクスポート...")
     pua_glyphs = db_helper.get_all_pua_glyphs_data()
@@ -323,6 +350,7 @@ def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Pa
         else:
             print(f"    警告: '{char_str_pua}' (PUA) は有効なUnicode値を持っていません。スキップします。")
     print(f"  {len(pua_glyphs)}個のPUAグリフ画像をエクスポートしました。")
+
 
 def process_single_image_to_svg(png_path: Path):
     svg_output_dir = png_path.parent.parent / SVG_SUBDIR_NAME
