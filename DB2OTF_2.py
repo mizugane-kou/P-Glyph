@@ -326,6 +326,16 @@ class FontBuildDBHelper:
     def get_ascender_height(self) -> int:
         return DEFAULT_ASCENDER_HEIGHT
 
+    def get_project_character_set(self) -> set:
+        row = self._execute_query("SELECT value FROM project_settings WHERE key = 'character_set'")
+        chars = set(row[0]['value']) if row and row[0]['value'] else set()
+        chars.add('.notdef')
+        return chars
+
+    def get_non_rotated_vrt2_chars(self) -> set:
+        row = self._execute_query("SELECT value FROM project_settings WHERE key = 'non_rotated_vrt2_chars'")
+        return set(row[0]['value']) if row and row[0]['value'] else set()
+
     def get_all_standard_glyphs_data(self) -> list:
         return self._execute_query("SELECT character, unicode_val, image_data, advance_width FROM glyphs WHERE image_data IS NOT NULL")
 
@@ -394,20 +404,35 @@ def step1_export_images_from_db(db_helper: FontBuildDBHelper, img_output_dir: Pa
     print("\nステップ1: DBからグリフ画像をエクスポート中...")
     if img_output_dir.exists(): shutil.rmtree(img_output_dir)
     img_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 対象文字セットを取得
+    valid_std_chars = db_helper.get_project_character_set()
+    valid_nr_vrt2_chars = db_helper.get_non_rotated_vrt2_chars()
+    
     std_glyphs = db_helper.get_all_standard_glyphs_data()
+    count_std = 0
     for char, unicode_val, img_data, _ in std_glyphs:
+        if char not in valid_std_chars: continue # セット外はスキップ
         img_name = "_notdef.png" if char==".notdef" else f"uni{unicode_val:04X}.png" if unicode_val is not None and unicode_val!=-1 else re.sub(r'[^\w-]', '_', char)+".png"
         (img_output_dir/img_name).write_bytes(img_data)
-    print(f"  {len(std_glyphs)}個の標準グリフ画像をエクスポートしました。")
+        count_std += 1
+    print(f"  {count_std}個の標準グリフ画像をエクスポートしました。")
+    
     rotated_chars = db_helper.get_rotated_vrt2_chars()
     count_rotated = 0
     for char in rotated_chars:
         if data := db_helper.get_glyph_data_for_char(char):
             Image.open(io.BytesIO(data[0])).rotate(-90,expand=True).save(img_output_dir/f"uni{ord(char):04X}.vert.png", "PNG"); count_rotated += 1
     print(f"  {count_rotated}個の回転vrt2グリフ画像をエクスポートしました。")
+    
     nr_vrt2_glyphs = db_helper.get_all_non_rotated_vrt2_glyphs_data()
-    for char, img_data in nr_vrt2_glyphs: (img_output_dir/f"uni{ord(char):04X}.vert.png").write_bytes(img_data)
-    print(f"  {len(nr_vrt2_glyphs)}個の非回転vrt2グリフ画像をエクスポートしました。")
+    count_nr = 0
+    for char, img_data in nr_vrt2_glyphs: 
+        if char not in valid_nr_vrt2_chars: continue # セット外はスキップ
+        (img_output_dir/f"uni{ord(char):04X}.vert.png").write_bytes(img_data)
+        count_nr += 1
+    print(f"  {count_nr}個の非回転vrt2グリフ画像をエクスポートしました。")
+    
     pua_glyphs = db_helper.get_all_pua_glyphs_data()
     for _, unicode_val, img_data, _ in pua_glyphs:
         if unicode_val: (img_output_dir/f"uni{unicode_val:04X}.png").write_bytes(img_data)
@@ -441,8 +466,8 @@ def set_font_names(font_path_str: str, family_name_display: str, family_name_asc
     try:
         font = TTFont(font_path_str)
         name_table = font['name']
-        full_name_display = f"{family_name_display} {style_name}"
-        full_name_ascii = f"{family_name_ascii} {style_name}"
+        full_name_display = f"{family_name_display}"
+        full_name_ascii = f"{family_name_ascii}"
         names_to_set = {
             1: (family_name_display, family_name_ascii), 2: (style_name, style_name),
             4: (full_name_display, full_name_ascii), 16: (family_name_display, family_name_ascii),
@@ -493,10 +518,10 @@ def step3_build_otf_from_svgs(svg_source_dir: Path, db_helper: FontBuildDBHelper
     safe_ascii_name = re.sub(r'[^\w-]', '', font_family_name_ascii) or "UntitledFont"
     safe_style_name = re.sub(r'[^\w-]', '', font_style_name) or "Regular"
     
-    ufo_dir_name = f"{safe_ascii_name}-{safe_style_name}.ufo"
-    intermediate_otf_file_name = f"{safe_ascii_name}-{safe_style_name}.otf"
+    ufo_dir_name = f"{safe_ascii_name}.ufo"
+    intermediate_otf_file_name = f"{safe_ascii_name}.otf"
     safe_display_family_name = re.sub(r'[\\/*?:"<>|]', '_', font_family_name_display) or "UntitledFont"
-    final_otf_file_name = f"{safe_display_family_name}-{safe_style_name}.otf"
+    final_otf_file_name = f"{safe_display_family_name}.otf"
 
     ufo_path = ufo_output_dir_base / ufo_dir_name
     intermediate_otf_path = otf_final_dir / intermediate_otf_file_name
